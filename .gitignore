@@ -56,5 +56,11 @@ run_fix.ps1
 run_test.ps1
 build.bat
 
+# Keypair generation helpers (local only)
+generate_keypair.js
+generate_proper_keypair.js
+package.json
+package-lock.json
+
 # Claude Code artifacts
 .claude/
