@@ -1,0 +1,60 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+
+# Keypairs - NEVER commit these
+keypair*.json
+*-keypair.json
+credentials/shredstream/shredstream-auth-keypair.json
+
+# Logs and data
+*.log
+/logs/
+/data/
+positions.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+/coverage/
+*.profraw
+*.profdata
+
+# Node modules (for keypair generator)
+node_modules/
+
+# Local Rust toolchain (custom install)
+/.cargo/
+/.rustup/
+
+# Build tools and installers
+mingw64/
+mingw.7z
+protoc/
+7zr.exe
+rustup-init.exe
+vs_BuildTools.exe
+
+# Windows artifacts
+nul
+
+# PowerShell helper scripts (local only)
+run_cargo.ps1
+run_fix.ps1
+run_test.ps1
+build.bat
+
+# Claude Code artifacts
+.claude/

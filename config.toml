@@ -1,0 +1,175 @@
+# Pump.fun Sniper Bot Configuration
+# All values shown are defaults unless otherwise noted
+
+[rpc]
+# Override via RPC_ENDPOINT env var
+endpoint = "https://your-rpc-endpoint.com"
+ws_endpoint = "wss://your-rpc-endpoint.com"
+timeout_ms = 30000
+max_retries = 3
+
+[jito]
+# Override via JITO_BLOCK_ENGINE_URL env var
+block_engine_url = "https://ny.mainnet.block-engine.jito.wtf"
+# Max 2 regions allowed
+regions = ["ny", "amsterdam"]
+# Tip percentile from tip stream (25, 50, 75, 95, 99)
+tip_percentile = 50
+min_tip_lamports = 10000
+max_tip_lamports = 1000000
+retry_attempts = 3
+retry_base_delay_ms = 50
+
+[shredstream]
+# Override via SHREDSTREAM_GRPC_URL env var
+grpc_url = "http://127.0.0.1:10000"
+reconnect_delay_ms = 1000
+max_reconnect_attempts = 10
+
+[pumpportal]
+# PumpPortal WebSocket for token detection (alternative to ShredStream)
+enabled = true
+ws_url = "wss://pumpportal.fun/api/data"
+reconnect_delay_ms = 1000
+max_reconnect_attempts = 10
+ping_interval_secs = 30
+# API key for Lightning Trading API (get from https://pumpportal.fun)
+# Leave empty to use Local API (sign transactions yourself)
+api_key = ""
+# Use PumpPortal for trading (true) or Jito bundles (false)
+use_for_trading = true
+
+[backpressure]
+# Max events in processing queue
+channel_capacity = 10000
+# Drop policy when queue is full:
+# - "oldest_non_priority": Drop oldest non-tracked-wallet events (recommended)
+# - "newest": Drop incoming events
+# - "block": Block sender (NOT recommended for real-time)
+drop_policy = "oldest_non_priority"
+
+[trading]
+# Amount of SOL to spend per snipe
+buy_amount_sol = 0.05
+# Slippage tolerance in basis points (2500 = 25%)
+slippage_bps = 2500
+# Priority fee for non-Jito transactions
+priority_fee_lamports = 100000
+# Simulate before sending (adds ~50ms latency)
+simulate_before_send = false
+
+[filters]
+# Enable token filtering (disable to snipe ALL new tokens - not recommended)
+enabled = true
+# Minimum initial liquidity in SOL
+min_liquidity_sol = 0.0
+# Maximum dev wallet holdings as percentage of supply
+max_dev_holdings_pct = 20.0
+# Only snipe tokens matching these regex patterns (empty = all)
+name_patterns = []
+# Block tokens matching these regex patterns
+blocked_patterns = []
+
+[wallet_tracking]
+# Enable wallet copy-trading
+enabled = false
+# List of wallet addresses to track
+wallets = []
+# Give tracked wallet events priority in queue
+priority_boost = true
+
+[auto_sell]
+# Enable automatic take-profit and stop-loss
+enabled = true
+# Sell when profit reaches this percentage
+take_profit_pct = 50.0
+# Sell when loss reaches this percentage
+stop_loss_pct = 30.0
+# Enable partial take-profit (sell portion at TP, hold rest)
+partial_take_profit = false
+# Price polling interval in milliseconds
+# Trade-off: faster = more RPC calls = higher cost
+# WARNING: TP/SL is best-effort. Fast rugs can gap through stop-loss.
+price_poll_interval_ms = 1000
+
+[safety]
+# Require confirmation for manual sells
+require_sell_confirmation = true
+# Maximum total position size in SOL (refuse buys exceeding this)
+max_position_sol = 0.5
+# Daily loss limit in SOL (pause buying when exceeded)
+# Behavior: Pause new buys, allow sells, reset at UTC midnight
+daily_loss_limit_sol = 1.0
+# Warn if keypair balance exceeds this (suggests using isolated wallet)
+keypair_balance_warning_sol = 1.0
+
+# Behavior when daily_loss_limit_sol is hit:
+# - Pause new buys immediately
+# - Continue allowing sells (to exit positions)
+# - Log warning and send alert
+# - Reset at UTC midnight
+
+# CLI --force flag behavior:
+# - Skips confirmation prompt ONLY
+# - Does NOT override safety limits (max_position, daily_loss)
+# - Safety limits are always enforced
+
+[wallet]
+# Wallet names (from credentials/wallets.json)
+hot_wallet = "hot-trading"
+vault_wallet = "vault-robinhood"
+
+# Credentials directory
+credentials_dir = "credentials"
+
+[wallet.safety]
+# Minimum SOL to keep in hot wallet (never drain below this)
+min_hot_balance_sol = 0.1
+
+# Maximum single transfer to vault
+max_single_transfer_sol = 5.0
+
+# Maximum total daily extraction to vault
+max_daily_extraction_sol = 10.0
+
+# Require confirmation for transfers above this amount
+confirm_above_sol = 1.0
+
+# Emergency threshold - pause trading if hot wallet drops below
+emergency_threshold_sol = 0.05
+
+# Lock vault address (prevent changes via code/AI)
+vault_address_locked = true
+
+# Maximum AI can auto-execute without user approval
+ai_max_auto_transfer_sol = 0.5
+
+[wallet.extraction]
+# Enable automatic profit extraction
+auto_extract = true
+
+# Extract when realized profit exceeds this threshold
+profit_threshold_sol = 0.2
+
+# Percentage of profits to extract
+profit_percentage = 50.0
+
+# Extract excess when balance exceeds ceiling
+balance_ceiling_sol = 2.0
+
+# Minimum time between extractions (seconds)
+min_extraction_interval_secs = 3600
+
+# AI Authority Boundaries (CRITICAL):
+# AI CAN:
+#   - Propose profit extractions to vault (within limits)
+#   - Execute small transfers automatically (< ai_max_auto_transfer_sol)
+#   - Recommend position sizing
+#   - Suggest pausing/resuming trading
+#
+# AI CANNOT:
+#   - Drain hot wallet below min_hot_balance_sol
+#   - Change vault addresses
+#   - Withdraw from vault (vault is receive-only)
+#   - Override emergency locks
+#   - Execute large transfers without user approval

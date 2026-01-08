@@ -1,0 +1,92 @@
+[package]
+name = "pumpfun-sniper"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "High-performance pump.fun sniper bot using Rust and Jito ShredStream"
+license = "MIT"
+repository = "https://github.com/yourusername/pumpfun-sniper"
+
+[features]
+default = []
+# ShredStream requires protobuf build which doesn't work on Windows
+# Enable with: cargo build --features shredstream
+shredstream = ["dep:solana-stream-sdk"]
+
+[dependencies]
+# Async runtime (LTS until March 2026)
+tokio = { version = "=1.43.0", features = ["full", "sync", "time", "fs"] }
+futures = "=0.3.31"
+tokio-util = "=0.7.13"
+
+# Solana - PIN EXACT VERSIONS to avoid serialization bugs
+solana-sdk = "=2.0.18"
+solana-client = "=2.0.18"
+solana-account-decoder = "=2.0.18"
+solana-transaction-status = "=2.0.18"
+spl-token = "=6.0.0"
+spl-associated-token-account = "=4.0.0"
+
+# Jito - NOTE: SDK still maturing, expect breaking changes
+jito-sdk-rust = "=0.2.0"
+# ShredStream SDK - optional, requires protobuf build
+solana-stream-sdk = { version = "=0.2.5", optional = true }
+
+# Serialization - pin for full reproducibility
+serde = { version = "=1.0.217", features = ["derive"] }
+serde_json = "=1.0.134"
+borsh = "=1.5.3"
+bs58 = "=0.5.1"
+
+# Config
+config = "=0.14.1"
+dotenvy = "=0.15.7"
+
+# CLI
+clap = { version = "=4.5.23", features = ["derive", "env"] }
+dialoguer = "0.11"
+
+# Logging
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter", "json"] }
+
+# Utils
+anyhow = "=1.0.95"
+thiserror = "=2.0.9"
+backoff = { version = "=0.4.0", features = ["tokio"] }
+chrono = { version = "=0.4.39", features = ["serde"] }
+regex = "=1.11.1"
+
+# Async channels
+async-channel = "=2.3.1"
+
+# Crypto
+sha2 = "=0.10.8"
+
+# WebSocket - enable url feature for IntoClientRequest on Url
+tokio-tungstenite = { version = "=0.24.0", features = ["native-tls", "url"] }
+tungstenite = { version = "=0.24.0", features = ["url"] }
+url = "=2.5.4"
+futures-util = "=0.3.31"
+
+# HTTP client
+reqwest = { version = "=0.12.9", default-features = false, features = ["json", "native-tls"] }
+
+# Utils (additional)
+lazy_static = "=1.5.0"
+rand = "=0.8.5"
+uuid = { version = "=1.11.0", features = ["v4"] }
+
+[dev-dependencies]
+tokio-test = "=0.4.4"
+tempfile = "=3.14.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
