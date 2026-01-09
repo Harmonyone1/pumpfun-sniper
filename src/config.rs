@@ -4,6 +4,11 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+// Re-export adaptive filter config
+pub use crate::filter::adaptive::config::AdaptiveFilterConfig;
+// Re-export strategy config
+pub use crate::strategy::engine::StrategyEngineConfig;
+
 /// Main configuration structure
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -19,6 +24,10 @@ pub struct Config {
     pub safety: SafetyConfig,
     #[serde(default)]
     pub wallet: WalletConfig,
+    #[serde(default)]
+    pub adaptive_filter: AdaptiveFilterConfig,
+    #[serde(default)]
+    pub strategy: StrategyEngineConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -669,6 +678,8 @@ impl Default for Config {
                 keypair_balance_warning_sol: default_keypair_balance_warning(),
             },
             wallet: WalletConfig::default(),
+            adaptive_filter: AdaptiveFilterConfig::default(),
+            strategy: StrategyEngineConfig::default(),
         }
     }
 }

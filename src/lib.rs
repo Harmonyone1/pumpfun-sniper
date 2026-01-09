@@ -8,6 +8,7 @@ pub mod error;
 pub mod filter;
 pub mod position;
 pub mod pump;
+pub mod strategy;
 pub mod stream;
 pub mod trading;
 pub mod wallet;

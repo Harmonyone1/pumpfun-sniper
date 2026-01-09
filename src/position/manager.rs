@@ -12,6 +12,64 @@ use tracing::{debug, info};
 use crate::config::SafetyConfig;
 use crate::error::{Error, Result};
 
+/// Entry recommendation that led to opening this position
+/// Used for context-aware auto-sell strategies
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryType {
+    /// High conviction entry (score >= 0.65)
+    StrongBuy,
+    /// Standard opportunity (score >= 0.35)
+    Opportunity,
+    /// Probe/learning position (score 0.15-0.35)
+    Probe,
+    /// Legacy entry (before entry type tracking)
+    Legacy,
+}
+
+impl Default for EntryType {
+    fn default() -> Self {
+        EntryType::Legacy
+    }
+}
+
+impl EntryType {
+    /// Get the take profit target for this entry type
+    pub fn take_profit_pct(&self) -> f64 {
+        match self {
+            EntryType::StrongBuy => 100.0,   // Hold for 2x
+            EntryType::Opportunity => 50.0,   // Standard 50% gain
+            EntryType::Probe => 25.0,         // Quick 25% scalp
+            EntryType::Legacy => 50.0,        // Default
+        }
+    }
+
+    /// Get the stop loss threshold for this entry type
+    pub fn stop_loss_pct(&self) -> f64 {
+        match self {
+            EntryType::StrongBuy => 30.0,    // Wider stop for high conviction
+            EntryType::Opportunity => 20.0,   // Standard stop
+            EntryType::Probe => 15.0,         // Tight stop for learning positions
+            EntryType::Legacy => 30.0,        // Default
+        }
+    }
+
+    /// Get the max hold time in seconds for this entry type
+    pub fn max_hold_secs(&self) -> Option<u64> {
+        match self {
+            EntryType::StrongBuy => None,        // No time limit for high conviction
+            EntryType::Opportunity => Some(300), // 5 min max
+            EntryType::Probe => Some(60),        // 60 second max for probes
+            EntryType::Legacy => None,           // Default no limit
+        }
+    }
+
+    /// Should use tiered exit strategy?
+    pub fn use_tiered_exit(&self) -> bool {
+        matches!(self, EntryType::StrongBuy)
+    }
+}
+
 /// A single position in a token
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -33,6 +91,9 @@ pub struct Position {
     pub entry_time: chrono::DateTime<chrono::Utc>,
     /// Entry transaction signature
     pub entry_signature: String,
+    /// Entry type/recommendation that led to this position
+    #[serde(default)]
+    pub entry_type: EntryType,
     /// Current price (updated by price feed)
     #[serde(skip)]
     pub current_price: f64,

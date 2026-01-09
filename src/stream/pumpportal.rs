@@ -39,6 +39,14 @@ impl SubscriptionMessage {
         }
     }
 
+    /// Subscribe to ALL trades on pump.fun (no filter)
+    pub fn subscribe_all_trades() -> Self {
+        Self {
+            method: "subscribeTokenTrade".to_string(),
+            keys: None, // No keys = all trades
+        }
+    }
+
     /// Subscribe to trades on specific tokens
     pub fn subscribe_token_trades(mints: Vec<String>) -> Self {
         Self {
@@ -176,6 +184,7 @@ impl PumpPortalClient {
     pub async fn start(
         &self,
         subscribe_new_tokens: bool,
+        subscribe_all_trades: bool,
         track_wallets: Vec<String>,
     ) -> Result<()> {
         info!("Starting PumpPortal WebSocket client...");
@@ -200,6 +209,7 @@ impl PumpPortalClient {
                     &config,
                     &event_tx,
                     subscribe_new_tokens,
+                    subscribe_all_trades,
                     &wallets,
                 )
                 .await
@@ -252,6 +262,7 @@ impl PumpPortalClient {
         config: &PumpPortalConfig,
         event_tx: &mpsc::Sender<PumpPortalEvent>,
         subscribe_new_tokens: bool,
+        subscribe_all_trades: bool,
         track_wallets: &[String],
     ) -> Result<()> {
         info!("Connecting to PumpPortal WebSocket...");
@@ -285,6 +296,18 @@ impl PumpPortalClient {
                 .await
                 .map_err(|e| Error::ShredStreamConnection(format!("Failed to subscribe: {}", e)))?;
             info!("Subscribed to new token events");
+        }
+
+        // Subscribe to ALL trades on pump.fun
+        if subscribe_all_trades {
+            let msg = SubscriptionMessage::subscribe_all_trades();
+            let json = serde_json::to_string(&msg)
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            write
+                .send(Message::Text(json))
+                .await
+                .map_err(|e| Error::ShredStreamConnection(format!("Failed to subscribe to trades: {}", e)))?;
+            info!("Subscribed to ALL trade events");
         }
 
         // Subscribe to wallet trades
@@ -352,6 +375,9 @@ impl PumpPortalClient {
         text: &str,
         event_tx: &mpsc::Sender<PumpPortalEvent>,
     ) -> Result<()> {
+        // Log first 200 chars of incoming message for debugging
+        debug!("Incoming message: {}", &text[..text.len().min(200)]);
+
         // Try parsing as new token event
         if let Ok(token_event) = serde_json::from_str::<NewTokenEvent>(text) {
             if token_event.tx_type == "create" {

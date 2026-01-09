@@ -2,9 +2,9 @@
 # All values shown are defaults unless otherwise noted
 
 [rpc]
-# Override via RPC_ENDPOINT env var
-endpoint = "https://your-rpc-endpoint.com"
-ws_endpoint = "wss://your-rpc-endpoint.com"
+# Override via RPC_ENDPOINT env var (or set below)
+endpoint = "https://mainnet.helius-rpc.com/?api-key=066a76e6-916f-4ef2-9194-c86676072933"
+ws_endpoint = "wss://mainnet.helius-rpc.com/?api-key=066a76e6-916f-4ef2-9194-c86676072933"
 timeout_ms = 30000
 max_retries = 3
 
@@ -62,13 +62,13 @@ simulate_before_send = false
 # Enable token filtering (disable to snipe ALL new tokens - not recommended)
 enabled = true
 # Minimum initial liquidity in SOL
-min_liquidity_sol = 0.0
+min_liquidity_sol = 0.5
 # Maximum dev wallet holdings as percentage of supply
 max_dev_holdings_pct = 20.0
 # Only snipe tokens matching these regex patterns (empty = all)
 name_patterns = []
 # Block tokens matching these regex patterns
-blocked_patterns = []
+blocked_patterns = ["(?i)scam", "(?i)rug", "(?i)honeypot"]
 
 [wallet_tracking]
 # Enable wallet copy-trading

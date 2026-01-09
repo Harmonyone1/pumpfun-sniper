@@ -10,6 +10,11 @@
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    signature::{Keypair, Signer},
+    transaction::VersionedTransaction,
+};
 use tracing::{debug, info};
 
 use crate::error::{Error, Result};
@@ -267,6 +272,7 @@ impl PumpPortalTrader {
     /// Get unsigned transaction for buy (Local API)
     ///
     /// Use this if you want to sign the transaction yourself
+    /// Returns raw transaction bytes (the API returns binary data directly)
     pub async fn get_buy_transaction(
         &self,
         mint: &str,
@@ -274,7 +280,7 @@ impl PumpPortalTrader {
         slippage_pct: u32,
         priority_fee: f64,
         public_key: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<u8>> {
         let request = LocalTradeRequest {
             action: TradeAction::Buy,
             mint: mint.to_string(),
@@ -296,21 +302,28 @@ impl PumpPortalTrader {
             .await
             .map_err(|e| Error::TransactionBuild(format!("HTTP request failed: {}", e)))?;
 
-        let local_response: LocalTradeResponse = response
-            .json()
-            .await
-            .map_err(|e| Error::Deserialization(format!("Failed to parse response: {}", e)))?;
-
-        if let Some(error) = local_response.error {
-            return Err(Error::TransactionBuild(error));
+        // Check for error response (JSON with error field)
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::TransactionBuild(format!("API error ({}): {}", status, text)));
         }
 
-        local_response
-            .transaction
-            .ok_or_else(|| Error::TransactionBuild("No transaction in response".to_string()))
+        // The API returns raw transaction bytes directly
+        let tx_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::TransactionBuild(format!("Failed to read response body: {}", e)))?;
+
+        if tx_bytes.is_empty() {
+            return Err(Error::TransactionBuild("Empty response from API".to_string()));
+        }
+
+        Ok(tx_bytes.to_vec())
     }
 
     /// Get unsigned transaction for sell (Local API)
+    /// Returns raw transaction bytes
     pub async fn get_sell_transaction(
         &self,
         mint: &str,
@@ -318,7 +331,7 @@ impl PumpPortalTrader {
         slippage_pct: u32,
         priority_fee: f64,
         public_key: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<u8>> {
         let denominated_in_sol = if amount.ends_with('%') { "false" } else { "false" };
 
         let request = LocalTradeRequest {
@@ -342,18 +355,148 @@ impl PumpPortalTrader {
             .await
             .map_err(|e| Error::TransactionBuild(format!("HTTP request failed: {}", e)))?;
 
-        let local_response: LocalTradeResponse = response
-            .json()
-            .await
-            .map_err(|e| Error::Deserialization(format!("Failed to parse response: {}", e)))?;
-
-        if let Some(error) = local_response.error {
-            return Err(Error::TransactionBuild(error));
+        // Check for error response
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::TransactionBuild(format!("API error ({}): {}", status, text)));
         }
 
-        local_response
-            .transaction
-            .ok_or_else(|| Error::TransactionBuild("No transaction in response".to_string()))
+        // The API returns raw transaction bytes directly
+        let tx_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::TransactionBuild(format!("Failed to read response body: {}", e)))?;
+
+        if tx_bytes.is_empty() {
+            return Err(Error::TransactionBuild("Empty response from API".to_string()));
+        }
+
+        Ok(tx_bytes.to_vec())
+    }
+
+    /// Execute a buy using Local API (sign and send yourself)
+    ///
+    /// This method gets an unsigned transaction from PumpPortal, signs it locally,
+    /// and submits it via the provided RPC client.
+    ///
+    /// # Arguments
+    /// * `mint` - Token mint address
+    /// * `sol_amount` - Amount of SOL to spend
+    /// * `slippage_pct` - Slippage percentage (e.g., 25 for 25%)
+    /// * `priority_fee` - Priority fee in SOL
+    /// * `keypair` - Keypair to sign the transaction
+    /// * `rpc_client` - RPC client to send the transaction
+    pub async fn buy_local(
+        &self,
+        mint: &str,
+        sol_amount: f64,
+        slippage_pct: u32,
+        priority_fee: f64,
+        keypair: &Keypair,
+        rpc_client: &RpcClient,
+    ) -> Result<String> {
+        let public_key = keypair.pubkey().to_string();
+
+        info!(
+            "Executing local buy: {} SOL for token {} (signer: {})",
+            sol_amount, mint, public_key
+        );
+
+        // Get unsigned transaction from PumpPortal Local API (returns raw bytes)
+        let tx_bytes = self
+            .get_buy_transaction(mint, sol_amount, slippage_pct, priority_fee, &public_key)
+            .await?;
+
+        debug!("Got unsigned transaction from PumpPortal ({} bytes)", tx_bytes.len());
+
+        // Deserialize as VersionedTransaction
+        let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
+            .map_err(|e| Error::Deserialization(format!("Failed to deserialize transaction: {}", e)))?;
+
+        debug!("Deserialized transaction, signing...");
+
+        // Sign the transaction
+        // For VersionedTransaction, we need to sign the message
+        let message_bytes = tx.message.serialize();
+        let signature = keypair.sign_message(&message_bytes);
+        tx.signatures[0] = signature;
+
+        debug!("Transaction signed, sending...");
+
+        // Send the signed transaction with skip_preflight to avoid simulation
+        use solana_client::rpc_config::RpcSendTransactionConfig;
+        use solana_sdk::commitment_config::CommitmentLevel;
+
+        let config = RpcSendTransactionConfig {
+            skip_preflight: true,
+            preflight_commitment: Some(CommitmentLevel::Confirmed),
+            ..Default::default()
+        };
+
+        let signature = rpc_client
+            .send_transaction_with_config(&tx, config)
+            .map_err(|e| Error::TransactionSend(format!("RPC send failed: {}", e)))?;
+
+        info!("Transaction sent! Signature: {}", signature);
+
+        Ok(signature.to_string())
+    }
+
+    /// Execute a sell using Local API (sign and send yourself)
+    pub async fn sell_local(
+        &self,
+        mint: &str,
+        amount: &str,
+        slippage_pct: u32,
+        priority_fee: f64,
+        keypair: &Keypair,
+        rpc_client: &RpcClient,
+    ) -> Result<String> {
+        let public_key = keypair.pubkey().to_string();
+
+        info!(
+            "Executing local sell: {} of token {} (signer: {})",
+            amount, mint, public_key
+        );
+
+        // Get unsigned transaction from PumpPortal Local API (returns raw bytes)
+        let tx_bytes = self
+            .get_sell_transaction(mint, amount, slippage_pct, priority_fee, &public_key)
+            .await?;
+
+        debug!("Got unsigned transaction from PumpPortal ({} bytes)", tx_bytes.len());
+
+        // Deserialize as VersionedTransaction
+        let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
+            .map_err(|e| Error::Deserialization(format!("Failed to deserialize transaction: {}", e)))?;
+
+        debug!("Deserialized transaction, signing...");
+
+        // Sign the transaction
+        let message_bytes = tx.message.serialize();
+        let signature = keypair.sign_message(&message_bytes);
+        tx.signatures[0] = signature;
+
+        debug!("Transaction signed, sending...");
+
+        // Send the signed transaction with skip_preflight to avoid simulation
+        use solana_client::rpc_config::RpcSendTransactionConfig;
+        use solana_sdk::commitment_config::CommitmentLevel;
+
+        let config = RpcSendTransactionConfig {
+            skip_preflight: true,
+            preflight_commitment: Some(CommitmentLevel::Confirmed),
+            ..Default::default()
+        };
+
+        let signature = rpc_client
+            .send_transaction_with_config(&tx, config)
+            .map_err(|e| Error::TransactionSend(format!("RPC send failed: {}", e)))?;
+
+        info!("Transaction sent! Signature: {}", signature);
+
+        Ok(signature.to_string())
     }
 }
 
