@@ -2970,7 +2970,7 @@ pub async fn hot_scan(
                                             // Adjust position size based on alpha score
                                             let alpha_multiplier = if profile.is_elite() {
                                                 info!(
-                                                    "[{}] ELITE creator {} | Win: {:.0}% | R: {:.1}x | Alpha: {:.2}",
+                                                    "[{}] ELITE creator {} | Win: {:.0}% | R: {:.1}x | Alpha: {:.2} -> 1.5x size",
                                                     token.symbol,
                                                     &creator[..8],
                                                     profile.win_rate * 100.0,
@@ -2979,14 +2979,14 @@ pub async fn hot_scan(
                                                 );
                                                 1.5 // 50% more for elite wallets
                                             } else if profile.win_rate >= 0.5 {
-                                                debug!(
-                                                    "[{}] Good creator {} | Win: {:.0}% | Alpha: {:.2}",
+                                                info!(
+                                                    "[{}] Good creator {} | Win: {:.0}% | Alpha: {:.2} -> 1.0x size",
                                                     token.symbol, &creator[..8], profile.win_rate * 100.0, profile.alpha_score.value
                                                 );
                                                 1.0 // Normal for decent wallets
                                             } else {
-                                                debug!(
-                                                    "[{}] Weak creator {} | Win: {:.0}% | Alpha: {:.2}",
+                                                info!(
+                                                    "[{}] Weak creator {} | Win: {:.0}% | Alpha: {:.2} -> 0.7x size",
                                                     token.symbol, &creator[..8], profile.win_rate * 100.0, profile.alpha_score.value
                                                 );
                                                 0.7 // 30% less for weak wallets
@@ -2995,13 +2995,13 @@ pub async fn hot_scan(
                                             buy_amount * alpha_multiplier
                                         }
                                         Err(e) => {
-                                            debug!("Could not profile creator for {}: {} - using default size", token.symbol, e);
+                                            warn!("Could not profile creator for {}: {} - using default size", token.symbol, e);
                                             buy_amount
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    debug!("Could not get creator for {}: {} - using default size", token.symbol, e);
+                                    warn!("Could not get creator for {}: {} - using default size", token.symbol, e);
                                     buy_amount
                                 }
                             }
