@@ -2372,6 +2372,18 @@ pub async fn hot_scan(
     };
     let bought_mints_path = std::sync::Arc::new(bought_mints_path);
 
+    // Track recently sold mints with cooldown (5 minutes before re-entry allowed)
+    // This prevents buying back at the top immediately after selling
+    const SOLD_MINTS_COOLDOWN_SECS: i64 = 300; // 5 minutes
+    let sold_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Track failed mints (buys that didn't land tokens) with longer cooldown
+    // This prevents repeatedly trying to buy tokens that consistently fail
+    const FAILED_MINTS_COOLDOWN_SECS: i64 = 1800; // 30 minutes
+    let failed_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     let dex_client = DexScreenerClient::new();
     let scan_config = HotScanConfig {
         min_m5_change: min_m5,
@@ -2391,6 +2403,8 @@ pub async fn hot_scan(
         let monitor_dex = DexScreenerClient::new();
         let monitor_bought_mints = bought_mints.clone();
         let monitor_bought_mints_path = bought_mints_path.clone();
+        let monitor_sold_mints = sold_mints.clone();
+        let monitor_failed_mints = failed_mints.clone();
         let monitor_use_local_api = use_local_api;
         // Determine which wallet to query for token balances
         let monitor_wallet = if use_local_api {
@@ -2527,7 +2541,7 @@ pub async fn hot_scan(
                         } else if position_age_secs > 30 {
                             // After 30 seconds with no tokens, assume tx failed
                             warn!(
-                                "[{}] TX LIKELY FAILED - no tokens after 30s, removing position",
+                                "[{}] TX LIKELY FAILED - no tokens after 30s, removing position (30min cooldown)",
                                 position.symbol
                             );
                             let _ = monitor_positions.abandon_position(&position.mint).await;
@@ -2537,6 +2551,12 @@ pub async fn hot_scan(
                                 &position.mint,
                             )
                             .await;
+                            // Add to failed_mints with 30 minute cooldown to prevent repeated failures
+                            {
+                                let mut failed = monitor_failed_mints.lock().await;
+                                failed.insert(position.mint.clone(), chrono::Utc::now().timestamp());
+                                info!("[{}] Added to failed_mints blacklist (30min cooldown)", position.symbol);
+                            }
                             continue;
                         } else {
                             // Still waiting for confirmation
@@ -2849,6 +2869,14 @@ pub async fn hot_scan(
                                         )
                                         .await;
 
+                                        // Add to sold_mints with 5-minute cooldown before re-entry
+                                        // This prevents immediate re-buy at the top
+                                        {
+                                            let mut sold = monitor_sold_mints.lock().await;
+                                            sold.insert(position.mint.clone(), chrono::Utc::now().timestamp());
+                                            info!("[{}] Added to sold_mints (5min cooldown before re-entry)", position.symbol);
+                                        }
+
                                         info!("=== TRADE CLOSED (Full) ===");
                                         info!(
                                             "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
@@ -2917,6 +2945,36 @@ pub async fn hot_scan(
                         if bought.contains_key(&token.mint) {
                             info!("Skipping {} - already bought this session", token.symbol);
                             continue;
+                        }
+
+                        // Check sold_mints cooldown (5 minutes after selling)
+                        {
+                            let sold = sold_mints.lock().await;
+                            if let Some(&sold_at) = sold.get(&token.mint) {
+                                let now = chrono::Utc::now().timestamp();
+                                let elapsed = now - sold_at;
+                                if elapsed < SOLD_MINTS_COOLDOWN_SECS {
+                                    let remaining = SOLD_MINTS_COOLDOWN_SECS - elapsed;
+                                    info!("Skipping {} - sold {}s ago, cooldown {}s remaining",
+                                          token.symbol, elapsed, remaining);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Check failed_mints cooldown (30 minutes after failed buy)
+                        {
+                            let failed = failed_mints.lock().await;
+                            if let Some(&failed_at) = failed.get(&token.mint) {
+                                let now = chrono::Utc::now().timestamp();
+                                let elapsed = now - failed_at;
+                                if elapsed < FAILED_MINTS_COOLDOWN_SECS {
+                                    let remaining_mins = (FAILED_MINTS_COOLDOWN_SECS - elapsed) / 60;
+                                    info!("Skipping {} - failed buy {}m ago, cooldown {}m remaining",
+                                          token.symbol, elapsed / 60, remaining_mins);
+                                    continue;
+                                }
+                            }
                         }
 
                         // Check if we already have a position

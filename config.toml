@@ -90,8 +90,8 @@ take_profit_pct = 12.0
 stop_loss_pct = 15.0
 # Enable partial take-profit (sell portion at TP, hold rest)
 partial_take_profit = false
-# Price polling interval in milliseconds
-price_poll_interval_ms = 500
+# Price polling interval in milliseconds (200ms for faster crash detection)
+price_poll_interval_ms = 200
 
 # === LAYERED EXITS ===
 # Layer 1: Sell 50% at quick_profit_pct to lock in early gains
