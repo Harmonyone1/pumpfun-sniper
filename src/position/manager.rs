@@ -38,10 +38,10 @@ impl EntryType {
     /// DATA-DRIVEN: Lowered for realistic 2-minute holds
     pub fn take_profit_pct(&self) -> f64 {
         match self {
-            EntryType::StrongBuy => 15.0,    // Was 100% - now 15% realistic
-            EntryType::Opportunity => 10.0,   // Was 50% - now 10% for quick profit
-            EntryType::Probe => 8.0,          // Was 25% - now 8% quick scalp
-            EntryType::Legacy => 10.0,        // Default
+            EntryType::StrongBuy => 15.0,   // Was 100% - now 15% realistic
+            EntryType::Opportunity => 10.0, // Was 50% - now 10% for quick profit
+            EntryType::Probe => 8.0,        // Was 25% - now 8% quick scalp
+            EntryType::Legacy => 10.0,      // Default
         }
     }
 
@@ -49,10 +49,10 @@ impl EntryType {
     /// This secures profits early before potential dump
     pub fn quick_profit_pct(&self) -> f64 {
         match self {
-            EntryType::StrongBuy => 8.0,     // Take 50% off at 8% profit
-            EntryType::Opportunity => 5.0,    // Take 50% off at 5% profit
-            EntryType::Probe => 4.0,          // Take 50% off at 4% profit (very quick)
-            EntryType::Legacy => 5.0,         // Default
+            EntryType::StrongBuy => 8.0,   // Take 50% off at 8% profit
+            EntryType::Opportunity => 5.0, // Take 50% off at 5% profit
+            EntryType::Probe => 4.0,       // Take 50% off at 4% profit (very quick)
+            EntryType::Legacy => 5.0,      // Default
         }
     }
 
@@ -60,10 +60,10 @@ impl EntryType {
     /// WIDENED: Give trades more room to breathe
     pub fn stop_loss_pct(&self) -> f64 {
         match self {
-            EntryType::StrongBuy => 15.0,    // Widened from 10% to 15%
-            EntryType::Opportunity => 12.0,   // Widened from 8% to 12%
-            EntryType::Probe => 10.0,         // Widened from 6% to 10%
-            EntryType::Legacy => 12.0,        // Widened from 8% to 12%
+            EntryType::StrongBuy => 15.0,   // Widened from 10% to 15%
+            EntryType::Opportunity => 15.0, // Widened from 12% to 15%
+            EntryType::Probe => 12.0,       // Widened from 10% to 12%
+            EntryType::Legacy => 15.0,      // Widened from 12% to 15%
         }
     }
 
@@ -242,26 +242,7 @@ impl PositionManager {
     /// Open a new position
     pub async fn open_position(&self, position: Position) -> Result<()> {
         // Check safety limits
-        let total_position_value = self.total_position_value().await;
-        let new_total = total_position_value + position.total_cost_sol;
-
-        if new_total > self.safety_config.max_position_sol {
-            return Err(Error::MaxPositionExceeded {
-                current: total_position_value,
-                buy: position.total_cost_sol,
-                max: self.safety_config.max_position_sol,
-            });
-        }
-
-        // Check daily loss limit
-        let stats = self.daily_stats.read().await;
-        if stats.total_loss_sol >= self.safety_config.daily_loss_limit_sol {
-            return Err(Error::DailyLossLimitReached {
-                lost: stats.total_loss_sol,
-                limit: self.safety_config.daily_loss_limit_sol,
-            });
-        }
-        drop(stats);
+        self.check_risk_limits(position.total_cost_sol).await?;
 
         // Add position
         let mint = position.mint.clone();
@@ -275,6 +256,11 @@ impl PositionManager {
         self.save().await?;
 
         Ok(())
+    }
+
+    /// Verify limits before sending a new buy
+    pub async fn can_open_position(&self, buy_amount: f64) -> Result<()> {
+        self.check_risk_limits(buy_amount).await
     }
 
     /// Close a position (fully or partially)
@@ -321,6 +307,17 @@ impl PositionManager {
         self.save().await?;
 
         Ok(pnl)
+    }
+
+    /// Remove a position without affecting daily stats (e.g., when a fill never landed)
+    pub async fn abandon_position(&self, mint: &str) -> Result<()> {
+        let mut positions = self.positions.write().await;
+        if positions.remove(mint).is_some() {
+            info!("Abandoned position in {} without recording P&L", mint);
+            drop(positions);
+            self.save().await?;
+        }
+        Ok(())
     }
 
     /// Update current price for a position and track peak price
@@ -399,34 +396,6 @@ impl PositionManager {
         stats.total_loss_sol >= self.safety_config.daily_loss_limit_sol
     }
 
-    /// Check if we can open a new position with given buy amount
-    /// Returns Ok(()) if allowed, Err with reason if not
-    pub async fn can_open_position(&self, buy_amount: f64) -> Result<()> {
-        // Check daily loss limit first
-        let stats = self.daily_stats.read().await;
-        if stats.total_loss_sol >= self.safety_config.daily_loss_limit_sol {
-            return Err(Error::DailyLossLimitReached {
-                lost: stats.total_loss_sol,
-                limit: self.safety_config.daily_loss_limit_sol,
-            });
-        }
-        drop(stats);
-
-        // Check max position size
-        let total_position_value = self.total_position_value().await;
-        let new_total = total_position_value + buy_amount;
-
-        if new_total > self.safety_config.max_position_sol {
-            return Err(Error::MaxPositionExceeded {
-                current: total_position_value,
-                buy: buy_amount,
-                max: self.safety_config.max_position_sol,
-            });
-        }
-
-        Ok(())
-    }
-
     /// Get remaining capacity for new positions
     pub async fn remaining_position_capacity(&self) -> f64 {
         let total = self.total_position_value().await;
@@ -450,6 +419,27 @@ impl PositionManager {
     pub async fn position_count(&self) -> usize {
         self.positions.read().await.len()
     }
+
+    async fn check_risk_limits(&self, buy_amount: f64) -> Result<()> {
+        let total_position_value = self.total_position_value().await;
+        if total_position_value + buy_amount > self.safety_config.max_position_sol {
+            return Err(Error::MaxPositionExceeded {
+                current: total_position_value,
+                buy: buy_amount,
+                max: self.safety_config.max_position_sol,
+            });
+        }
+
+        let stats = self.daily_stats.read().await;
+        if stats.total_loss_sol >= self.safety_config.daily_loss_limit_sol {
+            return Err(Error::DailyLossLimitReached {
+                lost: stats.total_loss_sol,
+                limit: self.safety_config.daily_loss_limit_sol,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -463,7 +453,7 @@ mod tests {
             symbol: "TEST".to_string(),
             bonding_curve: "test_curve".to_string(),
             token_amount: 1_000_000,
-            entry_price: 0.00000001,  // 0.01 SOL for 1M tokens
+            entry_price: 0.00000001, // 0.01 SOL for 1M tokens
             total_cost_sol: 0.01,
             entry_time: chrono::Utc::now(),
             entry_signature: "test_sig".to_string(),

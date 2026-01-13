@@ -34,11 +34,21 @@ pub struct HolderWatcherConfig {
     pub pattern_tracking_mins: u64,
 }
 
-fn default_holders_to_watch() -> usize { 10 }
-fn default_min_holding_pct() -> f64 { 2.0 }
-fn default_exit_threshold_pct() -> f64 { 10.0 }
-fn default_exit_on_any_sell() -> bool { true }
-fn default_pattern_tracking_mins() -> u64 { 30 }
+fn default_holders_to_watch() -> usize {
+    10
+}
+fn default_min_holding_pct() -> f64 {
+    2.0
+}
+fn default_exit_threshold_pct() -> f64 {
+    10.0
+}
+fn default_exit_on_any_sell() -> bool {
+    true
+}
+fn default_pattern_tracking_mins() -> u64 {
+    30
+}
 
 impl Default for HolderWatcherConfig {
     fn default() -> Self {
@@ -86,7 +96,7 @@ pub struct HolderSell {
 pub struct HolderSellAlert {
     pub mint: String,
     pub holder: String,
-    pub holder_rank: usize,  // 1 = top holder, 2 = second, etc.
+    pub holder_rank: usize, // 1 = top holder, 2 = second, etc.
     pub original_pct: f64,
     pub amount_sold: u64,
     pub pct_sold: f64,       // % of their holdings sold
@@ -207,7 +217,8 @@ impl HolderWatcher {
             self.update_patterns_on_exit(&holders);
 
             // Remove addresses (but only if not watching same address for another token)
-            let still_watching: HashSet<_> = watched.values()
+            let still_watching: HashSet<_> = watched
+                .values()
                 .flat_map(|h| h.iter().map(|wh| wh.address.clone()))
                 .collect();
 
@@ -228,7 +239,12 @@ impl HolderWatcher {
 
     /// Get all addresses we're watching (for subscribing to trade events)
     pub fn get_watched_addresses(&self) -> Vec<String> {
-        self.watched_addresses.read().unwrap().iter().cloned().collect()
+        self.watched_addresses
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Process a sell event - returns alert if this is a watched holder selling
@@ -280,7 +296,7 @@ impl HolderWatcher {
 
         // Determine urgency
         let urgency = if holder_idx == 0 {
-            AlertUrgency::Critical  // TOP holder selling
+            AlertUrgency::Critical // TOP holder selling
         } else if holder_idx < 3 || holder.original_pct > 10.0 {
             AlertUrgency::High
         } else {
@@ -364,8 +380,16 @@ impl HolderWatcher {
                     pct_sold: total_sold_pct,
                     total_sold_pct,
                     is_first_sell: false,
-                    urgency: if idx == 0 { AlertUrgency::Critical } else { AlertUrgency::High },
-                    timestamp: holder.sells.last().map(|s| s.timestamp).unwrap_or_else(Utc::now),
+                    urgency: if idx == 0 {
+                        AlertUrgency::Critical
+                    } else {
+                        AlertUrgency::High
+                    },
+                    timestamp: holder
+                        .sells
+                        .last()
+                        .map(|s| s.timestamp)
+                        .unwrap_or_else(Utc::now),
                 });
             }
 
@@ -381,7 +405,11 @@ impl HolderWatcher {
                     total_sold_pct,
                     is_first_sell: false,
                     urgency: AlertUrgency::High,
-                    timestamp: holder.sells.last().map(|s| s.timestamp).unwrap_or_else(Utc::now),
+                    timestamp: holder
+                        .sells
+                        .last()
+                        .map(|s| s.timestamp)
+                        .unwrap_or_else(Utc::now),
                 });
             }
         }
@@ -403,7 +431,8 @@ impl HolderWatcher {
                 continue;
             }
 
-            let pattern = patterns.entry(holder.address.clone())
+            let pattern = patterns
+                .entry(holder.address.clone())
                 .or_insert_with(|| HolderPattern {
                     address: holder.address.clone(),
                     ..Default::default()
@@ -417,7 +446,9 @@ impl HolderWatcher {
                 100.0
             };
 
-            let time_held = holder.sells.first()
+            let time_held = holder
+                .sells
+                .first()
                 .map(|s| (s.timestamp - holder.watch_started).num_seconds().max(0) as u64)
                 .unwrap_or(0);
 
@@ -431,13 +462,15 @@ impl HolderWatcher {
 
             // Update averages
             if !pattern.tokens_dumped.is_empty() {
-                let avg_time: f64 = pattern.tokens_dumped.iter()
+                let avg_time: f64 = pattern
+                    .tokens_dumped
+                    .iter()
                     .map(|d| d.time_held_secs as f64)
-                    .sum::<f64>() / pattern.tokens_dumped.len() as f64;
+                    .sum::<f64>()
+                    / pattern.tokens_dumped.len() as f64;
                 pattern.avg_time_to_dump_secs = Some(avg_time);
 
-                pattern.sells_in_chunks = pattern.tokens_dumped.iter()
-                    .any(|d| d.num_sells > 1);
+                pattern.sells_in_chunks = pattern.tokens_dumped.iter().any(|d| d.num_sells > 1);
             }
 
             debug!(
@@ -477,7 +510,10 @@ impl HolderWatcher {
             tokens_watched: watched.len(),
             total_holders_watched: addresses.len(),
             known_patterns: patterns.len(),
-            known_dumpers: patterns.values().filter(|p| p.tokens_dumped.len() >= 2).count(),
+            known_dumpers: patterns
+                .values()
+                .filter(|p| p.tokens_dumped.len() >= 2)
+                .count(),
         }
     }
 }
@@ -500,9 +536,9 @@ mod tests {
 
         // Watch a token with holders
         let holders = vec![
-            ("holder1".to_string(), 1000000, 50.0),  // 50% holder
-            ("holder2".to_string(), 500000, 25.0),   // 25% holder
-            ("holder3".to_string(), 200000, 10.0),   // 10% holder
+            ("holder1".to_string(), 1000000, 50.0), // 50% holder
+            ("holder2".to_string(), 500000, 25.0),  // 25% holder
+            ("holder3".to_string(), 200000, 10.0),  // 10% holder
         ];
         watcher.watch_token("token1", holders);
 
@@ -512,10 +548,8 @@ mod tests {
 
         // Simulate top holder selling
         let alert = watcher.process_sell(
-            "holder1",
-            "token1",
-            500000,  // Selling half
-            5.0,     // For 5 SOL
+            "holder1", "token1", 500000, // Selling half
+            5.0,    // For 5 SOL
             "sig123",
         );
 
@@ -534,9 +568,7 @@ mod tests {
         };
         let watcher = HolderWatcher::new(config);
 
-        let holders = vec![
-            ("holder1".to_string(), 1000000, 50.0),
-        ];
+        let holders = vec![("holder1".to_string(), 1000000, 50.0)];
         watcher.watch_token("token1", holders);
 
         // Before sell - should not exit

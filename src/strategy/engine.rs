@@ -13,9 +13,9 @@ use super::chain_health::{ChainHealth, ChainHealthConfig};
 use super::delta_tracker::DeltaTracker;
 use super::execution_feedback::{ExecutionFeedback, ExecutionFeedbackConfig};
 use super::exit_manager::{ExitManager, ExitManagerConfig, PositionContext};
-use super::fatal_risk::{FatalRiskContext, FatalRiskEngine, FatalRiskConfig};
+use super::fatal_risk::{FatalRiskConfig, FatalRiskContext, FatalRiskEngine};
 use super::liquidity::{LiquidityAnalyzer, LiquidityConfig};
-use super::portfolio_risk::{PortfolioRiskGovernor, PortfolioRiskConfig};
+use super::portfolio_risk::{PortfolioRiskConfig, PortfolioRiskGovernor};
 use super::price_action::{PriceAction, PriceActionAnalyzer};
 use super::randomization::{RandomizationConfig, Randomizer};
 use super::regime::{
@@ -23,8 +23,8 @@ use super::regime::{
 };
 use super::sizing::{PositionSizer, PositionSizingConfig, SizingContext};
 use super::types::{
-    ArbitratedDecision, DecisionExplanation, EntrySignal, ExitSignal, Position,
-    TokenRegime, TradingAction, TradingStrategy,
+    ArbitratedDecision, DecisionExplanation, EntrySignal, ExitSignal, Position, TokenRegime,
+    TradingAction, TradingStrategy,
 };
 
 /// Strategy engine configuration
@@ -162,14 +162,17 @@ impl StrategyEngine {
     pub async fn evaluate_entry(&mut self, ctx: &TokenAnalysisContext) -> EntryEvaluation {
         // 1. Build fatal risk context
         let creator_sell_info = if ctx.creator_behavior.total_sold_pct > 0.0 {
-            Some((ctx.creator_behavior.total_sold_pct, ctx.creator_behavior.avg_sell_interval_secs))
+            Some((
+                ctx.creator_behavior.total_sold_pct,
+                ctx.creator_behavior.avg_sell_interval_secs,
+            ))
         } else {
             None
         };
 
         let fatal_context = FatalRiskContext {
             mint: ctx.mint.clone(),
-            creator: String::new(), // Would come from token data
+            creator: String::new(),       // Would come from token data
             mint_authority_active: false, // Would come from RPC
             freeze_authority_active: false,
             creator_sell_info,
@@ -192,7 +195,9 @@ impl StrategyEngine {
         drop(chain_health);
 
         // 4. Check portfolio risk
-        let delta_metrics = self.get_or_create_delta_tracker(&ctx.mint).compute_metrics(&ctx.mint);
+        let delta_metrics = self
+            .get_or_create_delta_tracker(&ctx.mint)
+            .compute_metrics(&ctx.mint);
         let regime = self.regime_classifier.classify(
             &ctx.order_flow,
             &ctx.distribution,
@@ -201,7 +206,9 @@ impl StrategyEngine {
         );
 
         // Calculate preliminary size for portfolio check
-        let liquidity = self.liquidity.analyze_simple(ctx.sol_reserves, ctx.token_reserves);
+        let liquidity = self
+            .liquidity
+            .analyze_simple(ctx.sol_reserves, ctx.token_reserves);
 
         let exec_feedback = self.execution_feedback.read().await;
         let _exec_quality = exec_feedback.get_quality();
@@ -298,7 +305,9 @@ impl StrategyEngine {
     /// Evaluate an existing position for potential exit
     pub async fn evaluate_position(&mut self, position: &Position) -> PositionEvaluation {
         // Get current price and calculate PnL
-        let current_price = self.get_current_price(&position.mint).unwrap_or(position.entry_price);
+        let current_price = self
+            .get_current_price(&position.mint)
+            .unwrap_or(position.entry_price);
         let pnl_pct = if position.entry_price > 0.0 {
             ((current_price - position.entry_price) / position.entry_price) * 100.0
         } else {
@@ -311,9 +320,7 @@ impl StrategyEngine {
             .compute_metrics(&position.mint);
 
         // Get price action
-        let price_action = self
-            .get_or_create_price_analyzer(&position.mint)
-            .analyze();
+        let price_action = self.get_or_create_price_analyzer(&position.mint).analyze();
 
         // Get regime (simplified - would need full context in real impl)
         let regime = RegimeClassification {
@@ -408,9 +415,23 @@ impl StrategyEngine {
     ) {
         let mut feedback = self.execution_feedback.write().await;
         if is_buy {
-            feedback.record_buy(mint, size_sol, expected_price, actual_price, latency_ms, tx_sig);
+            feedback.record_buy(
+                mint,
+                size_sol,
+                expected_price,
+                actual_price,
+                latency_ms,
+                tx_sig,
+            );
         } else {
-            feedback.record_sell(mint, size_sol, expected_price, actual_price, latency_ms, tx_sig);
+            feedback.record_sell(
+                mint,
+                size_sol,
+                expected_price,
+                actual_price,
+                latency_ms,
+                tx_sig,
+            );
         }
 
         // Also record in chain health
@@ -419,7 +440,14 @@ impl StrategyEngine {
     }
 
     /// Record a failed transaction
-    pub async fn record_tx_failure(&mut self, mint: &str, is_buy: bool, size_sol: f64, latency_ms: u64, reason: &str) {
+    pub async fn record_tx_failure(
+        &mut self,
+        mint: &str,
+        is_buy: bool,
+        size_sol: f64,
+        latency_ms: u64,
+        reason: &str,
+    ) {
         let mut feedback = self.execution_feedback.write().await;
         feedback.record_failure(
             mint,
@@ -464,10 +492,8 @@ impl StrategyEngine {
 
     /// Set filter cache for sharing with fatal risk engine
     pub fn set_filter_cache(&mut self, cache: std::sync::Arc<crate::filter::cache::FilterCache>) {
-        self.fatal_risk = super::fatal_risk::FatalRiskEngine::with_cache(
-            self.config.fatal_risks.clone(),
-            cache,
-        );
+        self.fatal_risk =
+            super::fatal_risk::FatalRiskEngine::with_cache(self.config.fatal_risks.clone(), cache);
     }
 
     /// Check for exit signals on an existing position
@@ -562,7 +588,10 @@ impl StrategyEngine {
             chain_health.should_block_entries()
         );
         if chain_health.should_block_entries() {
-            return Some(format!("Chain congestion: {:?}", chain_state.congestion_level));
+            return Some(format!(
+                "Chain congestion: {:?}",
+                chain_state.congestion_level
+            ));
         }
         drop(chain_health);
 
@@ -628,7 +657,10 @@ impl StrategyEngine {
     }
 
     /// Sample chain health (call periodically)
-    pub async fn sample_chain_health(&self, rpc: &solana_client::nonblocking::rpc_client::RpcClient) {
+    pub async fn sample_chain_health(
+        &self,
+        rpc: &solana_client::nonblocking::rpc_client::RpcClient,
+    ) {
         let mut chain_health = self.chain_health.write().await;
         chain_health.sample(rpc).await;
     }

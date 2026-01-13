@@ -180,7 +180,11 @@ impl HotToken {
         let ratio_score = (capped_ratio - 1.0).max(0.0) * 20.0;
         let boost_score = if self.is_boosted { 10.0 } else { 0.0 };
         // Bonus for positive H1 (sustained momentum)
-        let h1_bonus = if self.h1_change > 0.0 { self.h1_change * 0.5 } else { 0.0 };
+        let h1_bonus = if self.h1_change > 0.0 {
+            self.h1_change * 0.5
+        } else {
+            0.0
+        };
 
         momentum_score + activity_score + ratio_score + boost_score + h1_bonus
     }
@@ -189,35 +193,35 @@ impl HotToken {
 /// Configuration for hot token scanning
 #[derive(Debug, Clone)]
 pub struct HotScanConfig {
-    pub min_m5_change: f64,        // Minimum 5-minute price change %
-    pub max_m5_change: f64,        // Maximum 5-minute change (avoid buying tops)
-    pub min_h1_change: f64,        // Minimum H1 change (avoid dead cat bounces)
-    pub min_buy_sell_ratio: f64,   // Minimum buy/sell ratio
-    pub max_buy_sell_ratio: f64,   // Maximum ratio (avoid wash trading)
-    pub min_buys_5m: u32,          // Minimum buys in 5 minutes
-    pub min_liquidity_usd: f64,    // Minimum liquidity in USD
-    pub min_market_cap: f64,       // Minimum market cap
-    pub max_market_cap: f64,       // Maximum market cap (avoid too established)
-    pub min_score: f64,            // Minimum score to consider
-    pub scan_profiles: bool,       // Scan latest profiles
-    pub scan_boosts: bool,         // Scan boosted tokens
-    pub profile_limit: usize,      // How many profiles to check
-    pub boost_limit: usize,        // How many boosts to check
+    pub min_m5_change: f64,      // Minimum 5-minute price change %
+    pub max_m5_change: f64,      // Maximum 5-minute change (avoid buying tops)
+    pub min_h1_change: f64,      // Minimum H1 change (avoid dead cat bounces)
+    pub min_buy_sell_ratio: f64, // Minimum buy/sell ratio
+    pub max_buy_sell_ratio: f64, // Maximum ratio (avoid wash trading)
+    pub min_buys_5m: u32,        // Minimum buys in 5 minutes
+    pub min_liquidity_usd: f64,  // Minimum liquidity in USD
+    pub min_market_cap: f64,     // Minimum market cap
+    pub max_market_cap: f64,     // Maximum market cap (avoid too established)
+    pub min_score: f64,          // Minimum score to consider
+    pub scan_profiles: bool,     // Scan latest profiles
+    pub scan_boosts: bool,       // Scan boosted tokens
+    pub profile_limit: usize,    // How many profiles to check
+    pub boost_limit: usize,      // How many boosts to check
 }
 
 impl Default for HotScanConfig {
     fn default() -> Self {
         Self {
-            min_m5_change: 10.0,           // 10% gain in 5 minutes
-            max_m5_change: 80.0,           // Don't buy after 80%+ pump (buying top)
-            min_h1_change: -30.0,          // Reject if H1 < -30% (dead cat bounce)
-            min_buy_sell_ratio: 1.3,       // 30% more buys than sells
-            max_buy_sell_ratio: 10.0,      // Cap at 10:1 (avoid manipulation)
-            min_buys_5m: 10,               // At least 10 buys in 5 min
-            min_liquidity_usd: 10_000.0,   // $10k liquidity
-            min_market_cap: 20_000.0,      // $20k market cap minimum
-            max_market_cap: 500_000.0,     // $500k max (avoid late entries)
-            min_score: 50.0,               // Minimum score threshold
+            min_m5_change: 10.0,         // 10% gain in 5 minutes
+            max_m5_change: 80.0,         // Don't buy after 80%+ pump (buying top)
+            min_h1_change: -30.0,        // Reject if H1 < -30% (dead cat bounce)
+            min_buy_sell_ratio: 1.3,     // 30% more buys than sells
+            max_buy_sell_ratio: 10.0,    // Cap at 10:1 (avoid manipulation)
+            min_buys_5m: 10,             // At least 10 buys in 5 min
+            min_liquidity_usd: 10_000.0, // $10k liquidity
+            min_market_cap: 20_000.0,    // $20k market cap minimum
+            max_market_cap: 500_000.0,   // $500k max (avoid late entries)
+            min_score: 50.0,             // Minimum score threshold
             scan_profiles: true,
             scan_boosts: true,
             profile_limit: 30,
@@ -264,7 +268,8 @@ impl DexScreenerClient {
 
         // Prefer pumpswap/pumpfun pairs
         if let Some(pairs) = data.pairs {
-            let pair = pairs.iter()
+            let pair = pairs
+                .iter()
                 .find(|p| p.dex_id == "pumpswap" || p.dex_id == "pumpfun")
                 .or_else(|| pairs.first())
                 .cloned();
@@ -274,21 +279,34 @@ impl DexScreenerClient {
     }
 
     /// Convert DexPair to HotToken with metrics
-    fn pair_to_hot_token(&self, mint: &str, pair: &DexPair, is_boosted: bool, boost_amount: f64) -> HotToken {
-        let price_native = pair.price_native
+    fn pair_to_hot_token(
+        &self,
+        mint: &str,
+        pair: &DexPair,
+        is_boosted: bool,
+        boost_amount: f64,
+    ) -> HotToken {
+        let price_native = pair
+            .price_native
             .as_ref()
             .and_then(|p| p.parse::<f64>().ok())
             .unwrap_or(0.0);
 
-        let m5_change = pair.price_change.as_ref()
+        let m5_change = pair
+            .price_change
+            .as_ref()
             .and_then(|pc| pc.m5)
             .unwrap_or(0.0);
 
-        let h1_change = pair.price_change.as_ref()
+        let h1_change = pair
+            .price_change
+            .as_ref()
             .and_then(|pc| pc.h1)
             .unwrap_or(0.0);
 
-        let (buys_5m, sells_5m) = pair.txns.as_ref()
+        let (buys_5m, sells_5m) = pair
+            .txns
+            .as_ref()
             .and_then(|t| t.m5.as_ref())
             .map(|m5| (m5.buys, m5.sells))
             .unwrap_or((0, 0));
@@ -299,18 +317,22 @@ impl DexScreenerClient {
             buys_5m as f64
         };
 
-        let liquidity_usd = pair.liquidity.as_ref()
-            .and_then(|l| l.usd)
-            .unwrap_or(0.0);
+        let liquidity_usd = pair.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
 
-        let volume_h1 = pair.volume.as_ref()
-            .and_then(|v| v.h1)
-            .unwrap_or(0.0);
+        let volume_h1 = pair.volume.as_ref().and_then(|v| v.h1).unwrap_or(0.0);
 
         HotToken {
             mint: mint.to_string(),
-            symbol: pair.base_token.symbol.clone().unwrap_or_else(|| "???".to_string()),
-            name: pair.base_token.name.clone().unwrap_or_else(|| "Unknown".to_string()),
+            symbol: pair
+                .base_token
+                .symbol
+                .clone()
+                .unwrap_or_else(|| "???".to_string()),
+            name: pair
+                .base_token
+                .name
+                .clone()
+                .unwrap_or_else(|| "Unknown".to_string()),
             price_native,
             m5_change,
             h1_change,
@@ -342,7 +364,10 @@ impl DexScreenerClient {
                         .take(config.profile_limit)
                         .collect();
 
-                    info!("Checking {} Solana profiles from DexScreener", solana_profiles.len());
+                    info!(
+                        "Checking {} Solana profiles from DexScreener",
+                        solana_profiles.len()
+                    );
 
                     for profile in solana_profiles {
                         if seen_mints.contains(&profile.token_address) {
@@ -351,7 +376,8 @@ impl DexScreenerClient {
                         seen_mints.insert(profile.token_address.clone());
 
                         if let Ok(Some(pair)) = self.get_token_pairs(&profile.token_address).await {
-                            let hot = self.pair_to_hot_token(&profile.token_address, &pair, false, 0.0);
+                            let hot =
+                                self.pair_to_hot_token(&profile.token_address, &pair, false, 0.0);
                             if hot.is_hot(config) {
                                 hot_tokens.push(hot);
                             }
@@ -386,7 +412,12 @@ impl DexScreenerClient {
 
                         if let Ok(Some(pair)) = self.get_token_pairs(&boost.token_address).await {
                             let boost_amount = boost.total_amount.unwrap_or(0.0);
-                            let hot = self.pair_to_hot_token(&boost.token_address, &pair, true, boost_amount);
+                            let hot = self.pair_to_hot_token(
+                                &boost.token_address,
+                                &pair,
+                                true,
+                                boost_amount,
+                            );
                             if hot.is_hot(config) {
                                 hot_tokens.push(hot);
                             }
@@ -401,7 +432,11 @@ impl DexScreenerClient {
         }
 
         // Sort by score (best opportunities first)
-        hot_tokens.sort_by(|a, b| b.score().partial_cmp(&a.score()).unwrap_or(std::cmp::Ordering::Equal));
+        hot_tokens.sort_by(|a, b| {
+            b.score()
+                .partial_cmp(&a.score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(hot_tokens)
     }

@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use super::delta_tracker::DeltaMetrics;
 use super::price_action::PriceAction;
 use super::regime::RegimeClassification;
-use super::types::{ExitCondition, ExitReason, ExitSignal, ExitStyle, Position, TradingStrategy, Urgency};
+use super::types::{
+    ExitCondition, ExitReason, ExitSignal, ExitStyle, Position, TradingStrategy, Urgency,
+};
 
 /// Exit manager configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +80,10 @@ impl ExitManager {
 
     /// Update position tracking with new price
     pub fn update_price(&mut self, mint: &str, price: f64) {
-        let high = self.position_high_prices.entry(mint.to_string()).or_insert(price);
+        let high = self
+            .position_high_prices
+            .entry(mint.to_string())
+            .or_insert(price);
         if price > *high {
             *high = price;
         }
@@ -99,7 +104,10 @@ impl ExitManager {
 
     /// Get levels hit for a position
     pub fn get_levels_hit(&self, mint: &str) -> Vec<f64> {
-        self.position_levels_hit.get(mint).cloned().unwrap_or_default()
+        self.position_levels_hit
+            .get(mint)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Clear tracking for a position
@@ -123,9 +131,7 @@ impl ExitManager {
                     }
                 } else {
                     // Lower confidence = quick exit
-                    ExitStyle::QuickScalp {
-                        target_pct: 30.0,
-                    }
+                    ExitStyle::QuickScalp { target_pct: 30.0 }
                 }
             }
 
@@ -180,7 +186,9 @@ impl ExitManager {
             return Some(ExitSignal {
                 mint: ctx.position.mint.clone(),
                 pct_to_sell: 100.0,
-                reason: ExitReason::StopLoss { loss_pct: -ctx.pnl_pct },
+                reason: ExitReason::StopLoss {
+                    loss_pct: -ctx.pnl_pct,
+                },
                 urgency: Urgency::Immediate,
             });
         }
@@ -190,7 +198,9 @@ impl ExitManager {
             return Some(ExitSignal {
                 mint: ctx.position.mint.clone(),
                 pct_to_sell: 100.0,
-                reason: ExitReason::MaxHoldTime { held_secs: ctx.hold_time_secs },
+                reason: ExitReason::MaxHoldTime {
+                    held_secs: ctx.hold_time_secs,
+                },
                 urgency: Urgency::High,
             });
         }
@@ -248,7 +258,9 @@ impl ExitManager {
                     return Some(ExitSignal {
                         mint: ctx.position.mint.clone(),
                         pct_to_sell: 100.0,
-                        reason: ExitReason::TakeProfit { pnl_pct: ctx.pnl_pct },
+                        reason: ExitReason::TakeProfit {
+                            pnl_pct: ctx.pnl_pct,
+                        },
                         urgency: Urgency::High,
                     });
                 }
@@ -260,7 +272,9 @@ impl ExitManager {
                         return Some(ExitSignal {
                             mint: ctx.position.mint.clone(),
                             pct_to_sell: *sell_pct,
-                            reason: ExitReason::TakeProfit { pnl_pct: ctx.pnl_pct },
+                            reason: ExitReason::TakeProfit {
+                                pnl_pct: ctx.pnl_pct,
+                            },
                             urgency: Urgency::Normal,
                         });
                     }
@@ -278,7 +292,9 @@ impl ExitManager {
                             mint: ctx.position.mint.clone(),
                             pct_to_sell: 100.0,
                             reason: ExitReason::TrailingStopHit {
-                                peak_pnl_pct: ((ctx.high_price - ctx.position.entry_price) / ctx.position.entry_price) * 100.0,
+                                peak_pnl_pct: ((ctx.high_price - ctx.position.entry_price)
+                                    / ctx.position.entry_price)
+                                    * 100.0,
                                 current_pnl_pct: ctx.pnl_pct,
                             },
                             urgency: Urgency::Immediate,
@@ -292,7 +308,9 @@ impl ExitManager {
                     return Some(ExitSignal {
                         mint: ctx.position.mint.clone(),
                         pct_to_sell: 100.0,
-                        reason: ExitReason::MaxHoldTime { held_secs: ctx.hold_time_secs },
+                        reason: ExitReason::MaxHoldTime {
+                            held_secs: ctx.hold_time_secs,
+                        },
                         urgency: Urgency::High,
                     });
                 }
@@ -392,8 +410,8 @@ impl Default for ExitManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::TokenRegime;
+    use super::*;
 
     fn create_test_context(pnl_pct: f64, strategy: TradingStrategy) -> PositionContext {
         let entry_price = 0.001;

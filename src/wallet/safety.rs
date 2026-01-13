@@ -52,16 +52,10 @@ impl Default for WalletSafetyConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SafetyViolation {
     /// Transfer would drain hot wallet below minimum
-    MinBalanceViolation {
-        remaining: f64,
-        minimum: f64,
-    },
+    MinBalanceViolation { remaining: f64, minimum: f64 },
 
     /// Single transfer exceeds maximum
-    MaxSingleTransferExceeded {
-        amount: f64,
-        max: f64,
-    },
+    MaxSingleTransferExceeded { amount: f64, max: f64 },
 
     /// Daily extraction limit reached
     DailyLimitExceeded {
@@ -77,28 +71,19 @@ pub enum SafetyViolation {
     VaultWithdrawalBlocked,
 
     /// AI action exceeds authority
-    AiAuthorityExceeded {
-        amount: f64,
-        max: f64,
-    },
+    AiAuthorityExceeded { amount: f64, max: f64 },
 
     /// AI action is forbidden
-    AiActionForbidden {
-        action: String,
-    },
+    AiActionForbidden { action: String },
 
     /// Emergency lock is active
     EmergencyLockActive,
 
     /// Source wallet cannot send
-    InvalidSourceWallet {
-        wallet_type: String,
-    },
+    InvalidSourceWallet { wallet_type: String },
 
     /// Destination wallet cannot receive
-    InvalidDestinationWallet {
-        wallet_type: String,
-    },
+    InvalidDestinationWallet { wallet_type: String },
 }
 
 impl std::fmt::Display for SafetyViolation {
@@ -118,7 +103,11 @@ impl std::fmt::Display for SafetyViolation {
                     amount, max
                 )
             }
-            SafetyViolation::DailyLimitExceeded { current, requested, max } => {
+            SafetyViolation::DailyLimitExceeded {
+                current,
+                requested,
+                max,
+            } => {
                 write!(
                     f,
                     "Daily limit exceeded: {} SOL extracted + {} SOL requested > {} SOL limit",

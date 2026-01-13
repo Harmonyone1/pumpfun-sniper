@@ -202,10 +202,7 @@ impl AdaptiveFilter {
             match tokio::time::timeout(timeout, provider.compute_token_signals(context)).await {
                 Ok(provider_signals) => signals.extend(provider_signals),
                 Err(_) => {
-                    tracing::warn!(
-                        provider = provider.name(),
-                        "Hot-path provider timed out"
-                    );
+                    tracing::warn!(provider = provider.name(), "Hot-path provider timed out");
                     // Add a penalty signal for timeout
                     signals.push(Signal::unavailable(
                         SignalType::WalletHistory,
@@ -299,9 +296,12 @@ impl AdaptiveFilter {
             );
         } else {
             signals.push(
-                Signal::neutral(SignalType::KnownDeployer, "Creator not in deployer blacklist")
-                    .with_latency(start.elapsed())
-                    .with_cached(true),
+                Signal::neutral(
+                    SignalType::KnownDeployer,
+                    "Creator not in deployer blacklist",
+                )
+                .with_latency(start.elapsed())
+                .with_cached(true),
             );
         }
 
@@ -402,8 +402,8 @@ impl AdaptiveFilter {
                 signals.push(
                     Signal::new(
                         SignalType::WalletAge,
-                        -0.1,  // Reduced from -0.4 - new wallets are normal on pump.fun
-                        0.5,   // Lower confidence - this signal is less meaningful
+                        -0.1, // Reduced from -0.4 - new wallets are normal on pump.fun
+                        0.5,  // Lower confidence - this signal is less meaningful
                         format!(
                             "Creator wallet is new ({:.1} days old)",
                             history.age_days().unwrap_or(0.0)
@@ -563,31 +563,21 @@ impl AdaptiveFilter {
 
         // Check for very short or very long names
         if name.len() < 2 || symbol.len() < 2 {
-            return Signal::new(
-                SignalType::NameQuality,
-                -0.3,
-                0.6,
-                "Very short name/symbol",
-            );
+            return Signal::new(SignalType::NameQuality, -0.3, 0.6, "Very short name/symbol");
         }
 
         if name.len() > 30 {
-            return Signal::new(
-                SignalType::NameQuality,
-                -0.2,
-                0.5,
-                "Unusually long name",
-            );
+            return Signal::new(SignalType::NameQuality, -0.2, 0.5, "Unusually long name");
         }
 
         // Check for all caps (often spam)
-        if name.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase()) && name.len() > 4 {
-            return Signal::new(
-                SignalType::NameQuality,
-                -0.1,
-                0.4,
-                "All caps name",
-            );
+        if name
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .all(|c| c.is_uppercase())
+            && name.len() > 4
+        {
+            return Signal::new(SignalType::NameQuality, -0.1, 0.4, "All caps name");
         }
 
         // Default neutral

@@ -73,12 +73,12 @@ impl ChainHealth {
         // Get recent performance samples
         if let Ok(samples) = rpc.get_recent_performance_samples(Some(5)).await {
             if !samples.is_empty() {
-                let avg_slot_time = samples.iter()
+                let avg_slot_time = samples
+                    .iter()
                     .filter(|s| s.num_slots > 0)
-                    .map(|s| {
-                        (s.sample_period_secs as f64 / s.num_slots as f64) * 1000.0
-                    })
-                    .sum::<f64>() / samples.len() as f64;
+                    .map(|s| (s.sample_period_secs as f64 / s.num_slots as f64) * 1000.0)
+                    .sum::<f64>()
+                    / samples.len() as f64;
                 self.recent_slot_times.add(avg_slot_time);
             }
         }
@@ -87,9 +87,8 @@ impl ChainHealth {
         // Note: This may not work on all RPC endpoints
         if let Ok(fees) = rpc.get_recent_prioritization_fees(&[]).await {
             if !fees.is_empty() {
-                let avg_fee = fees.iter()
-                    .map(|f| f.prioritization_fee)
-                    .sum::<u64>() / fees.len() as u64;
+                let avg_fee =
+                    fees.iter().map(|f| f.prioritization_fee).sum::<u64>() / fees.len() as u64;
                 self.recent_priority_fees.add(avg_fee as f64);
             }
         }
@@ -168,17 +167,13 @@ impl ChainHealth {
         match level {
             CongestionLevel::Normal => ChainAction::ProceedNormally,
 
-            CongestionLevel::Elevated => {
-                ChainAction::IncreasePriorityFee {
-                    to_lamports: priority_fee.saturating_mul(2).max(5000),
-                }
-            }
+            CongestionLevel::Elevated => ChainAction::IncreasePriorityFee {
+                to_lamports: priority_fee.saturating_mul(2).max(5000),
+            },
 
-            CongestionLevel::High => {
-                ChainAction::ReducePositionSize {
-                    factor: self.config.congestion_size_factor,
-                }
-            }
+            CongestionLevel::High => ChainAction::ReducePositionSize {
+                factor: self.config.congestion_size_factor,
+            },
 
             CongestionLevel::Severe => {
                 if self.config.pause_on_severe {
@@ -262,10 +257,7 @@ mod tests {
         );
 
         // High
-        assert_eq!(
-            health.calculate_congestion(560, 0.0),
-            CongestionLevel::High
-        );
+        assert_eq!(health.calculate_congestion(560, 0.0), CongestionLevel::High);
 
         // Severe
         assert_eq!(

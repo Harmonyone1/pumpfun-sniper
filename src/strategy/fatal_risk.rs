@@ -21,21 +21,14 @@ pub enum FatalRisk {
     FreezeAuthorityActive,
 
     /// Creator is in known rug deployer blacklist
-    KnownRugDeployer {
-        prior_rugs: u32,
-    },
+    KnownRugDeployer { prior_rugs: u32 },
 
     /// Creator sold significant portion early
-    CreatorDumpedEarly {
-        pct_sold: f64,
-        within_secs: u64,
-    },
+    CreatorDumpedEarly { pct_sold: f64, within_secs: u64 },
 
     // === Liquidity risks ===
     /// Liquidity dropped suddenly
-    LiquidityCollapsed {
-        drop_pct: f64,
-    },
+    LiquidityCollapsed { drop_pct: f64 },
 
     /// Cannot exit without extreme slippage
     ExitImpossible {
@@ -51,9 +44,7 @@ pub enum FatalRisk {
 
     // === Pattern risks ===
     /// Confirmed wash trading (>80% score)
-    WashTradingConfirmed {
-        wash_pct: f64,
-    },
+    WashTradingConfirmed { wash_pct: f64 },
 
     /// Known rug pattern detected
     BundledRugPattern {
@@ -62,23 +53,17 @@ pub enum FatalRisk {
     },
 
     /// Sell transactions failing (honeypot)
-    HoneypotDetected {
-        failed_sells: u32,
-    },
+    HoneypotDetected { failed_sells: u32 },
 
     /// Token is already rugged
-    AlreadyRugged {
-        price_drop_pct: f64,
-    },
+    AlreadyRugged { price_drop_pct: f64 },
 
     // === Chain risks ===
     /// Chain congestion too severe
     ChainCongestionCritical,
 
     /// Token blacklisted
-    TokenBlacklisted {
-        reason: String,
-    },
+    TokenBlacklisted { reason: String },
 }
 
 impl FatalRisk {
@@ -94,19 +79,31 @@ impl FatalRisk {
             FatalRisk::KnownRugDeployer { prior_rugs } => {
                 format!("Known rug deployer with {} prior rugs", prior_rugs)
             }
-            FatalRisk::CreatorDumpedEarly { pct_sold, within_secs } => {
-                format!("Creator dumped {:.1}% within {}s of launch", pct_sold, within_secs)
+            FatalRisk::CreatorDumpedEarly {
+                pct_sold,
+                within_secs,
+            } => {
+                format!(
+                    "Creator dumped {:.1}% within {}s of launch",
+                    pct_sold, within_secs
+                )
             }
             FatalRisk::LiquidityCollapsed { drop_pct } => {
                 format!("Liquidity collapsed by {:.1}%", drop_pct)
             }
-            FatalRisk::ExitImpossible { min_exit_sol, slippage_pct } => {
+            FatalRisk::ExitImpossible {
+                min_exit_sol,
+                slippage_pct,
+            } => {
                 format!(
                     "Cannot exit {:.3} SOL without {:.1}% slippage",
                     min_exit_sol, slippage_pct
                 )
             }
-            FatalRisk::InsufficientLiquidity { available_sol, required_sol } => {
+            FatalRisk::InsufficientLiquidity {
+                available_sol,
+                required_sol,
+            } => {
                 format!(
                     "Liquidity {:.3} SOL below minimum {:.3} SOL",
                     available_sol, required_sol
@@ -115,14 +112,27 @@ impl FatalRisk {
             FatalRisk::WashTradingConfirmed { wash_pct } => {
                 format!("Wash trading confirmed at {:.1}%", wash_pct)
             }
-            FatalRisk::BundledRugPattern { pattern_name, confidence } => {
-                format!("Rug pattern '{}' detected ({:.0}% confidence)", pattern_name, confidence * 100.0)
+            FatalRisk::BundledRugPattern {
+                pattern_name,
+                confidence,
+            } => {
+                format!(
+                    "Rug pattern '{}' detected ({:.0}% confidence)",
+                    pattern_name,
+                    confidence * 100.0
+                )
             }
             FatalRisk::HoneypotDetected { failed_sells } => {
-                format!("Honeypot detected - {} sell transactions failed", failed_sells)
+                format!(
+                    "Honeypot detected - {} sell transactions failed",
+                    failed_sells
+                )
             }
             FatalRisk::AlreadyRugged { price_drop_pct } => {
-                format!("Token already rugged - price dropped {:.1}%", price_drop_pct)
+                format!(
+                    "Token already rugged - price dropped {:.1}%",
+                    price_drop_pct
+                )
             }
             FatalRisk::ChainCongestionCritical => {
                 "Solana chain congestion is critical - cannot execute safely".to_string()
@@ -282,7 +292,10 @@ impl FatalRiskEngine {
             if pct_sold > self.config.max_creator_dump_pct
                 && within_secs < self.config.max_creator_dump_secs
             {
-                return Some(FatalRisk::CreatorDumpedEarly { pct_sold, within_secs });
+                return Some(FatalRisk::CreatorDumpedEarly {
+                    pct_sold,
+                    within_secs,
+                });
             }
         }
 
@@ -473,7 +486,10 @@ mod tests {
             .with_liquidity(0.01, 5.0, 0.1); // Only 0.01 SOL liquidity
 
         let result = engine.check(&context).await;
-        assert!(matches!(result, Some(FatalRisk::InsufficientLiquidity { .. })));
+        assert!(matches!(
+            result,
+            Some(FatalRisk::InsufficientLiquidity { .. })
+        ));
     }
 
     #[tokio::test]
@@ -498,7 +514,10 @@ mod tests {
         context.wash_trading_score = 0.85;
 
         let result = engine.check(&context).await;
-        assert!(matches!(result, Some(FatalRisk::WashTradingConfirmed { .. })));
+        assert!(matches!(
+            result,
+            Some(FatalRisk::WashTradingConfirmed { .. })
+        ));
     }
 
     #[tokio::test]

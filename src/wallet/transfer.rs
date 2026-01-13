@@ -48,11 +48,8 @@ impl TransferExecutor {
         );
 
         // Create transfer instruction
-        let instruction = system_instruction::transfer(
-            &from_keypair.pubkey(),
-            to_address,
-            amount_lamports,
-        );
+        let instruction =
+            system_instruction::transfer(&from_keypair.pubkey(), to_address, amount_lamports);
 
         // Get recent blockhash
         let blockhash = self
@@ -130,11 +127,8 @@ impl TransferExecutor {
         }
 
         // Estimate fee
-        let instruction = system_instruction::transfer(
-            &from_keypair.pubkey(),
-            to_address,
-            amount_lamports,
-        );
+        let instruction =
+            system_instruction::transfer(&from_keypair.pubkey(), to_address, amount_lamports);
 
         let blockhash = self
             .rpc_client

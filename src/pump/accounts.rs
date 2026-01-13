@@ -7,8 +7,8 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_sdk::pubkey::Pubkey;
 
-use crate::error::{Error, Result};
 use super::program::ACCOUNT_DISCRIMINATORS;
+use crate::error::{Error, Result};
 
 /// BondingCurve account - stores the bonding curve state for a token
 ///
@@ -114,7 +114,8 @@ impl BondingCurve {
         }
 
         // New SOL reserves after buy
-        let new_sol_reserves = self.virtual_sol_reserves
+        let new_sol_reserves = self
+            .virtual_sol_reserves
             .checked_add(sol_amount)
             .ok_or(Error::PriceOverflow)?;
 
@@ -143,7 +144,8 @@ impl BondingCurve {
         }
 
         // New token reserves after sell
-        let new_token_reserves = self.virtual_token_reserves
+        let new_token_reserves = self
+            .virtual_token_reserves
             .checked_add(token_amount)
             .ok_or(Error::PriceOverflow)?;
 
@@ -229,7 +231,7 @@ mod tests {
     fn test_bonding_curve_price() {
         let curve = BondingCurve {
             _discriminator: ACCOUNT_DISCRIMINATORS::BONDING_CURVE,
-            virtual_sol_reserves: 30_000_000_000,  // 30 SOL in lamports
+            virtual_sol_reserves: 30_000_000_000, // 30 SOL in lamports
             virtual_token_reserves: 1_000_000_000_000, // 1 trillion smallest units
             real_sol_reserves: 0,
             real_token_reserves: 1_000_000_000_000,

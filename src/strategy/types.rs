@@ -50,19 +50,14 @@ pub enum TokenRegime {
         expected_dump_in_secs: u64,
     },
     /// Fake volume from wash trading
-    WashTrade {
-        wash_pct: f64,
-        real_volume_sol: f64,
-    },
+    WashTrade { wash_pct: f64, real_volume_sol: f64 },
     /// Creator slowly selling holdings
     DeployerBleed {
         deployer_holdings_pct: f64,
         avg_sell_interval_secs: u64,
     },
     /// Unknown regime (insufficient data)
-    Unknown {
-        data_completeness: f64,
-    },
+    Unknown { data_completeness: f64 },
 }
 
 impl Default for TokenRegime {
@@ -76,7 +71,10 @@ impl Default for TokenRegime {
 impl TokenRegime {
     /// Returns true if this regime should be avoided
     pub fn should_avoid(&self) -> bool {
-        matches!(self, TokenRegime::WashTrade { .. } | TokenRegime::DeployerBleed { .. })
+        matches!(
+            self,
+            TokenRegime::WashTrade { .. } | TokenRegime::DeployerBleed { .. }
+        )
     }
 
     /// Returns the confidence level for this regime
@@ -108,27 +106,18 @@ impl TokenRegime {
 #[serde(rename_all = "snake_case")]
 pub enum ExitStyle {
     /// Quick scalp with fixed target
-    QuickScalp {
-        target_pct: f64,
-    },
+    QuickScalp { target_pct: f64 },
     /// Tiered exit at multiple levels
     TieredExit {
         /// (pct_gain, pct_to_sell)
         levels: Vec<(f64, f64)>,
     },
     /// Trailing stop after activation
-    TrailingStop {
-        trail_pct: f64,
-        activation_pct: f64,
-    },
+    TrailingStop { trail_pct: f64, activation_pct: f64 },
     /// Exit after max hold time
-    TimeBased {
-        max_hold_secs: u64,
-    },
+    TimeBased { max_hold_secs: u64 },
     /// Exit on specific conditions
-    ConditionBased {
-        exit_on: Vec<ExitCondition>,
-    },
+    ConditionBased { exit_on: Vec<ExitCondition> },
 }
 
 impl Default for ExitStyle {
@@ -196,15 +185,32 @@ pub struct ExitSignal {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitReason {
-    TakeProfit { pnl_pct: f64 },
-    TrailingStopHit { peak_pnl_pct: f64, current_pnl_pct: f64 },
-    StopLoss { loss_pct: f64 },
+    TakeProfit {
+        pnl_pct: f64,
+    },
+    TrailingStopHit {
+        peak_pnl_pct: f64,
+        current_pnl_pct: f64,
+    },
+    StopLoss {
+        loss_pct: f64,
+    },
     MomentumFade,
-    WhaleExited { whale_address: String },
-    RugPredicted { probability: f64 },
-    CreatorSelling { pct_sold: f64 },
-    MaxHoldTime { held_secs: u64 },
-    FatalRisk { risk: String },
+    WhaleExited {
+        whale_address: String,
+    },
+    RugPredicted {
+        probability: f64,
+    },
+    CreatorSelling {
+        pct_sold: f64,
+    },
+    MaxHoldTime {
+        held_secs: u64,
+    },
+    FatalRisk {
+        risk: String,
+    },
     ManualExit,
 }
 

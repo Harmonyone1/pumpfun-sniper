@@ -1,7 +1,7 @@
 //! Price calculation utilities for pump.fun bonding curves
 
-use crate::error::Result;
 use super::accounts::BondingCurve;
+use crate::error::Result;
 
 /// Token decimals - pump.fun uses 6 decimals (not Solana's standard 9)
 /// WARNING: This is the default, but should be read from mint for accuracy
@@ -17,10 +17,7 @@ pub fn calculate_price(curve: &BondingCurve) -> Result<f64> {
 
 /// Calculate price impact for a given buy amount
 /// Returns (tokens_received, price_impact_percent)
-pub fn calculate_buy_impact(
-    curve: &BondingCurve,
-    sol_amount: u64,
-) -> Result<(u64, f64)> {
+pub fn calculate_buy_impact(curve: &BondingCurve, sol_amount: u64) -> Result<(u64, f64)> {
     let tokens = curve.calculate_buy_tokens(sol_amount)?;
 
     // Calculate effective price
@@ -37,10 +34,7 @@ pub fn calculate_buy_impact(
 
 /// Calculate price impact for a given sell amount
 /// Returns (sol_received, price_impact_percent)
-pub fn calculate_sell_impact(
-    curve: &BondingCurve,
-    token_amount: u64,
-) -> Result<(u64, f64)> {
+pub fn calculate_sell_impact(curve: &BondingCurve, token_amount: u64) -> Result<(u64, f64)> {
     let sol = curve.calculate_sell_sol(token_amount)?;
 
     // Calculate effective price
@@ -56,29 +50,20 @@ pub fn calculate_sell_impact(
 }
 
 /// Calculate minimum tokens to receive for a buy with slippage
-pub fn calculate_min_tokens_with_slippage(
-    expected_tokens: u64,
-    slippage_bps: u32,
-) -> u64 {
+pub fn calculate_min_tokens_with_slippage(expected_tokens: u64, slippage_bps: u32) -> u64 {
     // slippage_bps is in basis points (100 bps = 1%)
     let slippage_factor = 10000 - slippage_bps as u64;
     (expected_tokens * slippage_factor) / 10000
 }
 
 /// Calculate minimum SOL to receive for a sell with slippage
-pub fn calculate_min_sol_with_slippage(
-    expected_sol: u64,
-    slippage_bps: u32,
-) -> u64 {
+pub fn calculate_min_sol_with_slippage(expected_sol: u64, slippage_bps: u32) -> u64 {
     let slippage_factor = 10000 - slippage_bps as u64;
     (expected_sol * slippage_factor) / 10000
 }
 
 /// Calculate maximum SOL to spend for a buy with slippage
-pub fn calculate_max_sol_with_slippage(
-    expected_sol: u64,
-    slippage_bps: u32,
-) -> u64 {
+pub fn calculate_max_sol_with_slippage(expected_sol: u64, slippage_bps: u32) -> u64 {
     let slippage_factor = 10000 + slippage_bps as u64;
     (expected_sol * slippage_factor) / 10000
 }
@@ -130,12 +115,12 @@ mod tests {
 
     fn test_curve() -> BondingCurve {
         BondingCurve::new_for_test(
-            30_000_000_000,       // virtual_sol_reserves: 30 SOL
-            1_000_000_000_000,    // virtual_token_reserves: 1M tokens
-            0,                    // real_sol_reserves
-            1_000_000_000_000,    // real_token_reserves
-            1_000_000_000_000,    // token_total_supply
-            false,                // complete
+            30_000_000_000,    // virtual_sol_reserves: 30 SOL
+            1_000_000_000_000, // virtual_token_reserves: 1M tokens
+            0,                 // real_sol_reserves
+            1_000_000_000_000, // real_token_reserves
+            1_000_000_000_000, // token_total_supply
+            false,             // complete
         )
     }
 

@@ -206,8 +206,8 @@ impl ExecutionFeedback {
 
         // Determine if we should reduce size or pause
         let should_reduce = avg_slippage > self.config.slippage_penalty_threshold_pct;
-        let should_pause = self.config.pause_on_severe_slippage
-            && (fill_rate < 0.3 || avg_slippage > 15.0);
+        let should_pause =
+            self.config.pause_on_severe_slippage && (fill_rate < 0.3 || avg_slippage > 15.0);
 
         ExecutionQuality {
             recent_avg_slippage: avg_slippage,
@@ -265,9 +265,7 @@ impl ExecutionFeedback {
 
     /// Get average slippage for successful executions
     pub fn avg_slippage(&self) -> f64 {
-        let successful: Vec<_> = self.executions.iter()
-            .filter(|e| e.success)
-            .collect();
+        let successful: Vec<_> = self.executions.iter().filter(|e| e.success).collect();
 
         if successful.is_empty() {
             return 0.0;

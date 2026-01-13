@@ -38,7 +38,7 @@ impl Default for ScoringResult {
             opportunity_score: 0.0,
             confidence: 0.0,
             signals: Vec::new(),
-            recommendation: Recommendation::Observe,  // Default: watch, don't trade
+            recommendation: Recommendation::Observe, // Default: watch, don't trade
             position_size_multiplier: 0.0,
             summary: "No signals available".to_string(),
         }
@@ -113,9 +113,8 @@ impl ReadinessState {
         let is_ready_for_trading = reasons.is_empty();
 
         // Full position requires higher bar
-        let is_ready_for_full_position = is_ready_for_trading
-            && data_completeness >= 0.7
-            && enriched_components >= 3;
+        let is_ready_for_full_position =
+            is_ready_for_trading && data_completeness >= 0.7 && enriched_components >= 3;
 
         let readiness_reason = if reasons.is_empty() {
             None
@@ -216,12 +215,18 @@ impl Recommendation {
 
     /// Check if this recommendation allows any trading action
     pub fn allows_trading(&self) -> bool {
-        matches!(self, Recommendation::StrongBuy | Recommendation::Opportunity | Recommendation::Probe)
+        matches!(
+            self,
+            Recommendation::StrongBuy | Recommendation::Opportunity | Recommendation::Probe
+        )
     }
 
     /// Check if this is a full-conviction trade (not probe)
     pub fn is_full_position(&self) -> bool {
-        matches!(self, Recommendation::StrongBuy | Recommendation::Opportunity)
+        matches!(
+            self,
+            Recommendation::StrongBuy | Recommendation::Opportunity
+        )
     }
 
     /// Get position size multiplier for this recommendation
@@ -229,7 +234,7 @@ impl Recommendation {
         match self {
             Recommendation::StrongBuy => 1.5,
             Recommendation::Opportunity => 1.0,
-            Recommendation::Probe => 0.05,  // 5% probe position
+            Recommendation::Probe => 0.05, // 5% probe position
             Recommendation::Observe => 0.0,
             Recommendation::Avoid => 0.0,
         }
@@ -267,14 +272,14 @@ pub struct ScoringThresholds {
 impl Default for ScoringThresholds {
     fn default() -> Self {
         Self {
-            strong_buy: 0.40,      // Lowered from 0.65 - more aggressive
-            opportunity: 0.10,     // Lowered from 0.35 - allow more opportunities
-            probe: -0.20,          // Lowered from 0.15 - probe even negative scores
-            avoid: -0.50,          // Lowered from -0.3 - only avoid very bad tokens
-            min_confidence: 0.20,  // Lowered from 0.3 - trade with less certainty
-            min_data_completeness: 0.3,     // Lowered from 0.5 - trade with less data
-            min_enriched_components: 1,       // Lowered from 2 - need less enrichment
-            min_time_since_launch_secs: 5,    // Lowered from 15s - faster entry
+            strong_buy: 0.40,              // Lowered from 0.65 - more aggressive
+            opportunity: 0.10,             // Lowered from 0.35 - allow more opportunities
+            probe: -0.20,                  // Lowered from 0.15 - probe even negative scores
+            avoid: -0.50,                  // Lowered from -0.3 - only avoid very bad tokens
+            min_confidence: 0.20,          // Lowered from 0.3 - trade with less certainty
+            min_data_completeness: 0.3,    // Lowered from 0.5 - trade with less data
+            min_enriched_components: 1,    // Lowered from 2 - need less enrichment
+            min_time_since_launch_secs: 5, // Lowered from 15s - faster entry
         }
     }
 }
@@ -484,15 +489,12 @@ impl ScoringEngine {
         let opportunity_count = signals.iter().filter(|s| s.is_opportunity()).count();
 
         // Find top risk and opportunity signals
-        let top_risk = signals
-            .iter()
-            .filter(|s| s.is_risk())
-            .max_by(|a, b| {
-                a.effective_contribution()
-                    .abs()
-                    .partial_cmp(&b.effective_contribution().abs())
-                    .unwrap()
-            });
+        let top_risk = signals.iter().filter(|s| s.is_risk()).max_by(|a, b| {
+            a.effective_contribution()
+                .abs()
+                .partial_cmp(&b.effective_contribution().abs())
+                .unwrap()
+        });
 
         let top_opportunity = signals
             .iter()
@@ -505,10 +507,7 @@ impl ScoringEngine {
 
         let mut parts = Vec::new();
 
-        parts.push(format!(
-            "Score: {:.2} -> {:?}",
-            score, recommendation
-        ));
+        parts.push(format!("Score: {:.2} -> {:?}", score, recommendation));
         parts.push(format!(
             "{} signals ({} risk, {} opportunity)",
             signals.len(),
@@ -517,7 +516,10 @@ impl ScoringEngine {
         ));
 
         if let Some(risk) = top_risk {
-            parts.push(format!("Top risk: {} ({:.2})", risk.signal_type, risk.value));
+            parts.push(format!(
+                "Top risk: {} ({:.2})",
+                risk.signal_type, risk.value
+            ));
         }
 
         if let Some(opp) = top_opportunity {
@@ -579,7 +581,12 @@ mod tests {
         // High value signals with high confidence = StrongBuy
         let signals = vec![
             Signal::new(SignalType::NameQuality, 0.8, 1.0, "Great name"),
-            Signal::new(SignalType::LiquiditySeeding, 0.7, 0.9, "Excellent liquidity"),
+            Signal::new(
+                SignalType::LiquiditySeeding,
+                0.7,
+                0.9,
+                "Excellent liquidity",
+            ),
         ];
         let result = engine.score(signals);
         assert!(result.score >= 0.65);
@@ -636,9 +643,12 @@ mod tests {
     fn test_scoring_low_confidence_observe() {
         let engine = ScoringEngine::new();
         // Good score but LOW confidence = Observe (not trade)
-        let signals = vec![
-            Signal::new(SignalType::NameQuality, 0.5, 0.1, "Good name but uncertain"),
-        ];
+        let signals = vec![Signal::new(
+            SignalType::NameQuality,
+            0.5,
+            0.1,
+            "Good name but uncertain",
+        )];
         let result = engine.score(signals);
         // Low confidence should result in Observe
         assert_eq!(result.recommendation, Recommendation::Observe);

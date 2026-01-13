@@ -25,9 +25,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::manager::WalletManager;
-use super::types::{
-    AiProposal, InitiatedBy, ProposalStatus, ProposedAction, TransferReason,
-};
+use super::types::{AiProposal, InitiatedBy, ProposalStatus, ProposedAction, TransferReason};
 
 /// AI Advisor configuration
 #[derive(Debug, Clone)]
@@ -158,11 +156,7 @@ impl AiAdvisor {
         proposal: &AiProposal,
     ) -> Result<ProposalStatus, String> {
         // Check safety bounds
-        if let Err(violation) = self
-            .wallet_manager
-            .safety()
-            .validate_ai_authority(proposal)
-        {
+        if let Err(violation) = self.wallet_manager.safety().validate_ai_authority(proposal) {
             warn!("AI proposal blocked by safety: {}", violation);
             return Ok(ProposalStatus::Rejected);
         }

@@ -2,21 +2,24 @@
 
 use anyhow::Result;
 use dialoguer::Confirm;
-use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::pubkey::Pubkey;
-use std::sync::Arc;
+use solana_sdk::signature::{Keypair, Signer};
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::filter::{AdaptiveFilter, MetadataSignalProvider, Recommendation, SignalContext, WalletBehaviorSignalProvider};
+use crate::filter::{
+    AdaptiveFilter, KillSwitchDecision, KillSwitchEvaluator, MetadataSignalProvider, Recommendation,
+    SignalContext, WalletBehaviorSignalProvider,
+};
+use crate::strategy::engine::StrategyEngine;
+use crate::strategy::types::TradingAction;
 use crate::stream::pumpportal::{PumpPortalClient, PumpPortalEvent};
 #[cfg(feature = "shredstream")]
 use crate::stream::shredstream::ShredStreamClient;
 use crate::trading::pumpportal_api::PumpPortalTrader;
-use crate::strategy::engine::StrategyEngine;
-use crate::strategy::types::TradingAction;
 
 /// Query actual token balance for a wallet and mint
 /// Returns the token balance or 0 if not found
@@ -32,29 +35,81 @@ fn query_token_balance(
         Err(_) => return 0,
     };
 
-    match rpc_client.get_token_accounts_by_owner(
-        wallet,
-        TokenAccountsFilter::Mint(mint_pubkey),
-    ) {
-        Ok(accounts) => {
-            if let Some(account) = accounts.first() {
-                // Parse the token account data to get balance
-                if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
-                    if let Some(info) = parsed.parsed.get("info") {
-                        if let Some(token_amount) = info.get("tokenAmount") {
-                            if let Some(amount_str) = token_amount.get("amount") {
-                                if let Some(amount) = amount_str.as_str() {
-                                    return amount.parse::<u64>().unwrap_or(0);
+    // Try SPL Token program with Mint filter (works for both SPL and Token2022)
+    if let Ok(accounts) =
+        rpc_client.get_token_accounts_by_owner(wallet, TokenAccountsFilter::Mint(mint_pubkey))
+    {
+        for account in &accounts {
+            if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
+                if let Some(info) = parsed.parsed.get("info") {
+                    if let Some(token_amount) = info.get("tokenAmount") {
+                        if let Some(amount_str) = token_amount.get("amount") {
+                            if let Some(amount) = amount_str.as_str() {
+                                let bal = amount.parse::<u64>().unwrap_or(0);
+                                if bal > 0 {
+                                    return bal;
                                 }
                             }
                         }
                     }
                 }
             }
-            0
         }
-        Err(_) => 0,
     }
+
+    // Fallback: Try Token2022 program explicitly (pump.fun tokens use this)
+    let token2022_program =
+        Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    if let Ok(accounts) = rpc_client
+        .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token2022_program))
+    {
+        for account in &accounts {
+            if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
+                if let Some(info) = parsed.parsed.get("info") {
+                    if let Some(account_mint) = info.get("mint") {
+                        if account_mint.as_str() == Some(mint) {
+                            if let Some(token_amount) = info.get("tokenAmount") {
+                                if let Some(amount_str) = token_amount.get("amount") {
+                                    if let Some(amount) = amount_str.as_str() {
+                                        let bal = amount.parse::<u64>().unwrap_or(0);
+                                        if bal > 0 {
+                                            return bal;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    0
+}
+
+fn persist_bought_mints(path: &str, map: &std::collections::HashMap<String, i64>) {
+    match serde_json::to_string_pretty(map) {
+        Ok(data) => {
+            if let Err(err) = std::fs::write(path, data) {
+                warn!("Failed to persist bought_mints cache: {}", err);
+            }
+        }
+        Err(err) => warn!("Failed to serialize bought_mints cache: {}", err),
+    }
+}
+
+async fn remove_bought_mint(
+    store: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    path: &Arc<String>,
+    mint: &str,
+) -> bool {
+    let mut guard = store.lock().await;
+    let removed = guard.remove(mint).is_some();
+    if removed {
+        persist_bought_mints(path, &*guard);
+    }
+    removed
 }
 
 /// Start the sniper bot
@@ -93,7 +148,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
             Some(PumpPortalTrader::local())
         } else {
             info!("Using Lightning API (0.5% fee)");
-            Some(PumpPortalTrader::lightning(config.pumpportal.api_key.clone()))
+            Some(PumpPortalTrader::lightning(
+                config.pumpportal.api_key.clone(),
+            ))
         }
     } else {
         info!("Using Jito bundles for trading");
@@ -107,7 +164,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     }
 
     // Set up event channel
-    let (event_tx, mut event_rx) = mpsc::channel::<PumpPortalEvent>(config.backpressure.channel_capacity);
+    let (event_tx, mut event_rx) =
+        mpsc::channel::<PumpPortalEvent>(config.backpressure.channel_capacity);
 
     // Connect to token detection source
     if config.pumpportal.enabled {
@@ -144,10 +202,27 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         warn!("Could not load positions: {} (starting fresh)", e);
     }
 
+    // Initialize kill-switch evaluator
+    let kill_switch_evaluator = if config.smart_money.kill_switches.enabled {
+        info!("Initializing kill-switch evaluator...");
+        let evaluator = Arc::new(KillSwitchEvaluator::new(
+            config.smart_money.kill_switches.clone(),
+            config.smart_money.holder_watcher.clone(),
+        ));
+        info!(
+            "Kill-switches enabled: deployer_sell={}, top_holder_sell={}",
+            config.smart_money.kill_switches.deployer_sell_any,
+            config.smart_money.kill_switches.top_holder_sell
+        );
+        Some(evaluator)
+    } else {
+        info!("Kill-switches disabled");
+        None
+    };
+
     // Initialize token filter
-    let token_filter = crate::filter::token_filter::TokenFilter::new(
-        config.filters.clone(),
-    ).map_err(|e| anyhow::anyhow!("Failed to create token filter: {}", e))?;
+    let token_filter = crate::filter::token_filter::TokenFilter::new(config.filters.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to create token filter: {}", e))?;
 
     // Initialize adaptive filter if enabled
     let adaptive_filter = if config.adaptive_filter.enabled {
@@ -199,12 +274,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     };
 
     // Track wallets for copy trading
-    let tracked_wallets: std::collections::HashSet<String> = config
-        .wallet_tracking
-        .wallets
-        .iter()
-        .cloned()
-        .collect();
+    let tracked_wallets: std::collections::HashSet<String> =
+        config.wallet_tracking.wallets.iter().cloned().collect();
 
     // Track tokens we've already evaluated from trade events (to avoid re-evaluating)
     let seen_trade_tokens: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
@@ -212,7 +283,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
     info!("Starting price feed...");
     // Wrap trader in Arc for sharing across tasks
-    let trader_arc: Option<std::sync::Arc<PumpPortalTrader>> = pumpportal_trader.map(std::sync::Arc::new);
+    let trader_arc: Option<std::sync::Arc<PumpPortalTrader>> =
+        pumpportal_trader.map(std::sync::Arc::new);
 
     // === IMPROVED POSITION MONITOR WITH LOCAL FALLBACK ===
     // Features: Trailing stop, no-movement exit, quick profit, retry with local fallback
@@ -225,10 +297,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
-            info!("Features: Trailing Stop (3%), No-Movement Exit (60s), Quick Profit, LOCAL FALLBACK");
+            info!("Features: Trailing Stop (5%), No-Movement Exit (120s), Quick Profit, LOCAL FALLBACK");
 
             // Track sell attempts for retry logic
-            let mut sell_attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            let mut sell_attempts: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -246,7 +319,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                     // CONFIRMATION WAIT: Skip positions less than 10 seconds old
                     // This gives time for buy tx to confirm and ATA to be created
-                    let position_age_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
+                    let position_age_secs = (chrono::Utc::now() - position.entry_time)
+                        .num_seconds()
+                        .max(0) as u64;
                     if position_age_secs < 10 {
                         continue; // Too new, wait for confirmation
                     }
@@ -259,14 +334,20 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                     };
 
                     // Calculate drop from peak (for trailing stop)
-                    let peak_price = if position.peak_price > 0.0 { position.peak_price } else { position.entry_price };
+                    let peak_price = if position.peak_price > 0.0 {
+                        position.peak_price
+                    } else {
+                        position.entry_price
+                    };
                     let drop_from_peak_pct = if peak_price > 0.0 {
                         ((peak_price - current_price) / peak_price) * 100.0
                     } else {
                         0.0
                     };
 
-                    let hold_time_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
+                    let hold_time_secs = (chrono::Utc::now() - position.entry_time)
+                        .num_seconds()
+                        .max(0) as u64;
 
                     // Get entry-type-specific thresholds
                     let tp_pct = position.entry_type.take_profit_pct();
@@ -275,9 +356,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                     let max_hold = position.entry_type.max_hold_secs();
 
                     // Trailing stop: 3% drop from peak (only if we're in profit)
-                    let trailing_stop_pct = 3.0;
+                    let trailing_stop_pct = 5.0;
                     // No-movement exit: 60 seconds with less than 2% movement
-                    let no_movement_secs = 60;
+                    let no_movement_secs = 120;
                     let no_movement_threshold = 2.0;
 
                     let mut should_sell = false;
@@ -293,7 +374,10 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                     // 2. Check trailing stop (only if in profit and dropped from peak)
                     if !should_sell && pnl_pct > 0.0 && drop_from_peak_pct >= trailing_stop_pct {
                         should_sell = true;
-                        reason = format!("TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%)", drop_from_peak_pct, pnl_pct);
+                        reason = format!(
+                            "TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%)",
+                            drop_from_peak_pct, pnl_pct
+                        );
                     }
 
                     // 3. Check take profit
@@ -303,16 +387,26 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                     }
 
                     // 4. Check quick profit (partial exit)
-                    if !should_sell && !position.quick_profit_taken && pnl_pct >= quick_profit_pct && pnl_pct < tp_pct {
+                    if !should_sell
+                        && !position.quick_profit_taken
+                        && pnl_pct >= quick_profit_pct
+                        && pnl_pct < tp_pct
+                    {
                         should_sell = true;
                         sell_pct = "50%";
                         reason = format!("QUICK PROFIT at {:.1}% - selling 50%", pnl_pct);
                     }
 
                     // 5. Check no-movement exit (60s with <2% move either way)
-                    if !should_sell && hold_time_secs >= no_movement_secs && pnl_pct.abs() < no_movement_threshold {
+                    if !should_sell
+                        && hold_time_secs >= no_movement_secs
+                        && pnl_pct.abs() < no_movement_threshold
+                    {
                         should_sell = true;
-                        reason = format!("NO MOVEMENT: {:.1}% after {}s - exiting stale position", pnl_pct, hold_time_secs);
+                        reason = format!(
+                            "NO MOVEMENT: {:.1}% after {}s - exiting stale position",
+                            pnl_pct, hold_time_secs
+                        );
                     }
 
                     // 6. Check max hold time last (safety net)
@@ -320,7 +414,10 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         if let Some(max_secs) = max_hold {
                             if hold_time_secs >= max_secs {
                                 should_sell = true;
-                                reason = format!("MAX HOLD TIME ({} secs) P&L: {:.1}%", max_secs, pnl_pct);
+                                reason = format!(
+                                    "MAX HOLD TIME ({} secs) P&L: {:.1}%",
+                                    max_secs, pnl_pct
+                                );
                             }
                         }
                     }
@@ -334,7 +431,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                         if let Some(ref trader) = monitor_trader {
                             let slippage = monitor_config.trading.slippage_bps / 100;
-                            let priority_fee = monitor_config.trading.priority_fee_lamports as f64 / 1e9;
+                            let priority_fee =
+                                monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
                             // Retry logic: try up to 3 times with Lightning, then try local fallback
                             let attempts = sell_attempts.entry(position.mint.clone()).or_insert(0);
@@ -343,19 +441,33 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             if *attempts > 5 {
                                 error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
                                 // Estimate received SOL as 0 since sell failed
-                                let _ = monitor_positions.close_position(&position.mint, position.token_amount, 0.0).await;
+                                let _ = monitor_positions
+                                    .close_position(&position.mint, position.token_amount, 0.0)
+                                    .await;
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
 
                             // Try Lightning API first (attempts 1-3)
-                            let sell_result: Result<String, crate::error::Error> = if *attempts <= 3 {
+                            let sell_result: Result<String, crate::error::Error> = if *attempts <= 3
+                            {
                                 info!("Attempting Lightning API sell (attempt {})", attempts);
-                                trader.sell(&position.mint, sell_pct, slippage, priority_fee).await
+                                trader
+                                    .sell(&position.mint, sell_pct, slippage, priority_fee)
+                                    .await
                             } else {
                                 // Attempts 4-5: Try local signing fallback
                                 warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
-                                trader.sell_local(&position.mint, sell_pct, slippage, priority_fee, &monitor_keypair, &monitor_rpc).await
+                                trader
+                                    .sell_local(
+                                        &position.mint,
+                                        sell_pct,
+                                        slippage,
+                                        priority_fee,
+                                        &monitor_keypair,
+                                        &monitor_rpc,
+                                    )
+                                    .await
                             };
 
                             match sell_result {
@@ -364,38 +476,71 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     sell_attempts.remove(&position.mint);
 
                                     // Calculate trade metrics
-                                    let hold_secs = (chrono::Utc::now() - position.entry_time).num_seconds();
-                                    let price_change_pct = ((current_price - position.entry_price) / position.entry_price) * 100.0;
+                                    let hold_secs =
+                                        (chrono::Utc::now() - position.entry_time).num_seconds();
+                                    let price_change_pct = ((current_price - position.entry_price)
+                                        / position.entry_price)
+                                        * 100.0;
 
                                     if sell_pct == "50%" {
                                         // Partial exit - mark quick profit taken
                                         let half_amount = position.token_amount / 2;
                                         // Estimate received SOL based on current price (minus ~2% slippage estimate)
-                                        let estimated_received = (half_amount as f64 * current_price) * 0.98;
-                                        let pnl_sol = estimated_received - (position.total_cost_sol / 2.0);
-                                        let _ = monitor_positions.close_position(&position.mint, half_amount, estimated_received).await;
-                                        let _ = monitor_positions.mark_quick_profit_taken(&position.mint).await;
+                                        let estimated_received =
+                                            (half_amount as f64 * current_price) * 0.98;
+                                        let pnl_sol =
+                                            estimated_received - (position.total_cost_sol / 2.0);
+                                        let _ = monitor_positions
+                                            .close_position(
+                                                &position.mint,
+                                                half_amount,
+                                                estimated_received,
+                                            )
+                                            .await;
+                                        let _ = monitor_positions
+                                            .mark_quick_profit_taken(&position.mint)
+                                            .await;
                                         info!("=== TRADE CLOSED (Partial) ===");
-                                        info!("  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                              position.symbol, position.entry_price, current_price, price_change_pct);
+                                        info!(
+                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                            position.symbol,
+                                            position.entry_price,
+                                            current_price,
+                                            price_change_pct
+                                        );
                                         info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
                                               half_amount, estimated_received, pnl_sol, hold_secs);
                                     } else {
                                         // Full exit
                                         // Estimate received SOL based on current price (minus ~2% slippage estimate)
-                                        let estimated_received = (position.token_amount as f64 * current_price) * 0.98;
+                                        let estimated_received =
+                                            (position.token_amount as f64 * current_price) * 0.98;
                                         let pnl_sol = estimated_received - position.total_cost_sol;
                                         let pnl_pct = (pnl_sol / position.total_cost_sol) * 100.0;
-                                        let _ = monitor_positions.close_position(&position.mint, position.token_amount, estimated_received).await;
+                                        let _ = monitor_positions
+                                            .close_position(
+                                                &position.mint,
+                                                position.token_amount,
+                                                estimated_received,
+                                            )
+                                            .await;
                                         info!("=== TRADE CLOSED (Full) ===");
-                                        info!("  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                              position.symbol, position.entry_price, current_price, price_change_pct);
+                                        info!(
+                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                            position.symbol,
+                                            position.entry_price,
+                                            current_price,
+                                            price_change_pct
+                                        );
                                         info!("  Cost: {:.4} SOL | Received: {:.4} SOL | P&L: {:+.4} SOL ({:+.1}%) | Hold: {}s",
                                               position.total_cost_sol, estimated_received, pnl_sol, pnl_pct, hold_secs);
                                     }
                                 }
                                 Err(e) => {
-                                    error!("AUTO-SELL FAILED for {} (attempt {}): {}", position.symbol, attempts, e);
+                                    error!(
+                                        "AUTO-SELL FAILED for {} (attempt {}): {}",
+                                        position.symbol, attempts, e
+                                    );
                                 }
                             }
                         }
@@ -747,6 +892,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             error!("Failed to record position: {}", e);
                                         }
 
+                                        // Start kill-switch monitoring for this position
+                                        if let Some(ref evaluator) = kill_switch_evaluator {
+                                            // Creator is the trader_public_key for new tokens
+                                            let creator = token.trader_public_key.clone();
+                                            // TODO: Fetch top holders from Helius for holder_watcher
+                                            // For now, we just track the deployer
+                                            evaluator.watch_position(&token.mint, &creator, vec![]);
+                                            info!(
+                                                "Kill-switch monitoring active for {} (creator: {})",
+                                                &token.mint[..12], &creator[..8]
+                                            );
+                                        }
+
                                         // Record entry in strategy engine
                                         if let Some(ref engine) = strategy_engine {
                                             let strategy_position = crate::strategy::types::Position {
@@ -789,6 +947,91 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             &trade.mint[..12],
                             trade.market_cap_sol
                         );
+
+                        // KILL-SWITCH: Check sells on tokens we hold
+                        if trade.tx_type == "sell" {
+                            // Check if we have a position in this token
+                            let positions = position_manager.get_all_positions().await;
+                            let our_position = positions.iter().find(|p| p.mint == trade.mint);
+
+                            if let Some(position) = our_position {
+                                let position_token_amount = position.token_amount;
+
+                                if let Some(ref evaluator) = kill_switch_evaluator {
+                                    let decision = evaluator.evaluate_sell(
+                                        &trade.mint,
+                                        &trade.trader_public_key,
+                                        trade.token_amount as u64,
+                                        sol_amount,
+                                        &trade.signature,
+                                    );
+
+                                    if let KillSwitchDecision::Exit(alert) = decision {
+                                        warn!(
+                                            "KILL-SWITCH TRIGGERED for {}: {} - AUTO-SELLING",
+                                            &trade.mint[..12], alert.reason
+                                        );
+
+                                        // Execute emergency sell if not dry run
+                                        if !dry_run {
+                                            if let Some(ref trader) = trader_arc {
+                                                let slippage_pct = config.trading.slippage_bps / 100;
+                                                let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
+
+                                                // Sell 100% immediately
+                                                info!(
+                                                    "Executing kill-switch sell for {} (urgency: {:?})",
+                                                    &trade.mint[..12], alert.urgency
+                                                );
+
+                                                let sell_result = if use_local_api {
+                                                    trader.sell_local(
+                                                        &trade.mint,
+                                                        "100%", // 100% sell
+                                                        slippage_pct,
+                                                        priority_fee,
+                                                        &keypair,
+                                                        &rpc_client,
+                                                    ).await
+                                                } else {
+                                                    trader.sell(&trade.mint, "100%", slippage_pct, priority_fee).await
+                                                };
+
+                                                match sell_result {
+                                                    Ok(sig) => {
+                                                        warn!(
+                                                            "KILL-SWITCH SELL EXECUTED: {} - sig: {}",
+                                                            alert.reason, sig
+                                                        );
+
+                                                        // Close position in manager (use position's token amount since we sold 100%)
+                                                        // Note: We don't know exact proceeds yet, estimate from current price
+                                                        let estimated_proceeds = position_token_amount as f64 * trade.market_cap_sol / 1_000_000_000.0;
+                                                        if let Err(e) = position_manager.close_position(&trade.mint, position_token_amount, estimated_proceeds).await {
+                                                            error!("Failed to close position after kill-switch: {}", e);
+                                                        }
+
+                                                        // Stop monitoring this position
+                                                        evaluator.unwatch_position(&trade.mint);
+                                                    }
+                                                    Err(e) => {
+                                                        error!(
+                                                            "KILL-SWITCH SELL FAILED for {}: {} - MANUAL EXIT NEEDED!",
+                                                            &trade.mint[..12], e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            warn!(
+                                                "DRY-RUN: Kill-switch would sell 100% of {} (reason: {})",
+                                                &trade.mint[..12], alert.reason
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // Check for tracked wallet trades (copy trading)
                         if config.wallet_tracking.enabled && tracked_wallets.contains(&trade.trader_public_key) {
@@ -979,6 +1222,64 @@ pub async fn sell(
         anyhow::bail!("Percentage must be between 0 and 100");
     }
 
+    // Initialize RPC client for balance queries
+    let rpc_client = solana_client::rpc_client::RpcClient::new_with_timeout(
+        config.rpc.endpoint.clone(),
+        std::time::Duration::from_millis(config.rpc.timeout_ms),
+    );
+
+    // Determine which wallet to query for balance (Lightning or local)
+    let balance_wallet = if !config.pumpportal.lightning_wallet.is_empty() {
+        Pubkey::from_str(&config.pumpportal.lightning_wallet)?
+    } else {
+        // Fall back to local keypair
+        let keypair_path = std::env::var("KEYPAIR_PATH")
+            .unwrap_or_else(|_| "credentials/hot-trading/keypair.json".to_string());
+        let keypair_data = std::fs::read_to_string(&keypair_path)?;
+        let secret_key: Vec<u8> = serde_json::from_str(&keypair_data)?;
+        let keypair = Keypair::from_bytes(&secret_key)?;
+        keypair.pubkey()
+    };
+
+    // Initialize position manager
+    let position_manager = std::sync::Arc::new(crate::position::manager::PositionManager::new(
+        config.safety.clone(),
+        Some(format!("{}/positions.json", config.wallet.credentials_dir)),
+    ));
+    if let Err(e) = position_manager.load().await {
+        warn!("Could not load positions: {} (continuing anyway)", e);
+    }
+
+    // Load bought_mints cache
+    let bought_mints_path = format!("{}/bought_mints.json", config.wallet.credentials_dir);
+    let bought_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> = {
+        if std::path::Path::new(&bought_mints_path).exists() {
+            match std::fs::read_to_string(&bought_mints_path) {
+                Ok(data) => {
+                    if let Ok(mints) = serde_json::from_str::<std::collections::HashMap<String, i64>>(&data) {
+                        std::sync::Arc::new(tokio::sync::Mutex::new(mints))
+                    } else {
+                        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+                    }
+                }
+                Err(_) => std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            }
+        } else {
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        }
+    };
+    let bought_mints_path = std::sync::Arc::new(bought_mints_path);
+
+    // Get position info if we have it
+    let position = position_manager.get_position(token).await;
+    if let Some(ref pos) = position {
+        println!("\nPosition found:");
+        println!("  Symbol: {}", pos.symbol);
+        println!("  Tokens: {}", pos.token_amount);
+        println!("  Entry price: {:.10} SOL", pos.entry_price);
+        println!("  Cost: {:.4} SOL", pos.total_cost_sol);
+    }
+
     // Confirmation prompt (unless --force)
     if config.safety.require_sell_confirmation && !force {
         let confirmed = Confirm::new()
@@ -997,7 +1298,6 @@ pub async fn sell(
 
     if dry_run {
         info!("DRY-RUN: Would sell {} of {}", amount, token);
-        // TODO: Simulate transaction
         return Ok(());
     }
 
@@ -1012,6 +1312,10 @@ pub async fn sell(
         let slippage_pct = config.trading.slippage_bps / 100;
         let priority_fee = config.trading.priority_fee_lamports as f64 / 1_000_000_000.0;
 
+        // Query SOL balance BEFORE sell for real P&L
+        let sol_before = rpc_client.get_balance(&balance_wallet).unwrap_or(0) as f64 / 1_000_000_000.0;
+        info!("Balance before sell: {:.4} SOL", sol_before);
+
         info!("Submitting sell via PumpPortal API...");
         match trader.sell(token, amount, slippage_pct, priority_fee).await {
             Ok(signature) => {
@@ -1019,6 +1323,72 @@ pub async fn sell(
                 println!("\nSell transaction confirmed!");
                 println!("Signature: {}", signature);
                 println!("View on Solscan: https://solscan.io/tx/{}", signature);
+
+                // Wait for tx confirmation then query actual SOL received
+                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                let sol_after = rpc_client.get_balance(&balance_wallet).unwrap_or(0) as f64 / 1_000_000_000.0;
+                let actual_received = (sol_after - sol_before).max(0.0);
+
+                println!("Balance after sell: {:.4} SOL", sol_after);
+                println!("SOL received: {:.4} SOL", actual_received);
+
+                // Update position manager and stats
+                if let Some(ref pos) = position {
+                    let is_full_sell = amount == "100%" || amount_value >= 100.0;
+                    let tokens_sold = if is_full_sell {
+                        pos.token_amount
+                    } else if is_percentage {
+                        (pos.token_amount as f64 * amount_value / 100.0) as u64
+                    } else {
+                        amount_value as u64
+                    };
+
+                    // Use actual received SOL, fallback to estimate if balance query failed
+                    let received = if actual_received > 0.0 {
+                        actual_received
+                    } else {
+                        // Estimate based on position price (use current_price if available, else entry_price)
+                        let price = if pos.current_price > 0.0 { pos.current_price } else { pos.entry_price };
+                        let estimated = (tokens_sold as f64 * price) * 0.98;
+                        warn!("Balance query returned 0, using estimated received: {:.4} SOL", estimated);
+                        estimated
+                    };
+
+                    let _ = position_manager
+                        .close_position(token, tokens_sold, received)
+                        .await;
+
+                    // Persist position state immediately
+                    if let Err(e) = position_manager.save().await {
+                        warn!("Failed to persist position state: {}", e);
+                    }
+
+                    let cost_portion = if is_full_sell {
+                        pos.total_cost_sol
+                    } else {
+                        pos.total_cost_sol * amount_value / 100.0
+                    };
+                    let pnl_sol = received - cost_portion;
+                    let pnl_pct = (pnl_sol / cost_portion) * 100.0;
+
+                    println!("\n=== TRADE CLOSED ===");
+                    println!("  Cost: {:.4} SOL | Received: {:.4} SOL | P&L: {:+.4} SOL ({:+.1}%)",
+                            cost_portion, received, pnl_sol, pnl_pct);
+
+                    // Clean up bought_mints if position is fully closed
+                    // Check if position still exists after close_position
+                    let position_closed = position_manager.get_position(token).await.is_none();
+                    if position_closed {
+                        let _ = remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
+                        info!("Removed {} from bought_mints cache", token);
+                    }
+                } else {
+                    // No position tracked - still clean up bought_mints
+                    let removed = remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
+                    if removed {
+                        info!("Removed {} from bought_mints cache", token);
+                    }
+                }
             }
             Err(e) => {
                 error!("Sell failed: {}", e);
@@ -1027,14 +1397,8 @@ pub async fn sell(
         }
     } else {
         // Use Jito bundles
-        // TODO: Implement Jito sell logic
-        // 1. Load keypair
-        // 2. Get current position
-        // 3. Calculate actual amount to sell
-        // 4. Build sell transaction
-        // 5. Submit via Jito bundle
-        // 6. Update position
-        warn!("Jito sell not yet implemented");
+        warn!("Jito sell not yet implemented - use PumpPortal Lightning API");
+        anyhow::bail!("Jito sell not implemented. Set pumpportal.use_for_trading = true in config.toml");
     }
 
     Ok(())
@@ -1190,8 +1554,8 @@ async fn check_shredstream(_config: &Config) -> Result<()> {
 }
 
 async fn check_pumpportal(config: &Config) -> Result<()> {
-    use tokio_tungstenite::connect_async;
     use std::time::Duration;
+    use tokio_tungstenite::connect_async;
 
     let url = url::Url::parse(&config.pumpportal.ws_url)
         .map_err(|e| anyhow::anyhow!("Invalid WebSocket URL: {}", e))?;
@@ -1207,7 +1571,10 @@ async fn check_pumpportal(config: &Config) -> Result<()> {
             Ok(())
         }
         Ok(Err(e)) => Err(anyhow::anyhow!("WebSocket connection failed: {}", e)),
-        Err(_) => Err(anyhow::anyhow!("Connection timed out after {}s", timeout.as_secs())),
+        Err(_) => Err(anyhow::anyhow!(
+            "Connection timed out after {}s",
+            timeout.as_secs()
+        )),
     }
 }
 
@@ -1282,11 +1649,26 @@ pub async fn wallet_status(config: &Config) -> Result<()> {
 
     // Show safety limits
     println!("=== SAFETY LIMITS ===\n");
-    println!("Min hot balance: {} SOL", config.wallet.safety.min_hot_balance_sol);
-    println!("Max single transfer: {} SOL", config.wallet.safety.max_single_transfer_sol);
-    println!("Max daily extraction: {} SOL", config.wallet.safety.max_daily_extraction_sol);
-    println!("AI max auto-transfer: {} SOL", config.wallet.safety.ai_max_auto_transfer_sol);
-    println!("Vault address locked: {}", config.wallet.safety.vault_address_locked);
+    println!(
+        "Min hot balance: {} SOL",
+        config.wallet.safety.min_hot_balance_sol
+    );
+    println!(
+        "Max single transfer: {} SOL",
+        config.wallet.safety.max_single_transfer_sol
+    );
+    println!(
+        "Max daily extraction: {} SOL",
+        config.wallet.safety.max_daily_extraction_sol
+    );
+    println!(
+        "AI max auto-transfer: {} SOL",
+        config.wallet.safety.ai_max_auto_transfer_sol
+    );
+    println!(
+        "Vault address locked: {}",
+        config.wallet.safety.vault_address_locked
+    );
 
     Ok(())
 }
@@ -1301,7 +1683,10 @@ pub async fn wallet_list(config: &Config) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to load credentials: {}", e))?;
 
     println!("\n=== CONFIGURED WALLETS ===\n");
-    println!("{:<20} {:<15} {:<15} {}", "NAME", "ALIAS", "TYPE", "ADDRESS");
+    println!(
+        "{:<20} {:<15} {:<15} {}",
+        "NAME", "ALIAS", "TYPE", "ADDRESS"
+    );
     println!("{}", "-".repeat(80));
 
     for wallet in creds.list_wallets() {
@@ -1353,7 +1738,10 @@ pub async fn wallet_add(
         "vault" => WalletType::Vault,
         "external" => WalletType::External,
         "auth" => WalletType::Auth,
-        _ => anyhow::bail!("Invalid wallet type: {}. Use: hot, vault, external, auth", wallet_type),
+        _ => anyhow::bail!(
+            "Invalid wallet type: {}. Use: hot, vault, external, auth",
+            wallet_type
+        ),
     };
 
     // Validate requirements
@@ -1395,7 +1783,10 @@ pub async fn wallet_add(
         info!("Generated new keypair: {}", address_str);
 
         (
-            Some(std::path::PathBuf::from(format!("credentials/{}/keypair.json", name))),
+            Some(std::path::PathBuf::from(format!(
+                "credentials/{}/keypair.json",
+                name
+            ))),
             "AUTO_DERIVED".to_string(),
         )
     } else {
@@ -1412,7 +1803,8 @@ pub async fn wallet_add(
         notes: String::new(),
     };
 
-    creds.add_wallet(entry)
+    creds
+        .add_wallet(entry)
         .map_err(|e| anyhow::anyhow!("Failed to add wallet: {}", e))?;
 
     println!("Wallet '{}' added successfully!", name);
@@ -1487,7 +1879,12 @@ pub async fn wallet_extract(
 
     // Execute extraction
     match wallet_manager
-        .extract_to_vault(amount, TransferReason::ManualTransfer, InitiatedBy::User, force)
+        .extract_to_vault(
+            amount,
+            TransferReason::ManualTransfer,
+            InitiatedBy::User,
+            force,
+        )
         .await
     {
         Ok(record) => {
@@ -1495,7 +1892,10 @@ pub async fn wallet_extract(
             println!("Amount: {} SOL", record.amount_sol);
             println!("To: {}", record.to_wallet);
             println!("Signature: {}", record.signature);
-            println!("View on Solscan: https://solscan.io/tx/{}", record.signature);
+            println!(
+                "View on Solscan: https://solscan.io/tx/{}",
+                record.signature
+            );
         }
         Err(e) => {
             error!("Extraction failed: {}", e);
@@ -1508,9 +1908,6 @@ pub async fn wallet_extract(
 
 /// View transfer history
 pub async fn wallet_history(config: &Config, limit: usize) -> Result<()> {
-    
-    
-
     println!("\n=== TRANSFER HISTORY ===\n");
 
     // Load history from file if it exists
@@ -1583,11 +1980,7 @@ pub async fn wallet_proposals(
 }
 
 /// Emergency actions
-pub async fn wallet_emergency(
-    config: &Config,
-    shutdown: bool,
-    resume: bool,
-) -> Result<()> {
+pub async fn wallet_emergency(config: &Config, shutdown: bool, resume: bool) -> Result<()> {
     if shutdown {
         warn!("=== EMERGENCY SHUTDOWN ===");
         warn!("Activating emergency lock - all trading operations will be paused");
@@ -1638,7 +2031,10 @@ pub async fn wallet_transfer(
     use solana_sdk::signature::Signer;
     use std::str::FromStr;
 
-    info!("Initiating transfer of {} SOL from {} to {}", amount, from, to);
+    info!(
+        "Initiating transfer of {} SOL from {} to {}",
+        amount, from, to
+    );
 
     // Load source wallet
     let from_path = format!("{}/{}/keypair.json", config.wallet.credentials_dir, from);
@@ -1681,9 +2077,7 @@ pub async fn wallet_transfer(
         let confirmed = Confirm::new()
             .with_prompt(format!(
                 "Transfer {} SOL from {} to {}?",
-                amount,
-                from,
-                to_pubkey
+                amount, from, to_pubkey
             ))
             .interact()?;
 
@@ -1745,7 +2139,10 @@ pub async fn scan(
 ) -> Result<()> {
     use crate::dexscreener::{DexScreenerClient, HotScanConfig};
 
-    info!("Starting token scan (liquidity: {}-{} SOL, volume >= {} SOL)", min_liquidity, max_liquidity, min_volume);
+    info!(
+        "Starting token scan (liquidity: {}-{} SOL, volume >= {} SOL)",
+        min_liquidity, max_liquidity, min_volume
+    );
 
     let client = DexScreenerClient::new();
     let scan_config = HotScanConfig {
@@ -1759,17 +2156,25 @@ pub async fn scan(
         let tokens: Vec<_> = tokens.into_iter().take(limit).collect();
 
         if format == "json" {
-            println!("{}", serde_json::to_string_pretty(&tokens.iter().map(|t| {
-                serde_json::json!({
-                    "mint": t.mint,
-                    "symbol": t.symbol,
-                    "name": t.name,
-                    "m5_change": t.m5_change,
-                    "liquidity_usd": t.liquidity_usd,
-                    "market_cap": t.market_cap,
-                    "score": t.score()
-                })
-            }).collect::<Vec<_>>())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &tokens
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "mint": t.mint,
+                                "symbol": t.symbol,
+                                "name": t.name,
+                                "m5_change": t.m5_change,
+                                "liquidity_usd": t.liquidity_usd,
+                                "market_cap": t.market_cap,
+                                "score": t.score()
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                )?
+            );
         } else {
             println!("\n{:=<80}", "");
             println!("Found {} tokens matching criteria:", tokens.len());
@@ -1823,7 +2228,10 @@ pub async fn hot_scan(
     use solana_sdk::signature::Signer;
 
     info!("=== HOT TOKEN SCANNER ===");
-    info!("Criteria: M5 >= {:.1}%, Ratio >= {:.1}, Liq >= ${:.0}, MCap <= ${:.0}", min_m5, min_ratio, min_liquidity, max_mcap);
+    info!(
+        "Criteria: M5 >= {:.1}%, Ratio >= {:.1}, Liq >= ${:.0}, MCap <= ${:.0}",
+        min_m5, min_ratio, min_liquidity, max_mcap
+    );
 
     if auto_buy {
         warn!("AUTO-BUY enabled with {} SOL per trade", buy_amount);
@@ -1844,7 +2252,10 @@ pub async fn hot_scan(
     let keypair_data = std::fs::read_to_string(&keypair_path)?;
     let secret_key: Vec<u8> = serde_json::from_str(&keypair_data)?;
     let keypair = std::sync::Arc::new(solana_sdk::signature::Keypair::from_bytes(&secret_key)?);
-    info!("Using wallet: {}", keypair.pubkey());
+    info!(
+        "Signing wallet (for local API fallback): {}",
+        keypair.pubkey()
+    );
 
     // Initialize RPC
     let rpc_client = std::sync::Arc::new(solana_client::rpc_client::RpcClient::new_with_timeout(
@@ -1857,10 +2268,23 @@ pub async fn hot_scan(
     let trader = if config.pumpportal.use_for_trading {
         if use_local_api {
             info!("Using Local API (sign + send locally)");
-            Some(std::sync::Arc::new(crate::trading::pumpportal_api::PumpPortalTrader::local()))
+            info!("Trading wallet: {}", keypair.pubkey());
+            Some(std::sync::Arc::new(
+                crate::trading::pumpportal_api::PumpPortalTrader::local(),
+            ))
         } else {
             info!("Using Lightning API (0.5% fee)");
-            Some(std::sync::Arc::new(crate::trading::pumpportal_api::PumpPortalTrader::lightning(config.pumpportal.api_key.clone())))
+            if !config.pumpportal.lightning_wallet.is_empty() {
+                info!(
+                    "Lightning wallet (for trading & balance): {}",
+                    config.pumpportal.lightning_wallet
+                );
+            }
+            Some(std::sync::Arc::new(
+                crate::trading::pumpportal_api::PumpPortalTrader::lightning(
+                    config.pumpportal.api_key.clone(),
+                ),
+            ))
         }
     } else {
         None
@@ -1881,34 +2305,41 @@ pub async fn hot_scan(
         // Load from file if exists and prune stale entries
         let now = chrono::Utc::now().timestamp();
         let ttl_secs = BOUGHT_MINTS_TTL_HOURS * 3600;
-        let loaded: std::collections::HashMap<String, i64> = if std::path::Path::new(&bought_mints_path).exists() {
-            match std::fs::read_to_string(&bought_mints_path) {
-                Ok(data) => {
-                    // Try new format (HashMap with timestamps)
-                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, i64>>(&data) {
-                        let before = map.len();
-                        let pruned: std::collections::HashMap<String, i64> = map.into_iter()
-                            .filter(|(_, ts)| now - ts < ttl_secs)
-                            .collect();
-                        let removed = before - pruned.len();
-                        if removed > 0 {
-                            info!("Pruned {} stale entries from bought_mints (TTL: {}h)", removed, BOUGHT_MINTS_TTL_HOURS);
+        let loaded: std::collections::HashMap<String, i64> =
+            if std::path::Path::new(&bought_mints_path).exists() {
+                match std::fs::read_to_string(&bought_mints_path) {
+                    Ok(data) => {
+                        // Try new format (HashMap with timestamps)
+                        if let Ok(map) =
+                            serde_json::from_str::<std::collections::HashMap<String, i64>>(&data)
+                        {
+                            let before = map.len();
+                            let pruned: std::collections::HashMap<String, i64> = map
+                                .into_iter()
+                                .filter(|(_, ts)| now - ts < ttl_secs)
+                                .collect();
+                            let removed = before - pruned.len();
+                            if removed > 0 {
+                                info!(
+                                    "Pruned {} stale entries from bought_mints (TTL: {}h)",
+                                    removed, BOUGHT_MINTS_TTL_HOURS
+                                );
+                            }
+                            info!("Loaded {} bought mints from session state", pruned.len());
+                            pruned
+                        } else if let Ok(mints) = serde_json::from_str::<Vec<String>>(&data) {
+                            // Migrate old format (Vec<String>) to new format with current timestamp
+                            info!("Migrating {} bought mints from legacy format", mints.len());
+                            mints.into_iter().map(|m| (m, now)).collect()
+                        } else {
+                            std::collections::HashMap::new()
                         }
-                        info!("Loaded {} bought mints from session state", pruned.len());
-                        pruned
-                    } else if let Ok(mints) = serde_json::from_str::<Vec<String>>(&data) {
-                        // Migrate old format (Vec<String>) to new format with current timestamp
-                        info!("Migrating {} bought mints from legacy format", mints.len());
-                        mints.into_iter().map(|m| (m, now)).collect()
-                    } else {
-                        std::collections::HashMap::new()
                     }
+                    Err(_) => std::collections::HashMap::new(),
                 }
-                Err(_) => std::collections::HashMap::new(),
-            }
-        } else {
-            std::collections::HashMap::new()
-        };
+            } else {
+                std::collections::HashMap::new()
+            };
         std::sync::Arc::new(tokio::sync::Mutex::new(loaded))
     };
     let bought_mints_path = std::sync::Arc::new(bought_mints_path);
@@ -1930,16 +2361,36 @@ pub async fn hot_scan(
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
         let monitor_dex = DexScreenerClient::new();
+        let monitor_bought_mints = bought_mints.clone();
+        let monitor_bought_mints_path = bought_mints_path.clone();
+        let monitor_use_local_api = use_local_api;
+        // Determine which wallet to query for token balances
+        let monitor_wallet = if use_local_api {
+            keypair.pubkey()
+        } else if !config.pumpportal.lightning_wallet.is_empty() {
+            Pubkey::from_str(&config.pumpportal.lightning_wallet)
+                .unwrap_or_else(|_| keypair.pubkey())
+        } else {
+            keypair.pubkey()
+        };
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
             let poll_interval_ms = monitor_config.auto_sell.price_poll_interval_ms;
-            info!("Features: Trailing Stop (3%), No-Movement Exit (60s), Quick Profit, LOCAL FALLBACK");
+            info!("Features: Trailing Stop (5%), No-Movement Exit (120s), Quick Profit, LOCAL FALLBACK");
             info!("Poll interval: {}ms", poll_interval_ms);
+            if !monitor_use_local_api {
+                info!(
+                    "Using Lightning wallet for balance queries: {}",
+                    monitor_wallet
+                );
+            }
 
-            let mut sell_attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            let mut sell_attempts: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
             // Track confirmed positions (tx landed and ATA exists)
-            let mut confirmed_positions: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut confirmed_positions: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
@@ -1972,29 +2423,41 @@ pub async fn hot_scan(
                         Ok(None) => {
                             // Token not found on DexScreener - use last known price
                             if position.current_price > 0.0 {
-                                warn!("[{}] Not found on DexScreener, using last known price: {:.10}",
-                                      position.symbol, position.current_price);
+                                warn!(
+                                    "[{}] Not found on DexScreener, using last known price: {:.10}",
+                                    position.symbol, position.current_price
+                                );
                                 position.current_price
                             } else {
-                                warn!("[{}] Not found on DexScreener and no last price - skipping", position.symbol);
+                                warn!(
+                                    "[{}] Not found on DexScreener and no last price - skipping",
+                                    position.symbol
+                                );
                                 continue;
                             }
                         }
                         Err(e) => {
                             // API error - use last known price as fallback
                             if position.current_price > 0.0 {
-                                warn!("[{}] DexScreener error: {} - using last known price: {:.10}",
-                                      position.symbol, e, position.current_price);
+                                warn!(
+                                    "[{}] DexScreener error: {} - using last known price: {:.10}",
+                                    position.symbol, e, position.current_price
+                                );
                                 position.current_price
                             } else {
-                                error!("[{}] DexScreener error and no fallback price: {}", position.symbol, e);
+                                error!(
+                                    "[{}] DexScreener error and no fallback price: {}",
+                                    position.symbol, e
+                                );
                                 continue;
                             }
                         }
                     };
 
                     // Update position price
-                    monitor_positions.update_price(&position.mint, current_price).await;
+                    monitor_positions
+                        .update_price(&position.mint, current_price)
+                        .await;
 
                     // Small delay between API calls to avoid rate limiting
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2007,7 +2470,9 @@ pub async fn hot_scan(
 
                     // TX CONFIRMATION CHECK: Verify buy tx confirmed before allowing sells
                     if !confirmed_positions.contains(&position.mint) {
-                        let position_age_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
+                        let position_age_secs = (chrono::Utc::now() - position.entry_time)
+                            .num_seconds()
+                            .max(0) as u64;
 
                         // First 5 seconds: just wait
                         if position_age_secs < 5 {
@@ -2015,16 +2480,29 @@ pub async fn hot_scan(
                         }
 
                         // After 5 seconds: check if we have tokens
-                        let wallet_pubkey = monitor_keypair.pubkey();
-                        let token_balance = query_token_balance(&monitor_rpc, &wallet_pubkey, &position.mint);
+                        // Use monitor_wallet (Lightning wallet or local wallet based on API mode)
+                        let token_balance =
+                            query_token_balance(&monitor_rpc, &monitor_wallet, &position.mint);
 
                         if token_balance > 0 {
-                            info!("[{}] TX CONFIRMED - token balance: {}", position.symbol, token_balance);
+                            info!(
+                                "[{}] TX CONFIRMED - token balance: {}",
+                                position.symbol, token_balance
+                            );
                             confirmed_positions.insert(position.mint.clone());
                         } else if position_age_secs > 30 {
                             // After 30 seconds with no tokens, assume tx failed
-                            warn!("[{}] TX LIKELY FAILED - no tokens after 30s, removing position", position.symbol);
-                            let _ = monitor_positions.close_position(&position.mint, position.token_amount, 0.0).await;
+                            warn!(
+                                "[{}] TX LIKELY FAILED - no tokens after 30s, removing position",
+                                position.symbol
+                            );
+                            let _ = monitor_positions.abandon_position(&position.mint).await;
+                            let _ = remove_bought_mint(
+                                &monitor_bought_mints,
+                                &monitor_bought_mints_path,
+                                &position.mint,
+                            )
+                            .await;
                             continue;
                         } else {
                             // Still waiting for confirmation
@@ -2040,14 +2518,20 @@ pub async fn hot_scan(
                     };
 
                     // Calculate drop from peak (for trailing stop)
-                    let peak_price = if position.peak_price > 0.0 { position.peak_price } else { position.entry_price };
+                    let peak_price = if position.peak_price > 0.0 {
+                        position.peak_price
+                    } else {
+                        position.entry_price
+                    };
                     let drop_from_peak_pct = if peak_price > 0.0 {
                         ((peak_price - current_price) / peak_price) * 100.0
                     } else {
                         0.0
                     };
 
-                    let hold_time_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
+                    let hold_time_secs = (chrono::Utc::now() - position.entry_time)
+                        .num_seconds()
+                        .max(0) as u64;
 
                     // Get entry-type-specific thresholds
                     let tp_pct = position.entry_type.take_profit_pct();
@@ -2059,16 +2543,20 @@ pub async fn hot_scan(
                     if hold_time_secs % 15 == 0 {
                         info!(
                             "[{}] Price: {:.10} | P&L: {:+.1}% | Peak: {:+.1}% | Hold: {}s",
-                            position.symbol, current_price, pnl_pct,
+                            position.symbol,
+                            current_price,
+                            pnl_pct,
                             if peak_price > position.entry_price {
                                 ((peak_price - position.entry_price) / position.entry_price) * 100.0
-                            } else { 0.0 },
+                            } else {
+                                0.0
+                            },
                             hold_time_secs
                         );
                     }
 
-                    let trailing_stop_pct = 3.0;
-                    let no_movement_secs = 60;
+                    let trailing_stop_pct = 5.0;
+                    let no_movement_secs = 120;
                     let no_movement_threshold = 2.0;
 
                     let mut should_sell = false;
@@ -2084,7 +2572,10 @@ pub async fn hot_scan(
                     // 2. Trailing stop (only if in profit and dropped from peak)
                     if !should_sell && pnl_pct > 0.0 && drop_from_peak_pct >= trailing_stop_pct {
                         should_sell = true;
-                        reason = format!("TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%)", drop_from_peak_pct, pnl_pct);
+                        reason = format!(
+                            "TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%)",
+                            drop_from_peak_pct, pnl_pct
+                        );
                     }
 
                     // 3. Take profit
@@ -2094,14 +2585,21 @@ pub async fn hot_scan(
                     }
 
                     // 4. Quick profit (partial exit)
-                    if !should_sell && !position.quick_profit_taken && pnl_pct >= quick_profit_pct && pnl_pct < tp_pct {
+                    if !should_sell
+                        && !position.quick_profit_taken
+                        && pnl_pct >= quick_profit_pct
+                        && pnl_pct < tp_pct
+                    {
                         should_sell = true;
                         sell_pct = "50%";
                         reason = format!("QUICK PROFIT at {:.1}% - selling 50%", pnl_pct);
                     }
 
                     // 5. No-movement exit
-                    if !should_sell && hold_time_secs >= no_movement_secs && pnl_pct.abs() < no_movement_threshold {
+                    if !should_sell
+                        && hold_time_secs >= no_movement_secs
+                        && pnl_pct.abs() < no_movement_threshold
+                    {
                         should_sell = true;
                         reason = format!("NO MOVEMENT: {:.1}% after {}s", pnl_pct, hold_time_secs);
                     }
@@ -2111,75 +2609,160 @@ pub async fn hot_scan(
                         if let Some(max_secs) = max_hold {
                             if hold_time_secs >= max_secs {
                                 should_sell = true;
-                                reason = format!("MAX HOLD TIME ({} secs) P&L: {:.1}%", max_secs, pnl_pct);
+                                reason = format!(
+                                    "MAX HOLD TIME ({} secs) P&L: {:.1}%",
+                                    max_secs, pnl_pct
+                                );
                             }
                         }
                     }
 
                     // Execute sell
                     if should_sell {
-                        warn!("AUTO-SELL TRIGGERED: {} ({}) - {}", position.symbol, position.mint, reason);
+                        warn!(
+                            "AUTO-SELL TRIGGERED: {} ({}) - {}",
+                            position.symbol, position.mint, reason
+                        );
 
                         if let Some(ref trader) = monitor_trader {
                             let slippage = monitor_config.trading.slippage_bps / 100;
-                            let priority_fee = monitor_config.trading.priority_fee_lamports as f64 / 1e9;
+                            let priority_fee =
+                                monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
                             let attempts = sell_attempts.entry(position.mint.clone()).or_insert(0);
                             *attempts += 1;
 
                             if *attempts > 5 {
                                 error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
-                                // Estimate received SOL as 0 since sell failed
-                                let _ = monitor_positions.close_position(&position.mint, position.token_amount, 0.0).await;
+                                let _ = monitor_positions.abandon_position(&position.mint).await;
+                                let _ = remove_bought_mint(
+                                    &monitor_bought_mints,
+                                    &monitor_bought_mints_path,
+                                    &position.mint,
+                                )
+                                .await;
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
 
+                            // Query SOL balance BEFORE sell for real P&L tracking
+                            let sol_before = monitor_rpc
+                                .get_balance(&monitor_wallet)
+                                .unwrap_or(0) as f64
+                                / 1_000_000_000.0;
+
                             // Try Lightning API first (attempts 1-3), then local (attempts 4-5)
-                            let sell_result: std::result::Result<String, crate::error::Error> = if *attempts <= 3 {
-                                info!("Attempting Lightning API sell (attempt {})", attempts);
-                                trader.sell(&position.mint, sell_pct, slippage, priority_fee).await
-                            } else {
-                                warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
-                                trader.sell_local(&position.mint, sell_pct, slippage, priority_fee, &monitor_keypair, &monitor_rpc).await
-                            };
+                            let sell_result: std::result::Result<String, crate::error::Error> =
+                                if *attempts <= 3 {
+                                    info!("Attempting Lightning API sell (attempt {})", attempts);
+                                    trader
+                                        .sell(&position.mint, sell_pct, slippage, priority_fee)
+                                        .await
+                                } else {
+                                    warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
+                                    trader
+                                        .sell_local(
+                                            &position.mint,
+                                            sell_pct,
+                                            slippage,
+                                            priority_fee,
+                                            &monitor_keypair,
+                                            &monitor_rpc,
+                                        )
+                                        .await
+                                };
 
                             match sell_result {
                                 Ok(sig) => {
                                     info!("AUTO-SELL EXECUTED: {} - {}", position.symbol, sig);
                                     sell_attempts.remove(&position.mint);
 
+                                    // Wait for tx confirmation then query actual SOL received
+                                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                                    let sol_after = monitor_rpc
+                                        .get_balance(&monitor_wallet)
+                                        .unwrap_or(0) as f64
+                                        / 1_000_000_000.0;
+                                    let actual_received = (sol_after - sol_before).max(0.0);
+
                                     // Calculate trade metrics
-                                    let hold_secs = (chrono::Utc::now() - position.entry_time).num_seconds();
-                                    let price_change_pct = ((current_price - position.entry_price) / position.entry_price) * 100.0;
+                                    let hold_secs =
+                                        (chrono::Utc::now() - position.entry_time).num_seconds();
+                                    let price_change_pct = ((current_price - position.entry_price)
+                                        / position.entry_price)
+                                        * 100.0;
 
                                     if sell_pct == "50%" {
                                         let half_amount = position.token_amount / 2;
-                                        // Estimate received SOL based on current price (minus ~2% slippage estimate)
-                                        let estimated_received = (half_amount as f64 * current_price) * 0.98;
-                                        let pnl_sol = estimated_received - (position.total_cost_sol / 2.0);
-                                        let _ = monitor_positions.close_position(&position.mint, half_amount, estimated_received).await;
-                                        let _ = monitor_positions.mark_quick_profit_taken(&position.mint).await;
+                                        // Use actual received SOL (fallback to estimate if 0)
+                                        let received = if actual_received > 0.0 {
+                                            actual_received
+                                        } else {
+                                            (half_amount as f64 * current_price) * 0.98
+                                        };
+                                        let pnl_sol = received - (position.total_cost_sol / 2.0);
+                                        let _ = monitor_positions
+                                            .close_position(
+                                                &position.mint,
+                                                half_amount,
+                                                received,
+                                            )
+                                            .await;
+                                        let _ = monitor_positions
+                                            .mark_quick_profit_taken(&position.mint)
+                                            .await;
                                         info!("=== TRADE CLOSED (Partial) ===");
-                                        info!("  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                              position.symbol, position.entry_price, current_price, price_change_pct);
-                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
-                                              half_amount, estimated_received, pnl_sol, hold_secs);
+                                        info!(
+                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                            position.symbol,
+                                            position.entry_price,
+                                            current_price,
+                                            price_change_pct
+                                        );
+                                        info!("  Tokens: {} | Received: {:.4} SOL (actual) | P&L: {:+.4} SOL | Hold: {}s",
+                                              half_amount, received, pnl_sol, hold_secs);
                                     } else {
-                                        // Estimate received SOL based on current price (minus ~2% slippage estimate)
-                                        let estimated_received = (position.token_amount as f64 * current_price) * 0.98;
-                                        let pnl_sol = estimated_received - position.total_cost_sol;
+                                        // Use actual received SOL (fallback to estimate if 0)
+                                        let received = if actual_received > 0.0 {
+                                            actual_received
+                                        } else {
+                                            (position.token_amount as f64 * current_price) * 0.98
+                                        };
+                                        let pnl_sol = received - position.total_cost_sol;
                                         let pnl_pct = (pnl_sol / position.total_cost_sol) * 100.0;
-                                        let _ = monitor_positions.close_position(&position.mint, position.token_amount, estimated_received).await;
+                                        let _ = monitor_positions
+                                            .close_position(
+                                                &position.mint,
+                                                position.token_amount,
+                                                received,
+                                            )
+                                            .await;
+
+                                        // Clean up bought_mints on successful full sell
+                                        let _ = remove_bought_mint(
+                                            &monitor_bought_mints,
+                                            &monitor_bought_mints_path,
+                                            &position.mint,
+                                        )
+                                        .await;
+
                                         info!("=== TRADE CLOSED (Full) ===");
-                                        info!("  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                              position.symbol, position.entry_price, current_price, price_change_pct);
-                                        info!("  Cost: {:.4} SOL | Received: {:.4} SOL | P&L: {:+.4} SOL ({:+.1}%) | Hold: {}s",
-                                              position.total_cost_sol, estimated_received, pnl_sol, pnl_pct, hold_secs);
+                                        info!(
+                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                            position.symbol,
+                                            position.entry_price,
+                                            current_price,
+                                            price_change_pct
+                                        );
+                                        info!("  Cost: {:.4} SOL | Received: {:.4} SOL (actual) | P&L: {:+.4} SOL ({:+.1}%) | Hold: {}s",
+                                              position.total_cost_sol, received, pnl_sol, pnl_pct, hold_secs);
                                     }
                                 }
                                 Err(e) => {
-                                    error!("AUTO-SELL FAILED for {} (attempt {}): {}", position.symbol, attempts, e);
+                                    error!(
+                                        "AUTO-SELL FAILED for {} (attempt {}): {}",
+                                        position.symbol, attempts, e
+                                    );
                                 }
                             }
                         }
@@ -2241,27 +2824,39 @@ pub async fn hot_scan(
 
                         // PRE-TRADE VALIDATION: Check position limits BEFORE trading
                         if let Err(e) = position_manager.can_open_position(buy_amount).await {
-                            warn!("Cannot open position for {}: {} - stopping buy loop", token.symbol, e);
+                            warn!(
+                                "Cannot open position for {}: {} - stopping buy loop",
+                                token.symbol, e
+                            );
                             break; // Stop trying to buy more tokens
                         }
 
-                        info!("AUTO-BUY candidate: {} ({}) score={:.1}", token.symbol, token.mint, token.score());
+                        info!(
+                            "AUTO-BUY candidate: {} ({}) score={:.1}",
+                            token.symbol,
+                            token.mint,
+                            token.score()
+                        );
 
                         // POOL READINESS CHECK: Verify pump.fun pool exists before buying
                         if let Some(ref trader) = trader {
                             if !trader.check_pool_ready(&token.mint).await {
-                                warn!("Skipping {} - pool not ready (may be too new)", token.symbol);
+                                warn!(
+                                    "Skipping {} - pool not ready (may be too new)",
+                                    token.symbol
+                                );
                                 continue;
                             }
                         }
 
                         if dry_run {
-                            warn!("DRY-RUN: Would buy {:.4} SOL of {}", buy_amount, token.symbol);
+                            warn!(
+                                "DRY-RUN: Would buy {:.4} SOL of {}",
+                                buy_amount, token.symbol
+                            );
                             bought.insert(token.mint.clone(), chrono::Utc::now().timestamp());
                             // Persist bought_mints to disk (with timestamps)
-                            if let Ok(data) = serde_json::to_string_pretty(&*bought) {
-                                let _ = std::fs::write(&*bought_mints_path, data);
-                            }
+                            persist_bought_mints(&*bought_mints_path, &*bought);
                             continue;
                         }
 
@@ -2269,22 +2864,41 @@ pub async fn hot_scan(
                             let slippage = config.trading.slippage_bps / 100;
                             let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
 
-                            info!("Buying {} SOL of {} via {}", buy_amount, token.symbol, if use_local_api { "Local API" } else { "Lightning" });
+                            info!(
+                                "Buying {} SOL of {} via {}",
+                                buy_amount,
+                                token.symbol,
+                                if use_local_api {
+                                    "Local API"
+                                } else {
+                                    "Lightning"
+                                }
+                            );
 
                             let buy_result = if use_local_api {
-                                trader.buy_local(&token.mint, buy_amount, slippage, priority_fee, &keypair, &rpc_client).await
+                                trader
+                                    .buy_local(
+                                        &token.mint,
+                                        buy_amount,
+                                        slippage,
+                                        priority_fee,
+                                        &keypair,
+                                        &rpc_client,
+                                    )
+                                    .await
                             } else {
-                                trader.buy(&token.mint, buy_amount, slippage, priority_fee).await
+                                trader
+                                    .buy(&token.mint, buy_amount, slippage, priority_fee)
+                                    .await
                             };
 
                             match buy_result {
                                 Ok(sig) => {
                                     info!("BUY EXECUTED: {} - {}", token.symbol, sig);
-                                    bought.insert(token.mint.clone(), chrono::Utc::now().timestamp());
+                                    bought
+                                        .insert(token.mint.clone(), chrono::Utc::now().timestamp());
                                     // Persist bought_mints to disk (with timestamps)
-                                    if let Ok(data) = serde_json::to_string_pretty(&*bought) {
-                                        let _ = std::fs::write(&*bought_mints_path, data);
-                                    }
+                                    persist_bought_mints(&*bought_mints_path, &*bought);
 
                                     // Record position
                                     let estimated_tokens = (buy_amount / token.price_native) as u64;
@@ -2298,7 +2912,8 @@ pub async fn hot_scan(
                                         total_cost_sol: buy_amount,
                                         entry_time: chrono::Utc::now(),
                                         entry_signature: sig,
-                                        entry_type: crate::position::manager::EntryType::Opportunity,
+                                        entry_type:
+                                            crate::position::manager::EntryType::Opportunity,
                                         quick_profit_taken: false,
                                         peak_price: token.price_native,
                                         current_price: token.price_native,
@@ -2306,15 +2921,28 @@ pub async fn hot_scan(
 
                                     if let Err(e) = position_manager.open_position(position).await {
                                         error!("Failed to record position: {}", e);
+                                        bought.remove(&token.mint);
+                                        persist_bought_mints(&*bought_mints_path, &*bought);
+                                        continue;
                                     }
 
                                     // Wait for tx confirmation, then query actual token balance
                                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                    let actual_balance = query_token_balance(&rpc_client, &keypair.pubkey(), &token.mint);
+                                    let actual_balance = query_token_balance(
+                                        &rpc_client,
+                                        &keypair.pubkey(),
+                                        &token.mint,
+                                    );
                                     if actual_balance > 0 && actual_balance != estimated_tokens {
-                                        info!("Actual token balance: {} (estimated: {})", actual_balance, estimated_tokens);
+                                        info!(
+                                            "Actual token balance: {} (estimated: {})",
+                                            actual_balance, estimated_tokens
+                                        );
                                         // Update position with actual balance
-                                        if let Err(e) = position_manager.update_token_amount(&token.mint, actual_balance).await {
+                                        if let Err(e) = position_manager
+                                            .update_token_amount(&token.mint, actual_balance)
+                                            .await
+                                        {
                                             warn!("Failed to update token amount: {}", e);
                                         }
                                     } else if actual_balance == 0 {
@@ -2323,12 +2951,7 @@ pub async fn hot_scan(
                                 }
                                 Err(e) => {
                                     error!("BUY FAILED for {}: {}", token.symbol, e);
-                                    // Mark as bought to avoid retrying failed tokens
-                                    bought.insert(token.mint.clone(), chrono::Utc::now().timestamp());
-                                    // Persist bought_mints to disk (with timestamps)
-                                    if let Ok(data) = serde_json::to_string_pretty(&*bought) {
-                                        let _ = std::fs::write(&*bought_mints_path, data);
-                                    }
+                                    continue;
                                 }
                             }
                         }
@@ -2344,22 +2967,24 @@ pub async fn hot_scan(
         // === TELEMETRY & MONITORING ===
         let positions = position_manager.get_all_positions().await;
         let daily_stats = position_manager.get_daily_stats().await;
-        let bought_count = bought_mints.lock().await.len();
 
         // Session Stats Summary
         println!("\n{:=<80}", "");
         println!("SESSION STATS:");
-        println!("  Tokens Bought: {} | Open Positions: {}", bought_count, positions.len());
-        println!("  Daily Trades: {} | Wins: {} | Losses: {} | Win Rate: {:.1}%",
+        println!(
+            "  Total Trades: {} | Open Positions: {}",
             daily_stats.total_trades,
+            positions.len()
+        );
+        println!(
+            "  Wins: {} | Losses: {} | Win Rate: {:.1}%",
             daily_stats.winning_trades,
             daily_stats.losing_trades,
             daily_stats.win_rate()
         );
-        println!("  Profit: {:.4} SOL | Loss: {:.4} SOL | Net P&L: {:.4} SOL",
-            daily_stats.total_profit_sol,
-            daily_stats.total_loss_sol,
-            daily_stats.net_pnl_sol
+        println!(
+            "  Profit: {:.4} SOL | Loss: {:.4} SOL | Net P&L: {:.4} SOL",
+            daily_stats.total_profit_sol, daily_stats.total_loss_sol, daily_stats.net_pnl_sol
         );
 
         // Position Details
@@ -2386,7 +3011,10 @@ pub async fn hot_scan(
         // Remaining capacity
         let remaining_capacity = position_manager.remaining_position_capacity().await;
         let remaining_loss = position_manager.remaining_daily_loss().await;
-        println!("\n  Remaining Position Capacity: {:.4} SOL", remaining_capacity);
+        println!(
+            "\n  Remaining Position Capacity: {:.4} SOL",
+            remaining_capacity
+        );
         println!("  Remaining Daily Loss Buffer: {:.4} SOL", remaining_loss);
         println!("{:=<80}", "");
 

@@ -13,8 +13,8 @@
 use super::fatal_risk::FatalRisk;
 use super::portfolio_risk::PortfolioBlock;
 use super::types::{
-    ArbitratedDecision, ChainAction, DecisionSource,
-    EntrySignal, ExitSignal, TradingAction, TokenRegime,
+    ArbitratedDecision, ChainAction, DecisionSource, EntrySignal, ExitSignal, TokenRegime,
+    TradingAction,
 };
 
 /// Rug prediction result
@@ -35,12 +35,16 @@ pub struct DecisionArbitrator {
 impl DecisionArbitrator {
     /// Create a new decision arbitrator
     pub fn new() -> Self {
-        Self { log_overrides: true }
+        Self {
+            log_overrides: true,
+        }
     }
 
     /// Create without override logging
     pub fn quiet() -> Self {
-        Self { log_overrides: false }
+        Self {
+            log_overrides: false,
+        }
     }
 
     /// Arbitrate a new token entry decision
@@ -60,13 +64,19 @@ impl DecisionArbitrator {
             if let Some(entry) = &strategy_signal {
                 self.log_override(
                     DecisionSource::Strategy,
-                    &format!("Entry signal for {} at {:.3} SOL", mint, entry.suggested_size_sol),
+                    &format!(
+                        "Entry signal for {} at {:.3} SOL",
+                        mint, entry.suggested_size_sol
+                    ),
                     DecisionSource::FatalRisk,
                     &fatal.description(),
                 );
                 overridden.push((
                     DecisionSource::Strategy,
-                    format!("Entry: {} at {:.3} SOL", entry.strategy, entry.suggested_size_sol),
+                    format!(
+                        "Entry: {} at {:.3} SOL",
+                        entry.strategy, entry.suggested_size_sol
+                    ),
                     format!("Overridden by fatal risk: {}", fatal.description()),
                 ));
             }
@@ -142,7 +152,10 @@ impl DecisionArbitrator {
                 );
                 overridden.push((
                     DecisionSource::Strategy,
-                    format!("Entry: {:?} at {:.3} SOL", entry.strategy, entry.suggested_size_sol),
+                    format!(
+                        "Entry: {:?} at {:.3} SOL",
+                        entry.strategy, entry.suggested_size_sol
+                    ),
                     format!("Overridden by portfolio risk: {}", block.description()),
                 ));
             }
@@ -163,7 +176,10 @@ impl DecisionArbitrator {
                     TokenRegime::WashTrade { wash_pct, .. } => {
                         format!("Wash trade detected ({:.0}%)", wash_pct)
                     }
-                    TokenRegime::DeployerBleed { deployer_holdings_pct, .. } => {
+                    TokenRegime::DeployerBleed {
+                        deployer_holdings_pct,
+                        ..
+                    } => {
                         format!("Deployer bleed ({:.0}% holdings)", deployer_holdings_pct)
                     }
                     _ => "Toxic regime".to_string(),
@@ -232,14 +248,21 @@ impl DecisionArbitrator {
                         DecisionSource::ExitManager,
                         &format!("Exit signal: {:?}", exit.reason),
                         DecisionSource::RugPredictor,
-                        &format!("Rug predicted at {:.0}% probability", rug.probability * 100.0),
+                        &format!(
+                            "Rug predicted at {:.0}% probability",
+                            rug.probability * 100.0
+                        ),
                     );
                 }
                 return ArbitratedDecision {
                     action: TradingAction::Exit {
                         mint: mint.to_string(),
                         pct: 100.0,
-                        reason: format!("Rug predicted ({:.0}%): {}", rug.probability * 100.0, rug.warnings.join(", ")),
+                        reason: format!(
+                            "Rug predicted ({:.0}%): {}",
+                            rug.probability * 100.0,
+                            rug.warnings.join(", ")
+                        ),
                     },
                     source: DecisionSource::RugPredictor,
                     overridden,
@@ -291,14 +314,22 @@ impl DecisionArbitrator {
     ) -> ArbitratedDecision {
         // If we have a position, prioritize exit checks
         if has_position {
-            let exit_decision = self.arbitrate_exit(mint, rug_prediction, exit_signal, chain_action);
+            let exit_decision =
+                self.arbitrate_exit(mint, rug_prediction, exit_signal, chain_action);
             if !matches!(exit_decision.action, TradingAction::Hold) {
                 return exit_decision;
             }
         }
 
         // Otherwise, check entry
-        self.arbitrate_entry(mint, fatal_result, chain_action, portfolio_result, strategy_signal, regime)
+        self.arbitrate_entry(
+            mint,
+            fatal_result,
+            chain_action,
+            portfolio_result,
+            strategy_signal,
+            regime,
+        )
     }
 
     /// Log an override for debugging
@@ -329,8 +360,8 @@ impl Default for DecisionArbitrator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::{TradingStrategy, Urgency};
+    use super::*;
 
     fn make_entry_signal(mint: &str, size: f64) -> EntrySignal {
         EntrySignal {
@@ -502,7 +533,10 @@ mod tests {
             &ChainAction::ExitOnlyMode, // Chain also bad
             Err(PortfolioBlock::MaxPositionsReached { current: 5, max: 5 }), // Portfolio also blocked
             Some(make_entry_signal("test_mint", 0.1)),
-            &TokenRegime::WashTrade { wash_pct: 0.9, real_volume_sol: 0.1 }, // Regime also bad
+            &TokenRegime::WashTrade {
+                wash_pct: 0.9,
+                real_volume_sol: 0.1,
+            }, // Regime also bad
         );
 
         // Should be fatal risk, not any of the others

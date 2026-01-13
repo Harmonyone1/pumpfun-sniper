@@ -244,7 +244,10 @@ impl PriceFeed {
     }
 
     /// Fetch price from bonding curve, also returns whether the curve is complete (graduated)
-    async fn fetch_bonding_curve_price(rpc_client: &RpcClient, bonding_curve: &Pubkey) -> Result<(f64, bool)> {
+    async fn fetch_bonding_curve_price(
+        rpc_client: &RpcClient,
+        bonding_curve: &Pubkey,
+    ) -> Result<(f64, bool)> {
         let account = rpc_client
             .get_account(bonding_curve)
             .map_err(|e| Error::Rpc(format!("Failed to fetch bonding curve: {}", e)))?;
@@ -255,7 +258,10 @@ impl PriceFeed {
     }
 
     /// Fetch price from DexScreener API (for graduated tokens)
-    async fn fetch_dexscreener_price(dexscreener: &DexScreenerClient, mint: &Pubkey) -> Result<f64> {
+    async fn fetch_dexscreener_price(
+        dexscreener: &DexScreenerClient,
+        mint: &Pubkey,
+    ) -> Result<f64> {
         let mint_str = mint.to_string();
         let token_info = dexscreener
             .get_token_info(&mint_str)
@@ -264,7 +270,10 @@ impl PriceFeed {
 
         match token_info {
             Some(info) if info.price_native > 0.0 => {
-                debug!("Got DexScreener price for {}: {} SOL", mint, info.price_native);
+                debug!(
+                    "Got DexScreener price for {}: {} SOL",
+                    mint, info.price_native
+                );
                 Ok(info.price_native)
             }
             Some(_) => Err(Error::Rpc("DexScreener returned zero price".to_string())),

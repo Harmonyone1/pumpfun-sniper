@@ -35,7 +35,10 @@ max_reconnect_attempts = 10
 ping_interval_secs = 30
 # API key for Lightning Trading API (get from https://pumpportal.fun)
 # Leave empty to use Local API (sign transactions yourself)
-api_key = ""
+# NOTE: Lightning API uses the wallet tied to the API key (9EwatauCtiQSK4ArSPvuQZFqtF6mvogM8qurL6av24mo)
+api_key = "618ppm9rf8r3cru29h56jgk4f9anerkj5d44yh3q8dvm4vbd9mtq4uvra9gmmy1re9m38cbjahc7mmj175r46c349cqn6yjp8npp2mu99hw7jt25cx17ccurddr6phv46n7jywbm84yku9hbn8wjd8566uctpad230x2t5wf1b5epauenr6yhj2dxrpjv2970tq6vk6e5vkuf8"
+# Lightning wallet address (derived from API key)
+lightning_wallet = "9EwatauCtiQSK4ArSPvuQZFqtF6mvogM8qurL6av24mo"
 # Use PumpPortal for trading (true) or Jito bundles (false)
 use_for_trading = true
 
@@ -49,8 +52,8 @@ channel_capacity = 10000
 drop_policy = "oldest_non_priority"
 
 [trading]
-# Amount of SOL to spend per snipe
-buy_amount_sol = 0.05
+# Amount of SOL to spend per snipe (increased from 0.05 to overcome fees)
+buy_amount_sol = 0.15
 # Slippage tolerance in basis points (2500 = 25%)
 slippage_bps = 2500
 # Priority fee for non-Jito transactions
@@ -81,16 +84,25 @@ priority_boost = true
 [auto_sell]
 # Enable automatic take-profit and stop-loss
 enabled = true
-# Sell when profit reaches this percentage
-take_profit_pct = 50.0
-# Sell when loss reaches this percentage
-stop_loss_pct = 30.0
+# Sell when profit reaches this percentage (DATA-DRIVEN: lowered for realistic exits)
+take_profit_pct = 10.0
+# Sell when loss reaches this percentage (widened to give trades more room)
+stop_loss_pct = 15.0
+# Quick profit: sell 50% at this level to lock in gains
+quick_profit_pct = 5.0
+# Trailing stop: sell if price drops this % from peak (locks in profits)
+trailing_stop_pct = 5.0
+# No-movement exit: exit if price moves less than this % after no_movement_secs
+no_movement_threshold_pct = 2.0
+no_movement_secs = 120
+# Max hold time in seconds (safety net)
+max_hold_secs = 120
 # Enable partial take-profit (sell portion at TP, hold rest)
 partial_take_profit = false
-# Price polling interval in milliseconds
+# Price polling interval in milliseconds (REDUCED for faster exit)
 # Trade-off: faster = more RPC calls = higher cost
 # WARNING: TP/SL is best-effort. Fast rugs can gap through stop-loss.
-price_poll_interval_ms = 1000
+price_poll_interval_ms = 500
 
 [safety]
 # Require confirmation for manual sells
@@ -173,3 +185,33 @@ min_extraction_interval_secs = 3600
 #   - Withdraw from vault (vault is receive-only)
 #   - Override emergency locks
 #   - Execute large transfers without user approval
+
+[smart_money]
+# Enable smart money detection features
+enabled = true
+
+[smart_money.kill_switches]
+# Kill-switches are non-negotiable exit conditions
+# When triggered, bot sells immediately - no debate
+enabled = true
+# Exit if deployer/creator sells ANY amount (strongest signal)
+deployer_sell_any = true
+# Exit if top holder sells (holder_watcher Critical alert)
+top_holder_sell = true
+# Future: Number of bundled wallets selling together to trigger exit
+bundled_sell_count = 2
+# Future: Window in seconds for bundled sell detection
+bundled_sell_window_secs = 30
+
+[smart_money.holder_watcher]
+# Track top N holders for sell alerts
+top_n_holders = 10
+# Alert thresholds by holder rank
+# Rank 1-3: Alert if sells >10% of position
+# Rank 4-6: Alert if sells >15%
+# Rank 7+: Alert if sells >20%
+critical_sell_pct = 10.0
+high_sell_pct = 15.0
+medium_sell_pct = 20.0
+# Exit if total holder sells exceed this threshold (across all tracked)
+total_exit_threshold_pct = 30.0

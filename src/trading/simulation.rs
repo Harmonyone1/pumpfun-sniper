@@ -88,8 +88,5 @@ pub fn all_simulations_passed(results: &[SimulationResult]) -> bool {
 
 /// Get total compute units from simulation results
 pub fn total_compute_units(results: &[SimulationResult]) -> u64 {
-    results
-        .iter()
-        .filter_map(|r| r.compute_units)
-        .sum()
+    results.iter().filter_map(|r| r.compute_units).sum()
 }

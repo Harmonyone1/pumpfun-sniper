@@ -64,3 +64,11 @@ package-lock.json
 
 # Claude Code artifacts
 .claude/
+tmpclaude-*
+
+# Credentials directory - contains wallet secrets
+credentials/
+
+# Temporary analysis and scripts
+analysis/
+scripts/

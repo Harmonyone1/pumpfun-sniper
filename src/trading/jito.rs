@@ -68,10 +68,12 @@ struct JsonRpcError {
 /// Bundle status response from Jito
 #[derive(Deserialize, Debug)]
 struct BundleStatusResponse {
+    #[allow(dead_code)]
     #[serde(default)]
     bundle_id: String,
     #[serde(default)]
     status: String,
+    #[allow(dead_code)]
     #[serde(default)]
     landed_slot: Option<u64>,
 }
@@ -79,18 +81,21 @@ struct BundleStatusResponse {
 /// Alternative status response format (Jito sometimes uses this)
 #[derive(Deserialize, Debug)]
 struct BundleStatusContext {
+    #[allow(dead_code)]
     context: Option<serde_json::Value>,
     value: Option<Vec<BundleStatusItem>>,
 }
 
 #[derive(Deserialize, Debug)]
 struct BundleStatusItem {
+    #[allow(dead_code)]
     #[serde(default)]
     bundle_id: String,
     #[serde(default)]
     status: String,
     #[serde(default)]
     confirmation_status: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     landed_slot: Option<u64>,
 }
@@ -156,7 +161,10 @@ impl JitoClient {
     }
 
     /// Submit a bundle of versioned transactions (from PumpPortal)
-    pub async fn submit_versioned_bundle(&self, transactions: Vec<VersionedTransaction>) -> Result<BundleResult> {
+    pub async fn submit_versioned_bundle(
+        &self,
+        transactions: Vec<VersionedTransaction>,
+    ) -> Result<BundleResult> {
         if transactions.is_empty() {
             return Err(Error::JitoBundleSubmission("Empty bundle".to_string()));
         }
@@ -192,8 +200,9 @@ impl JitoClient {
         legacy_tx: Transaction,
     ) -> Result<BundleResult> {
         // Encode versioned transaction
-        let versioned_bytes = bincode::serialize(&versioned_tx)
-            .map_err(|e| Error::Serialization(format!("Failed to serialize versioned tx: {}", e)))?;
+        let versioned_bytes = bincode::serialize(&versioned_tx).map_err(|e| {
+            Error::Serialization(format!("Failed to serialize versioned tx: {}", e))
+        })?;
         let versioned_encoded = bs58::encode(&versioned_bytes).into_string();
 
         // Encode legacy transaction
@@ -215,10 +224,17 @@ impl JitoClient {
     }
 
     /// Send bundle request to Jito
-    async fn send_bundle_request(&self, encoded_txs: Vec<String>, signatures: Vec<String>) -> Result<BundleResult> {
+    async fn send_bundle_request(
+        &self,
+        encoded_txs: Vec<String>,
+        signatures: Vec<String>,
+    ) -> Result<BundleResult> {
         let url = format!("{}/api/v1/bundles", self.config.block_engine_url);
 
-        info!("Submitting bundle with {} transactions to Jito", encoded_txs.len());
+        info!(
+            "Submitting bundle with {} transactions to Jito",
+            encoded_txs.len()
+        );
 
         // Jito expects array of base64 encoded transactions
         let request = JsonRpcRequest {
@@ -265,10 +281,15 @@ impl JitoClient {
                                     if error.code == -32097 {
                                         warn!("Jito rate limit via RPC, waiting...");
                                         tokio::time::sleep(Duration::from_millis(1500)).await;
-                                        last_error = Some(Error::JitoBundleSubmission("Rate limited".to_string()));
+                                        last_error = Some(Error::JitoBundleSubmission(
+                                            "Rate limited".to_string(),
+                                        ));
                                         continue;
                                     }
-                                    warn!("Jito RPC error: {} (code: {})", error.message, error.code);
+                                    warn!(
+                                        "Jito RPC error: {} (code: {})",
+                                        error.message, error.code
+                                    );
                                     last_error = Some(Error::JitoBundleSubmission(error.message));
                                     continue;
                                 }
@@ -300,7 +321,10 @@ impl JitoClient {
                 }
                 Err(e) => {
                     warn!("Jito request failed: {}", e);
-                    last_error = Some(Error::JitoBundleSubmission(format!("Request failed: {}", e)));
+                    last_error = Some(Error::JitoBundleSubmission(format!(
+                        "Request failed: {}",
+                        e
+                    )));
                 }
             }
         }
@@ -330,7 +354,14 @@ impl JitoClient {
         let body = response.text().await.unwrap_or_default();
 
         // Log raw response for debugging (truncated)
-        debug!("Bundle status response: {}", if body.len() > 200 { &body[..200] } else { &body });
+        debug!(
+            "Bundle status response: {}",
+            if body.len() > 200 {
+                &body[..200]
+            } else {
+                &body
+            }
+        );
 
         // Helper to extract status from string
         let parse_status = |s: &str| -> BundleStatus {
@@ -347,7 +378,8 @@ impl JitoClient {
         };
 
         // Try format 1: { "result": [{ "bundle_id": ..., "status": ... }] }
-        if let Ok(resp) = serde_json::from_str::<JsonRpcResponse<Vec<BundleStatusResponse>>>(&body) {
+        if let Ok(resp) = serde_json::from_str::<JsonRpcResponse<Vec<BundleStatusResponse>>>(&body)
+        {
             if let Some(statuses) = resp.result {
                 if let Some(status) = statuses.first() {
                     if !status.status.is_empty() {
@@ -382,7 +414,9 @@ impl JitoClient {
                 if let Some(value) = result.get("value") {
                     if let Some(arr) = value.as_array() {
                         if let Some(first) = arr.first() {
-                            if let Some(status) = first.get("confirmation_status").and_then(|s| s.as_str()) {
+                            if let Some(status) =
+                                first.get("confirmation_status").and_then(|s| s.as_str())
+                            {
                                 return Ok(parse_status(status));
                             }
                             if let Some(status) = first.get("status").and_then(|s| s.as_str()) {
@@ -408,7 +442,11 @@ impl JitoClient {
     }
 
     /// Wait for bundle confirmation with timeout
-    pub async fn wait_for_confirmation(&self, bundle_id: &str, timeout_secs: u64) -> Result<BundleStatus> {
+    pub async fn wait_for_confirmation(
+        &self,
+        bundle_id: &str,
+        timeout_secs: u64,
+    ) -> Result<BundleStatus> {
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
@@ -452,7 +490,8 @@ impl JitoClient {
             Ok(response) => {
                 if let Ok(floors) = response.json::<Vec<serde_json::Value>>().await {
                     // Get the percentile we want
-                    let percentile_key = format!("landed_tips_{}_percentile", self.config.tip_percentile);
+                    let percentile_key =
+                        format!("landed_tips_{}_percentile", self.config.tip_percentile);
 
                     if let Some(floor) = floors.first() {
                         if let Some(tip) = floor.get(&percentile_key).and_then(|v| v.as_f64()) {

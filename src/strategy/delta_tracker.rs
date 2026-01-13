@@ -98,12 +98,18 @@ impl RollingWindow {
 
     /// Get the minimum value in window
     pub fn min(&self) -> f64 {
-        self.samples.iter().map(|(_, v)| *v).fold(f64::MAX, f64::min)
+        self.samples
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f64::MAX, f64::min)
     }
 
     /// Get the maximum value in window
     pub fn max(&self) -> f64 {
-        self.samples.iter().map(|(_, v)| *v).fold(f64::MIN, f64::max)
+        self.samples
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f64::MIN, f64::max)
     }
 
     /// Calculate trend based on slope
@@ -146,7 +152,12 @@ impl RollingWindow {
         // First half slope
         let first_half: Vec<_> = self.samples.iter().take(mid).collect();
         let first_slope = if first_half.len() >= 2 {
-            let duration = first_half.last().unwrap().0.duration_since(first_half.first().unwrap().0).as_secs_f64();
+            let duration = first_half
+                .last()
+                .unwrap()
+                .0
+                .duration_since(first_half.first().unwrap().0)
+                .as_secs_f64();
             if duration > 0.001 {
                 (first_half.last().unwrap().1 - first_half.first().unwrap().1) / duration
             } else {
@@ -159,7 +170,12 @@ impl RollingWindow {
         // Second half slope
         let second_half: Vec<_> = self.samples.iter().skip(mid).collect();
         let second_slope = if second_half.len() >= 2 {
-            let duration = second_half.last().unwrap().0.duration_since(second_half.first().unwrap().0).as_secs_f64();
+            let duration = second_half
+                .last()
+                .unwrap()
+                .0
+                .duration_since(second_half.first().unwrap().0)
+                .as_secs_f64();
             if duration > 0.001 {
                 (second_half.last().unwrap().1 - second_half.first().unwrap().1) / duration
             } else {
@@ -170,7 +186,11 @@ impl RollingWindow {
         };
 
         // Total duration
-        let total_duration = self.samples.back().unwrap().0
+        let total_duration = self
+            .samples
+            .back()
+            .unwrap()
+            .0
             .duration_since(self.samples.front().unwrap().0)
             .as_secs_f64();
 
@@ -198,9 +218,12 @@ impl RollingWindow {
         }
 
         let avg = self.average();
-        let variance = self.samples.iter()
+        let variance = self
+            .samples
+            .iter()
             .map(|(_, v)| (v - avg).powi(2))
-            .sum::<f64>() / (self.samples.len() - 1) as f64;
+            .sum::<f64>()
+            / (self.samples.len() - 1) as f64;
 
         variance.sqrt()
     }
@@ -304,13 +327,19 @@ impl DeltaTracker {
     /// Get or create a window for a metric
     pub fn get_window(&mut self, name: &str) -> &mut RollingWindow {
         let duration = self.default_duration;
-        self.windows.entry(name.to_string())
+        self.windows
+            .entry(name.to_string())
             .or_insert_with(|| RollingWindow::new(duration))
     }
 
     /// Get a window with specific duration
-    pub fn get_window_with_duration(&mut self, name: &str, duration: Duration) -> &mut RollingWindow {
-        self.windows.entry(name.to_string())
+    pub fn get_window_with_duration(
+        &mut self,
+        name: &str,
+        duration: Duration,
+    ) -> &mut RollingWindow {
+        self.windows
+            .entry(name.to_string())
             .or_insert_with(|| RollingWindow::new(duration))
     }
 
@@ -336,7 +365,8 @@ impl DeltaTracker {
         let holder_1m = self.get_window_with_duration(&prefix("holders"), Duration::from_secs(60));
         let holder_count_delta_1m = holder_1m.delta() as i32;
 
-        let holder_5m = self.get_window_with_duration(&prefix("holders_5m"), Duration::from_secs(300));
+        let holder_5m =
+            self.get_window_with_duration(&prefix("holders_5m"), Duration::from_secs(300));
         let holder_count_delta_5m = holder_5m.delta() as i32;
 
         let top_holder = self.get_window(&prefix("top_holder_pct"));

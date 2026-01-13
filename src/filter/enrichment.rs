@@ -6,12 +6,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio::time::timeout;
-use tracing::{debug, info, warn};
 use crate::filter::cache::FilterCache;
 use crate::filter::helius::HeliusClient;
 use crate::filter::types::SignalContext;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
 
 /// Request to enrich data for a token
 #[derive(Debug, Clone)]
@@ -136,7 +136,8 @@ impl EnrichmentService {
             total_count += 1;
             match timeout(
                 timeout_duration,
-                self.helius.get_wallet_history(creator, self.config.wallet_tx_limit),
+                self.helius
+                    .get_wallet_history(creator, self.config.wallet_tx_limit),
             )
             .await
             {
@@ -163,7 +164,8 @@ impl EnrichmentService {
             total_count += 1;
             match timeout(
                 timeout_duration,
-                self.helius.get_token_holders(mint, self.config.holder_limit),
+                self.helius
+                    .get_token_holders(mint, self.config.holder_limit),
             )
             .await
             {
@@ -214,7 +216,8 @@ impl EnrichmentService {
 
         match timeout(
             timeout_duration,
-            self.helius.get_wallet_history(address, self.config.wallet_tx_limit),
+            self.helius
+                .get_wallet_history(address, self.config.wallet_tx_limit),
         )
         .await
         {
@@ -257,7 +260,10 @@ pub struct EnrichmentWorker {
 
 impl EnrichmentWorker {
     /// Create a new worker with a channel receiver
-    pub fn new(service: Arc<EnrichmentService>, receiver: mpsc::Receiver<EnrichmentRequest>) -> Self {
+    pub fn new(
+        service: Arc<EnrichmentService>,
+        receiver: mpsc::Receiver<EnrichmentRequest>,
+    ) -> Self {
         Self { service, receiver }
     }
 

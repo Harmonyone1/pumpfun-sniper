@@ -12,6 +12,7 @@ use crate::filter::types::{PositionSignalContext, SignalContext, TradeSignalCont
 
 // Signal providers
 pub mod metadata;
+pub mod smart_money;
 pub mod wallet_behavior;
 // pub mod distribution;
 // pub mod order_flow;
@@ -20,6 +21,7 @@ pub mod wallet_behavior;
 
 // Re-exports
 pub use metadata::MetadataSignalProvider;
+pub use smart_money::SmartMoneySignalProvider;
 pub use wallet_behavior::WalletBehaviorSignalProvider;
 
 /// Signal value range: -1.0 (extreme risk) to +1.0 (extreme opportunity)
@@ -116,7 +118,7 @@ impl SignalType {
                 | SignalType::MintAuthority     // If cached from Helius
                 | SignalType::FreezeAuthority   // If cached from Helius
                 | SignalType::HolderConcentration // If cached from Helius
-                | SignalType::WalletHistory     // If cached from Helius
+                | SignalType::WalletHistory // If cached from Helius
         )
     }
 
@@ -153,8 +155,8 @@ impl SignalType {
             SignalType::UriAnalysis => 0.4,
 
             // CRITICAL - Token authority signals
-            SignalType::MintAuthority => 2.5,    // Can mint more = instant rug
-            SignalType::FreezeAuthority => 2.0,  // Can freeze accounts
+            SignalType::MintAuthority => 2.5, // Can mint more = instant rug
+            SignalType::FreezeAuthority => 2.0, // Can freeze accounts
 
             // Holder distribution signals
             SignalType::HolderConcentration => 1.5,
@@ -397,12 +399,7 @@ mod tests {
 
     #[test]
     fn test_signal_creation() {
-        let signal = Signal::new(
-            SignalType::KnownDeployer,
-            -0.9,
-            1.0,
-            "Known rug deployer",
-        );
+        let signal = Signal::new(SignalType::KnownDeployer, -0.9, 1.0, "Known rug deployer");
         assert_eq!(signal.signal_type, SignalType::KnownDeployer);
         assert!(signal.is_risk());
         assert!(!signal.is_opportunity());

@@ -98,8 +98,7 @@ impl FrontRunDetector {
         }
 
         let now = chrono::Utc::now();
-        let window_start =
-            now - chrono::Duration::seconds(self.config.cluster_window_secs as i64);
+        let window_start = now - chrono::Duration::seconds(self.config.cluster_window_secs as i64);
 
         // Filter to recent buys only
         let recent_buys: Vec<_> = trades

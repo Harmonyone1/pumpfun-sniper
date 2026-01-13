@@ -4,8 +4,8 @@
 //! This is important because while pump.fun typically uses 6 decimals,
 //! we should not assume this for all tokens.
 
-use solana_sdk::pubkey::Pubkey;
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -26,9 +26,9 @@ pub fn get_decimals(rpc_client: &RpcClient, mint: &Pubkey) -> Result<u8> {
 
     // Check cache first
     {
-        let cache = DECIMALS_CACHE.read().map_err(|e| {
-            Error::Internal(format!("Failed to acquire cache read lock: {}", e))
-        })?;
+        let cache = DECIMALS_CACHE
+            .read()
+            .map_err(|e| Error::Internal(format!("Failed to acquire cache read lock: {}", e)))?;
 
         if let Some(&decimals) = cache.get(&mint_str) {
             return Ok(decimals);
@@ -40,9 +40,9 @@ pub fn get_decimals(rpc_client: &RpcClient, mint: &Pubkey) -> Result<u8> {
 
     // Update cache
     {
-        let mut cache = DECIMALS_CACHE.write().map_err(|e| {
-            Error::Internal(format!("Failed to acquire cache write lock: {}", e))
-        })?;
+        let mut cache = DECIMALS_CACHE
+            .write()
+            .map_err(|e| Error::Internal(format!("Failed to acquire cache write lock: {}", e)))?;
 
         cache.insert(mint_str, decimals);
     }
@@ -91,9 +91,9 @@ pub fn get_decimals_or_default(rpc_client: &RpcClient, mint: &Pubkey) -> u8 {
 
 /// Pre-populate cache with known decimals (for testing or known tokens)
 pub fn set_cached_decimals(mint: &Pubkey, decimals: u8) -> Result<()> {
-    let mut cache = DECIMALS_CACHE.write().map_err(|e| {
-        Error::Internal(format!("Failed to acquire cache write lock: {}", e))
-    })?;
+    let mut cache = DECIMALS_CACHE
+        .write()
+        .map_err(|e| Error::Internal(format!("Failed to acquire cache write lock: {}", e)))?;
 
     cache.insert(mint.to_string(), decimals);
     Ok(())
@@ -101,9 +101,9 @@ pub fn set_cached_decimals(mint: &Pubkey, decimals: u8) -> Result<()> {
 
 /// Clear the decimals cache
 pub fn clear_cache() -> Result<()> {
-    let mut cache = DECIMALS_CACHE.write().map_err(|e| {
-        Error::Internal(format!("Failed to acquire cache write lock: {}", e))
-    })?;
+    let mut cache = DECIMALS_CACHE
+        .write()
+        .map_err(|e| Error::Internal(format!("Failed to acquire cache write lock: {}", e)))?;
 
     cache.clear();
     Ok(())
@@ -111,9 +111,9 @@ pub fn clear_cache() -> Result<()> {
 
 /// Get cache size (for monitoring)
 pub fn cache_size() -> Result<usize> {
-    let cache = DECIMALS_CACHE.read().map_err(|e| {
-        Error::Internal(format!("Failed to acquire cache read lock: {}", e))
-    })?;
+    let cache = DECIMALS_CACHE
+        .read()
+        .map_err(|e| Error::Internal(format!("Failed to acquire cache read lock: {}", e)))?;
 
     Ok(cache.len())
 }

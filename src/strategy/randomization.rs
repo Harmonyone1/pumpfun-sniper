@@ -84,9 +84,9 @@ impl Randomizer {
             return Duration::ZERO;
         }
 
-        let delay_ms = self.rng.gen_range(
-            self.config.entry_delay_min_ms..=self.config.entry_delay_max_ms,
-        );
+        let delay_ms = self
+            .rng
+            .gen_range(self.config.entry_delay_min_ms..=self.config.entry_delay_max_ms);
         Duration::from_millis(delay_ms)
     }
 
@@ -96,9 +96,9 @@ impl Randomizer {
             return Duration::ZERO;
         }
 
-        let delay_ms = self.rng.gen_range(
-            self.config.exit_delay_min_ms..=self.config.exit_delay_max_ms,
-        );
+        let delay_ms = self
+            .rng
+            .gen_range(self.config.exit_delay_min_ms..=self.config.exit_delay_max_ms);
         Duration::from_millis(delay_ms)
     }
 
@@ -359,14 +359,15 @@ mod tests {
         let mut randomizer = Randomizer::new(config, Some(42));
 
         let recommended = TradingStrategy::MomentumSurfing;
-        let alternatives = vec![TradingStrategy::SnipeAndScalp, TradingStrategy::WhaleFollowing];
+        let alternatives = vec![
+            TradingStrategy::SnipeAndScalp,
+            TradingStrategy::WhaleFollowing,
+        ];
 
         let mut selected_alternatives = 0;
         for _ in 0..100 {
-            let selected = randomizer.select_strategy_with_entropy(
-                recommended.clone(),
-                &alternatives,
-            );
+            let selected =
+                randomizer.select_strategy_with_entropy(recommended.clone(), &alternatives);
             if !matches!(selected, TradingStrategy::MomentumSurfing) {
                 selected_alternatives += 1;
             }

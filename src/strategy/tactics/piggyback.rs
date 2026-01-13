@@ -104,8 +104,9 @@ impl SniperStat {
             // Update average loss
             let prev_losses = self.total_trades - self.winning_trades - 1;
             if prev_losses > 0 {
-                self.avg_loss_pct =
-                    (self.avg_loss_pct * prev_losses as f64 + profit_pct.abs()) / prev_losses as f64 + 1.0;
+                self.avg_loss_pct = (self.avg_loss_pct * prev_losses as f64 + profit_pct.abs())
+                    / prev_losses as f64
+                    + 1.0;
             } else {
                 self.avg_loss_pct = profit_pct.abs();
             }
@@ -116,9 +117,9 @@ impl SniperStat {
 
         // Update average hold time
         let prev_total = self.total_trades - 1;
-        self.avg_hold_time_secs =
-            ((self.avg_hold_time_secs as f64 * prev_total as f64 + hold_time_secs as f64)
-                / self.total_trades as f64) as u64;
+        self.avg_hold_time_secs = ((self.avg_hold_time_secs as f64 * prev_total as f64
+            + hold_time_secs as f64)
+            / self.total_trades as f64) as u64;
 
         // Recalculate quality score
         self.update_quality_score();
@@ -240,7 +241,11 @@ impl SniperPiggyback {
     ) {
         // Find the matching buy trade
         if let Some(trades) = self.sniper_trades.get_mut(sniper) {
-            if let Some(buy_trade) = trades.iter_mut().rev().find(|t| t.mint == mint && t.is_buy && t.exit_price.is_none()) {
+            if let Some(buy_trade) = trades
+                .iter_mut()
+                .rev()
+                .find(|t| t.mint == mint && t.is_buy && t.exit_price.is_none())
+            {
                 let entry_price = buy_trade.entry_price;
                 let hold_time = chrono::Utc::now()
                     .signed_duration_since(buy_trade.timestamp)
@@ -365,7 +370,8 @@ impl SniperPiggyback {
         self.sniper_stats
             .retain(|_, s| s.last_trade_time > cutoff || s.total_trades >= 10);
 
-        self.sniper_trades.retain(|addr, _| self.sniper_stats.contains_key(addr));
+        self.sniper_trades
+            .retain(|addr, _| self.sniper_stats.contains_key(addr));
 
         self.refresh_quality_snipers();
     }
@@ -453,7 +459,13 @@ mod tests {
             for j in 0..10 {
                 piggyback.record_sniper_buy(&sniper, &format!("mint{}{}", i, j), 0.1, 0.001);
                 // Different exit prices: 0.003 (200%), 0.002 (100%), 0.0015 (50%)
-                let exit_price = if i == 0 { 0.003 } else if i == 1 { 0.002 } else { 0.0015 };
+                let exit_price = if i == 0 {
+                    0.003
+                } else if i == 1 {
+                    0.002
+                } else {
+                    0.0015
+                };
                 piggyback.record_sniper_sell(&sniper, &format!("mint{}{}", i, j), 0.1, exit_price);
             }
         }

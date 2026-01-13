@@ -201,11 +201,7 @@ impl KnownActors {
 
     /// Get statistics
     pub fn stats(&self) -> (usize, usize, usize) {
-        (
-            self.deployers.len(),
-            self.snipers.len(),
-            self.trusted.len(),
-        )
+        (self.deployers.len(), self.snipers.len(), self.trusted.len())
     }
 }
 
@@ -256,7 +252,9 @@ impl CacheStats {
 
     pub fn hit_rate(&self) -> f64 {
         let hits = self.wallet_hits.load(std::sync::atomic::Ordering::Relaxed);
-        let misses = self.wallet_misses.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = self
+            .wallet_misses
+            .load(std::sync::atomic::Ordering::Relaxed);
         let total = hits + misses;
         if total == 0 {
             0.0

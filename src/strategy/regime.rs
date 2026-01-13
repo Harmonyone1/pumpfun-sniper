@@ -145,12 +145,14 @@ impl RegimeClassifier {
 
             return RegimeClassification {
                 regime: TokenRegime::SniperFlip {
-                    sniper_count: (distribution.sniper_holdings_pct * distribution.holder_count as f64) as u32,
+                    sniper_count: (distribution.sniper_holdings_pct
+                        * distribution.holder_count as f64)
+                        as u32,
                     expected_dump_in_secs: expected_dump_secs,
                 },
                 confidence: 0.7,
                 reasons,
-                should_enter: true, // Can still scalp
+                should_enter: true,   // Can still scalp
                 size_multiplier: 0.3, // Small size
             };
         }
@@ -174,7 +176,10 @@ impl RegimeClassifier {
             // Boost if buy ratio is good
             if order_flow.buy_sell_ratio > 0.6 {
                 confidence += 0.1;
-                reasons.push(format!("Buy ratio {:.0}%", order_flow.buy_sell_ratio * 100.0));
+                reasons.push(format!(
+                    "Buy ratio {:.0}%",
+                    order_flow.buy_sell_ratio * 100.0
+                ));
             }
 
             // Check momentum
@@ -248,8 +253,8 @@ impl Default for RegimeClassifier {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::Trend;
+    use super::*;
 
     #[test]
     fn test_wash_trade_detection() {

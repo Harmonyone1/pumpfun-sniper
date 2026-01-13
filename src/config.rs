@@ -6,6 +6,9 @@ use std::path::Path;
 
 // Re-export adaptive filter config
 pub use crate::filter::adaptive::config::AdaptiveFilterConfig;
+// Re-export holder watcher and kill switch configs
+pub use crate::filter::holder_watcher::HolderWatcherConfig;
+pub use crate::filter::kill_switch::KillSwitchConfig;
 // Re-export strategy config
 pub use crate::strategy::engine::StrategyEngineConfig;
 
@@ -28,6 +31,34 @@ pub struct Config {
     pub adaptive_filter: AdaptiveFilterConfig,
     #[serde(default)]
     pub strategy: StrategyEngineConfig,
+    #[serde(default)]
+    pub smart_money: SmartMoneyConfig,
+}
+
+/// Smart money detection and kill-switch configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct SmartMoneyConfig {
+    /// Enable smart money features
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Kill-switch configuration
+    #[serde(default)]
+    pub kill_switches: KillSwitchConfig,
+
+    /// Holder watcher configuration
+    #[serde(default)]
+    pub holder_watcher: HolderWatcherConfig,
+}
+
+impl Default for SmartMoneyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            kill_switches: KillSwitchConfig::default(),
+            holder_watcher: HolderWatcherConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +117,9 @@ pub struct PumpPortalConfig {
     pub api_key: String,
     #[serde(default = "default_true")]
     pub use_for_trading: bool,
+    /// Lightning wallet address (the wallet tied to the API key)
+    #[serde(default)]
+    pub lightning_wallet: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,8 +197,12 @@ pub struct AutoSellConfig {
     pub trailing_stop_distance_pct: f64,
 }
 
-fn default_trailing_activation() -> f64 { 10.0 }
-fn default_trailing_distance() -> f64 { 15.0 }
+fn default_trailing_activation() -> f64 {
+    10.0
+}
+fn default_trailing_distance() -> f64 {
+    15.0
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SafetyConfig {
@@ -500,7 +538,10 @@ impl Config {
     fn validate(&self) -> Result<()> {
         // Validate Jito regions (max 2)
         if self.jito.regions.len() > 2 {
-            anyhow::bail!("Maximum 2 Jito regions allowed, got {}", self.jito.regions.len());
+            anyhow::bail!(
+                "Maximum 2 Jito regions allowed, got {}",
+                self.jito.regions.len()
+            );
         }
 
         // Validate trading amounts
@@ -598,7 +639,11 @@ impl Config {
             self.pumpportal.enabled,
             self.pumpportal.ws_url,
             self.pumpportal.use_for_trading,
-            if self.pumpportal.api_key.is_empty() { "(not set)" } else { "***" },
+            if self.pumpportal.api_key.is_empty() {
+                "(not set)"
+            } else {
+                "***"
+            },
             self.trading.buy_amount_sol,
             self.trading.slippage_bps,
             self.filters.enabled,
@@ -653,6 +698,7 @@ impl Default for Config {
                 ping_interval_secs: default_ping_interval_secs(),
                 api_key: String::new(),
                 use_for_trading: true,
+                lightning_wallet: String::new(),
             },
             backpressure: BackpressureConfig {
                 channel_capacity: default_channel_capacity(),
@@ -695,6 +741,7 @@ impl Default for Config {
             wallet: WalletConfig::default(),
             adaptive_filter: AdaptiveFilterConfig::default(),
             strategy: StrategyEngineConfig::default(),
+            smart_money: SmartMoneyConfig::default(),
         }
     }
 }
@@ -724,6 +771,9 @@ mod tests {
             mask_url("https://api.example.com?key=secret"),
             "https://api.example.com?***"
         );
-        assert_eq!(mask_url("https://api.example.com"), "https://api.example.com");
+        assert_eq!(
+            mask_url("https://api.example.com"),
+            "https://api.example.com"
+        );
     }
 }

@@ -161,7 +161,8 @@ impl PumpPortalTrader {
         slippage_pct: u32,
         priority_fee: f64,
     ) -> Result<String> {
-        self.buy_with_pool(mint, sol_amount, slippage_pct, priority_fee, PoolType::Auto).await
+        self.buy_with_pool(mint, sol_amount, slippage_pct, priority_fee, PoolType::Auto)
+            .await
     }
 
     /// Buy tokens using Lightning API with specific pool
@@ -195,10 +196,7 @@ impl PumpPortalTrader {
             pool: Some(pool),
         };
 
-        info!(
-            "Executing buy: {} SOL for token {}",
-            sol_amount, mint
-        );
+        info!("Executing buy: {} SOL for token {}", sol_amount, mint);
 
         let response = self
             .client
@@ -223,9 +221,11 @@ impl PumpPortalTrader {
             }
         }
 
-        trade_response
-            .signature
-            .ok_or_else(|| Error::TransactionSend("No signature in response - API returned empty result".to_string()))
+        trade_response.signature.ok_or_else(|| {
+            Error::TransactionSend(
+                "No signature in response - API returned empty result".to_string(),
+            )
+        })
     }
 
     /// Execute a sell using Lightning API
@@ -291,9 +291,11 @@ impl PumpPortalTrader {
             }
         }
 
-        trade_response
-            .signature
-            .ok_or_else(|| Error::TransactionSend("No signature in response - API returned empty result".to_string()))
+        trade_response.signature.ok_or_else(|| {
+            Error::TransactionSend(
+                "No signature in response - API returned empty result".to_string(),
+            )
+        })
     }
 
     /// Get unsigned transaction for buy (Local API)
@@ -333,7 +335,10 @@ impl PumpPortalTrader {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(Error::TransactionBuild(format!("API error ({}): {}", status, text)));
+            return Err(Error::TransactionBuild(format!(
+                "API error ({}): {}",
+                status, text
+            )));
         }
 
         // The API returns raw transaction bytes directly
@@ -343,7 +348,9 @@ impl PumpPortalTrader {
             .map_err(|e| Error::TransactionBuild(format!("Failed to read response body: {}", e)))?;
 
         if tx_bytes.is_empty() {
-            return Err(Error::TransactionBuild("Empty response from API".to_string()));
+            return Err(Error::TransactionBuild(
+                "Empty response from API".to_string(),
+            ));
         }
 
         Ok(tx_bytes.to_vec())
@@ -359,7 +366,11 @@ impl PumpPortalTrader {
         priority_fee: f64,
         public_key: &str,
     ) -> Result<Vec<u8>> {
-        let denominated_in_sol = if amount.ends_with('%') { "false" } else { "false" };
+        let denominated_in_sol = if amount.ends_with('%') {
+            "false"
+        } else {
+            "false"
+        };
 
         let request = LocalTradeRequest {
             action: TradeAction::Sell,
@@ -386,7 +397,10 @@ impl PumpPortalTrader {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(Error::TransactionBuild(format!("API error ({}): {}", status, text)));
+            return Err(Error::TransactionBuild(format!(
+                "API error ({}): {}",
+                status, text
+            )));
         }
 
         // The API returns raw transaction bytes directly
@@ -396,7 +410,9 @@ impl PumpPortalTrader {
             .map_err(|e| Error::TransactionBuild(format!("Failed to read response body: {}", e)))?;
 
         if tx_bytes.is_empty() {
-            return Err(Error::TransactionBuild("Empty response from API".to_string()));
+            return Err(Error::TransactionBuild(
+                "Empty response from API".to_string(),
+            ));
         }
 
         Ok(tx_bytes.to_vec())
@@ -435,11 +451,15 @@ impl PumpPortalTrader {
             .get_buy_transaction(mint, sol_amount, slippage_pct, priority_fee, &public_key)
             .await?;
 
-        debug!("Got unsigned transaction from PumpPortal ({} bytes)", tx_bytes.len());
+        debug!(
+            "Got unsigned transaction from PumpPortal ({} bytes)",
+            tx_bytes.len()
+        );
 
         // Deserialize as VersionedTransaction
-        let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
-            .map_err(|e| Error::Deserialization(format!("Failed to deserialize transaction: {}", e)))?;
+        let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes).map_err(|e| {
+            Error::Deserialization(format!("Failed to deserialize transaction: {}", e))
+        })?;
 
         debug!("Deserialized transaction, signing...");
 
@@ -638,11 +658,15 @@ impl PumpPortalTrader {
             .get_sell_transaction(mint, amount, slippage_pct, priority_fee, &public_key)
             .await?;
 
-        debug!("Got unsigned transaction from PumpPortal ({} bytes)", tx_bytes.len());
+        debug!(
+            "Got unsigned transaction from PumpPortal ({} bytes)",
+            tx_bytes.len()
+        );
 
         // Deserialize as VersionedTransaction
-        let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
-            .map_err(|e| Error::Deserialization(format!("Failed to deserialize transaction: {}", e)))?;
+        let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes).map_err(|e| {
+            Error::Deserialization(format!("Failed to deserialize transaction: {}", e))
+        })?;
 
         debug!("Deserialized transaction, signing...");
 
@@ -685,11 +709,7 @@ impl PumpPortalTrader {
         rpc_client: &RpcClient,
     ) -> Result<String> {
         use crate::trading::jito::BundleStatus;
-        use solana_sdk::{
-            message::Message,
-            system_instruction,
-            transaction::Transaction,
-        };
+        use solana_sdk::{message::Message, system_instruction, transaction::Transaction};
 
         let public_key = keypair.pubkey().to_string();
 
@@ -700,7 +720,11 @@ impl PumpPortalTrader {
 
         // Get recommended tip from Jito
         let tip_lamports = jito_client.get_recommended_tip().await.unwrap_or(100000);
-        info!("Using Jito tip: {} lamports ({:.6} SOL)", tip_lamports, tip_lamports as f64 / 1e9);
+        info!(
+            "Using Jito tip: {} lamports ({:.6} SOL)",
+            tip_lamports,
+            tip_lamports as f64 / 1e9
+        );
 
         // Get unsigned transaction from PumpPortal
         let tx_bytes = match self
@@ -714,11 +738,15 @@ impl PumpPortalTrader {
             }
         };
 
-        debug!("Got unsigned transaction from PumpPortal ({} bytes)", tx_bytes.len());
+        debug!(
+            "Got unsigned transaction from PumpPortal ({} bytes)",
+            tx_bytes.len()
+        );
 
         // Deserialize as VersionedTransaction
-        let mut buy_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
-            .map_err(|e| Error::Deserialization(format!("Failed to deserialize transaction: {}", e)))?;
+        let mut buy_tx: VersionedTransaction = bincode::deserialize(&tx_bytes).map_err(|e| {
+            Error::Deserialization(format!("Failed to deserialize transaction: {}", e))
+        })?;
 
         // Sign the buy transaction
         let message_bytes = buy_tx.message.serialize();
@@ -731,15 +759,13 @@ impl PumpPortalTrader {
             let tip_account = jito_client.get_tip_account();
 
             // Get recent blockhash for tip transaction
-            let blockhash = rpc_client.get_latest_blockhash()
+            let blockhash = rpc_client
+                .get_latest_blockhash()
                 .map_err(|e| Error::TransactionBuild(format!("Failed to get blockhash: {}", e)))?;
 
             // Create tip transaction
-            let tip_ix = system_instruction::transfer(
-                &keypair.pubkey(),
-                &tip_account,
-                tip_lamports,
-            );
+            let tip_ix =
+                system_instruction::transfer(&keypair.pubkey(), &tip_account, tip_lamports);
 
             let tip_message = Message::new(&[tip_ix], Some(&keypair.pubkey()));
             let mut tip_tx = Transaction::new_unsigned(tip_message);
@@ -748,28 +774,34 @@ impl PumpPortalTrader {
             debug!("Created tip transaction to {}", tip_account);
 
             // Clone buy_tx for Jito (we need original for fallback)
-            let buy_tx_clone: VersionedTransaction = bincode::deserialize(
-                &bincode::serialize(&buy_tx).unwrap()
-            ).unwrap();
+            let buy_tx_clone: VersionedTransaction =
+                bincode::deserialize(&bincode::serialize(&buy_tx).unwrap()).unwrap();
 
             // Submit bundle
-            let bundle_result = jito_client.submit_bundle_mixed(buy_tx_clone, tip_tx).await?;
+            let bundle_result = jito_client
+                .submit_bundle_mixed(buy_tx_clone, tip_tx)
+                .await?;
             info!("Bundle submitted: {}", bundle_result.bundle_id);
 
             // Wait for confirmation (reduced to 15 seconds for faster fallback)
-            let status = jito_client.wait_for_confirmation(&bundle_result.bundle_id, 15).await?;
+            let status = jito_client
+                .wait_for_confirmation(&bundle_result.bundle_id, 15)
+                .await?;
 
             match status {
                 BundleStatus::Landed => {
-                    let sig = bundle_result.signatures.first()
+                    let sig = bundle_result
+                        .signatures
+                        .first()
                         .cloned()
                         .unwrap_or_else(|| bundle_result.bundle_id.clone());
                     info!("Jito BUY CONFIRMED: {}", sig);
                     Ok(sig)
                 }
-                BundleStatus::Failed(reason) => {
-                    Err(Error::JitoBundleSubmission(format!("Bundle failed: {}", reason)))
-                }
+                BundleStatus::Failed(reason) => Err(Error::JitoBundleSubmission(format!(
+                    "Bundle failed: {}",
+                    reason
+                ))),
                 _ => {
                     // Check if first signature landed on-chain
                     if let Some(sig) = bundle_result.signatures.first() {
@@ -784,10 +816,13 @@ impl PumpPortalTrader {
                             }
                         }
                     }
-                    Err(Error::JitoBundleSubmission("Bundle didn't land".to_string()))
+                    Err(Error::JitoBundleSubmission(
+                        "Bundle didn't land".to_string(),
+                    ))
                 }
             }
-        }.await;
+        }
+        .await;
 
         // If Jito succeeded, return
         if let Ok(sig) = jito_result {
@@ -800,7 +835,18 @@ impl PumpPortalTrader {
         // Get fresh transaction for RPC (new blockhash)
         let priority_fee = jito_client.config().min_tip_lamports as f64 / 1e9;
 
-        match self.buy_local_with_retry(mint, sol_amount, slippage_pct, priority_fee, keypair, rpc_client, 3).await {
+        match self
+            .buy_local_with_retry(
+                mint,
+                sol_amount,
+                slippage_pct,
+                priority_fee,
+                keypair,
+                rpc_client,
+                3,
+            )
+            .await
+        {
             Ok(sig) => {
                 info!("RPC FALLBACK BUY CONFIRMED: {}", sig);
                 Ok(sig)
@@ -825,11 +871,7 @@ impl PumpPortalTrader {
         rpc_client: &RpcClient,
     ) -> Result<String> {
         use crate::trading::jito::BundleStatus;
-        use solana_sdk::{
-            message::Message,
-            system_instruction,
-            transaction::Transaction,
-        };
+        use solana_sdk::{message::Message, system_instruction, transaction::Transaction};
 
         let public_key = keypair.pubkey().to_string();
 
@@ -840,7 +882,11 @@ impl PumpPortalTrader {
 
         // Get recommended tip from Jito
         let tip_lamports = jito_client.get_recommended_tip().await.unwrap_or(100000);
-        info!("Using Jito tip: {} lamports ({:.6} SOL)", tip_lamports, tip_lamports as f64 / 1e9);
+        info!(
+            "Using Jito tip: {} lamports ({:.6} SOL)",
+            tip_lamports,
+            tip_lamports as f64 / 1e9
+        );
 
         // Get unsigned transaction from PumpPortal (use minimal priority fee since we're using Jito)
         let tx_bytes = match self
@@ -854,11 +900,15 @@ impl PumpPortalTrader {
             }
         };
 
-        debug!("Got unsigned transaction from PumpPortal ({} bytes)", tx_bytes.len());
+        debug!(
+            "Got unsigned transaction from PumpPortal ({} bytes)",
+            tx_bytes.len()
+        );
 
         // Deserialize as VersionedTransaction
-        let mut sell_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
-            .map_err(|e| Error::Deserialization(format!("Failed to deserialize transaction: {}", e)))?;
+        let mut sell_tx: VersionedTransaction = bincode::deserialize(&tx_bytes).map_err(|e| {
+            Error::Deserialization(format!("Failed to deserialize transaction: {}", e))
+        })?;
 
         // Sign the sell transaction
         let message_bytes = sell_tx.message.serialize();
@@ -871,15 +921,13 @@ impl PumpPortalTrader {
             let tip_account = jito_client.get_tip_account();
 
             // Get recent blockhash for tip transaction
-            let blockhash = rpc_client.get_latest_blockhash()
+            let blockhash = rpc_client
+                .get_latest_blockhash()
                 .map_err(|e| Error::TransactionBuild(format!("Failed to get blockhash: {}", e)))?;
 
             // Create tip transaction
-            let tip_ix = system_instruction::transfer(
-                &keypair.pubkey(),
-                &tip_account,
-                tip_lamports,
-            );
+            let tip_ix =
+                system_instruction::transfer(&keypair.pubkey(), &tip_account, tip_lamports);
 
             let tip_message = Message::new(&[tip_ix], Some(&keypair.pubkey()));
             let mut tip_tx = Transaction::new_unsigned(tip_message);
@@ -888,28 +936,34 @@ impl PumpPortalTrader {
             debug!("Created tip transaction to {}", tip_account);
 
             // Clone sell_tx for Jito (we need original for fallback)
-            let sell_tx_clone: VersionedTransaction = bincode::deserialize(
-                &bincode::serialize(&sell_tx).unwrap()
-            ).unwrap();
+            let sell_tx_clone: VersionedTransaction =
+                bincode::deserialize(&bincode::serialize(&sell_tx).unwrap()).unwrap();
 
             // Submit bundle
-            let bundle_result = jito_client.submit_bundle_mixed(sell_tx_clone, tip_tx).await?;
+            let bundle_result = jito_client
+                .submit_bundle_mixed(sell_tx_clone, tip_tx)
+                .await?;
             info!("Bundle submitted: {}", bundle_result.bundle_id);
 
             // Wait for confirmation (reduced to 15 seconds for faster fallback)
-            let status = jito_client.wait_for_confirmation(&bundle_result.bundle_id, 15).await?;
+            let status = jito_client
+                .wait_for_confirmation(&bundle_result.bundle_id, 15)
+                .await?;
 
             match status {
                 BundleStatus::Landed => {
-                    let sig = bundle_result.signatures.first()
+                    let sig = bundle_result
+                        .signatures
+                        .first()
                         .cloned()
                         .unwrap_or_else(|| bundle_result.bundle_id.clone());
                     info!("Jito SELL CONFIRMED: {}", sig);
                     Ok(sig)
                 }
-                BundleStatus::Failed(reason) => {
-                    Err(Error::JitoBundleSubmission(format!("Bundle failed: {}", reason)))
-                }
+                BundleStatus::Failed(reason) => Err(Error::JitoBundleSubmission(format!(
+                    "Bundle failed: {}",
+                    reason
+                ))),
                 _ => {
                     // Check if first signature landed on-chain
                     if let Some(sig) = bundle_result.signatures.first() {
@@ -924,10 +978,13 @@ impl PumpPortalTrader {
                             }
                         }
                     }
-                    Err(Error::JitoBundleSubmission("Bundle didn't land".to_string()))
+                    Err(Error::JitoBundleSubmission(
+                        "Bundle didn't land".to_string(),
+                    ))
                 }
             }
-        }.await;
+        }
+        .await;
 
         // If Jito succeeded, return
         if let Ok(sig) = jito_result {
@@ -940,7 +997,17 @@ impl PumpPortalTrader {
         // Get fresh transaction for RPC (new blockhash) with higher priority fee
         let priority_fee = jito_client.config().min_tip_lamports as f64 / 1e9;
 
-        match self.sell_local(mint, amount, slippage_pct, priority_fee, keypair, rpc_client).await {
+        match self
+            .sell_local(
+                mint,
+                amount,
+                slippage_pct,
+                priority_fee,
+                keypair,
+                rpc_client,
+            )
+            .await
+        {
             Ok(sig) => {
                 info!("RPC FALLBACK SELL CONFIRMED: {}", sig);
                 Ok(sig)
@@ -957,7 +1024,10 @@ impl PumpPortalTrader {
     pub async fn check_pool_ready(&self, mint: &str) -> bool {
         // Verify token ends with "pump" (pump.fun convention)
         if !mint.ends_with("pump") {
-            debug!("Token {} does not end with 'pump' - not a pump.fun token", mint);
+            debug!(
+                "Token {} does not end with 'pump' - not a pump.fun token",
+                mint
+            );
             return false;
         }
 
@@ -974,7 +1044,8 @@ impl PumpPortalTrader {
             pool: Some(PoolType::Pump),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(PUMPPORTAL_LOCAL_API_URL)
             .json(&request)
             .send()
@@ -1007,20 +1078,13 @@ impl PumpPortalTrader {
 }
 
 /// Quick buy helper - simplest way to buy
-pub async fn quick_buy(
-    api_key: &str,
-    mint: &str,
-    sol_amount: f64,
-) -> Result<String> {
+pub async fn quick_buy(api_key: &str, mint: &str, sol_amount: f64) -> Result<String> {
     let trader = PumpPortalTrader::lightning(api_key.to_string());
     trader.buy(mint, sol_amount, 25, 0.0005).await
 }
 
 /// Quick sell helper - simplest way to sell all
-pub async fn quick_sell_all(
-    api_key: &str,
-    mint: &str,
-) -> Result<String> {
+pub async fn quick_sell_all(api_key: &str, mint: &str) -> Result<String> {
     let trader = PumpPortalTrader::lightning(api_key.to_string());
     trader.sell(mint, "100%", 25, 0.0005).await
 }

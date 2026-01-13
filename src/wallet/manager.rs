@@ -79,10 +79,7 @@ pub struct WalletManager {
 
 impl WalletManager {
     /// Create a new wallet manager
-    pub async fn new(
-        config: WalletManagerConfig,
-        rpc_client: RpcClient,
-    ) -> Result<Self> {
+    pub async fn new(config: WalletManagerConfig, rpc_client: RpcClient) -> Result<Self> {
         let credentials_path = Path::new(&config.credentials_dir);
         let credentials = CredentialManager::load(credentials_path)?;
 
@@ -187,9 +184,10 @@ impl WalletManager {
         };
 
         // Validate with safety enforcer
-        self.safety.validate_transfer(&pending).await.map_err(|e| {
-            Error::SafetyLimitExceeded(e.to_string())
-        })?;
+        self.safety
+            .validate_transfer(&pending)
+            .await
+            .map_err(|e| Error::SafetyLimitExceeded(e.to_string()))?;
 
         // Check confirmation requirement
         if !force && self.safety.requires_confirmation(amount_sol) {
@@ -201,9 +199,9 @@ impl WalletManager {
 
         // Execute transfer
         let hot_keypair = creds.get_keypair(&self.config.hot_wallet_name)?;
-        let signature = self
-            .transfer_executor
-            .transfer_sol(hot_keypair, &vault_address, amount_sol)?;
+        let signature =
+            self.transfer_executor
+                .transfer_sol(hot_keypair, &vault_address, amount_sol)?;
 
         // Record extraction
         self.safety.record_extraction(amount_sol).await;

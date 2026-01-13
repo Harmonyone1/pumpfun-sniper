@@ -216,7 +216,9 @@ impl<T> PriorityQueue<T> {
 
     pub fn pop(&mut self) -> Option<T> {
         // Always process priority items first
-        self.priority.pop_front().or_else(|| self.normal.pop_front())
+        self.priority
+            .pop_front()
+            .or_else(|| self.normal.pop_front())
     }
 
     pub fn len(&self) -> usize {
@@ -261,8 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backpressure_newest() {
-        let channel: BackpressureChannel<i32> =
-            BackpressureChannel::new(2, DropPolicy::Newest);
+        let channel: BackpressureChannel<i32> = BackpressureChannel::new(2, DropPolicy::Newest);
 
         channel.send(1, false).await.unwrap();
         channel.send(2, false).await.unwrap();

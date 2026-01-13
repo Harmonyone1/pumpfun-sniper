@@ -6,4 +6,4 @@ pub mod price_feed;
 
 pub use auto_sell::AutoSeller;
 pub use manager::PositionManager;
-pub use price_feed::{PriceFeed, PriceSource, MonitoredToken};
+pub use price_feed::{MonitoredToken, PriceFeed, PriceSource};

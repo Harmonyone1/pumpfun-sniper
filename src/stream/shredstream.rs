@@ -53,10 +53,7 @@ pub struct ShredStreamClient {
 
 impl ShredStreamClient {
     /// Create a new ShredStream client
-    pub fn new(
-        config: ShredStreamConfig,
-        event_tx: mpsc::Sender<StreamEvent>,
-    ) -> Self {
+    pub fn new(config: ShredStreamConfig, event_tx: mpsc::Sender<StreamEvent>) -> Self {
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
 
         Self {
@@ -114,9 +111,8 @@ impl ShredStreamClient {
                 let _ = event_tx.send(StreamEvent::Disconnected).await;
 
                 // Wait before reconnecting
-                let delay = Duration::from_millis(
-                    config.reconnect_delay_ms * reconnect_attempts as u64,
-                );
+                let delay =
+                    Duration::from_millis(config.reconnect_delay_ms * reconnect_attempts as u64);
                 warn!(
                     "Reconnecting in {:?} (attempt {}/{})",
                     delay, reconnect_attempts, config.max_reconnect_attempts
@@ -248,9 +244,9 @@ mod tests {
         ];
         assert!(ShredStreamClient::is_pump_fun_transaction(&accounts));
 
-        let accounts_no_pump = vec![
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
-        ];
-        assert!(!ShredStreamClient::is_pump_fun_transaction(&accounts_no_pump));
+        let accounts_no_pump = vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string()];
+        assert!(!ShredStreamClient::is_pump_fun_transaction(
+            &accounts_no_pump
+        ));
     }
 }

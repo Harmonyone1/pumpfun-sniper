@@ -33,13 +33,11 @@ impl CredentialManager {
         let wallets_path = credentials_dir.join("wallets.json");
 
         let registry = if wallets_path.exists() {
-            let content = std::fs::read_to_string(&wallets_path).map_err(|e| {
-                Error::Config(format!("Failed to read wallets.json: {}", e))
-            })?;
+            let content = std::fs::read_to_string(&wallets_path)
+                .map_err(|e| Error::Config(format!("Failed to read wallets.json: {}", e)))?;
 
-            serde_json::from_str::<WalletRegistry>(&content).map_err(|e| {
-                Error::Config(format!("Failed to parse wallets.json: {}", e))
-            })?
+            serde_json::from_str::<WalletRegistry>(&content)
+                .map_err(|e| Error::Config(format!("Failed to parse wallets.json: {}", e)))?
         } else {
             warn!("wallets.json not found, creating empty registry");
             WalletRegistry::default()
@@ -69,9 +67,10 @@ impl CredentialManager {
     ///
     /// For keypair-based wallets with AUTO_DERIVED, derives from keypair.
     pub fn get_address(&mut self, name: &str) -> Result<solana_sdk::pubkey::Pubkey> {
-        let wallet = self.wallets.get(name).ok_or_else(|| {
-            Error::Config(format!("Wallet not found: {}", name))
-        })?;
+        let wallet = self
+            .wallets
+            .get(name)
+            .ok_or_else(|| Error::Config(format!("Wallet not found: {}", name)))?;
 
         if wallet.address == "AUTO_DERIVED" {
             // Need to load keypair to derive address
@@ -79,9 +78,10 @@ impl CredentialManager {
             Ok(keypair.pubkey())
         } else {
             // Parse stored address
-            wallet.address.parse().map_err(|e| {
-                Error::Config(format!("Invalid address for {}: {}", name, e))
-            })
+            wallet
+                .address
+                .parse()
+                .map_err(|e| Error::Config(format!("Invalid address for {}: {}", name, e)))
         }
     }
 
@@ -94,22 +94,23 @@ impl CredentialManager {
             return Ok(self.loaded_keypairs.get(name).unwrap());
         }
 
-        let wallet = self.wallets.get(name).ok_or_else(|| {
-            Error::Config(format!("Wallet not found: {}", name))
-        })?;
+        let wallet = self
+            .wallets
+            .get(name)
+            .ok_or_else(|| Error::Config(format!("Wallet not found: {}", name)))?;
 
         let keypair_path = wallet.keypair_path.as_ref().ok_or_else(|| {
-            Error::Config(format!(
-                "Wallet {} is external, no keypair available",
-                name
-            ))
+            Error::Config(format!("Wallet {} is external, no keypair available", name))
         })?;
 
         // Resolve relative path
         let full_path = if keypair_path.is_absolute() {
             keypair_path.clone()
         } else {
-            self.credentials_dir.parent().unwrap_or(Path::new(".")).join(keypair_path)
+            self.credentials_dir
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(keypair_path)
         };
 
         debug!("Loading keypair from: {:?}", full_path);
@@ -133,24 +134,15 @@ impl CredentialManager {
 
         // Load keypair
         let keypair_bytes = std::fs::read(&full_path).map_err(|e| {
-            Error::InvalidKeypair(format!(
-                "Failed to read keypair for {}: {}",
-                name, e
-            ))
+            Error::InvalidKeypair(format!("Failed to read keypair for {}: {}", name, e))
         })?;
 
         let keypair_json: Vec<u8> = serde_json::from_slice(&keypair_bytes).map_err(|e| {
-            Error::InvalidKeypair(format!(
-                "Failed to parse keypair JSON for {}: {}",
-                name, e
-            ))
+            Error::InvalidKeypair(format!("Failed to parse keypair JSON for {}: {}", name, e))
         })?;
 
         let keypair = Keypair::from_bytes(&keypair_json).map_err(|e| {
-            Error::InvalidKeypair(format!(
-                "Invalid keypair bytes for {}: {}",
-                name, e
-            ))
+            Error::InvalidKeypair(format!("Invalid keypair bytes for {}: {}", name, e))
         })?;
 
         self.loaded_keypairs.insert(name.to_string(), keypair);
@@ -196,14 +188,12 @@ impl CredentialManager {
             wallets: self.wallets.values().cloned().collect(),
         };
 
-        let json = serde_json::to_string_pretty(&registry).map_err(|e| {
-            Error::Config(format!("Failed to serialize registry: {}", e))
-        })?;
+        let json = serde_json::to_string_pretty(&registry)
+            .map_err(|e| Error::Config(format!("Failed to serialize registry: {}", e)))?;
 
         let wallets_path = self.credentials_dir.join("wallets.json");
-        std::fs::write(&wallets_path, json).map_err(|e| {
-            Error::Config(format!("Failed to write wallets.json: {}", e))
-        })?;
+        std::fs::write(&wallets_path, json)
+            .map_err(|e| Error::Config(format!("Failed to write wallets.json: {}", e)))?;
 
         info!("Saved wallet registry");
         Ok(())

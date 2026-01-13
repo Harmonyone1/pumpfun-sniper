@@ -27,7 +27,10 @@ impl WalletTracker {
             .collect::<std::result::Result<HashSet<_>, _>>()
             .map_err(|e| Error::Config(format!("Invalid wallet address: {}", e)))?;
 
-        info!("Wallet tracker initialized with {} wallets", tracked_wallets.len());
+        info!(
+            "Wallet tracker initialized with {} wallets",
+            tracked_wallets.len()
+        );
 
         Ok(Self {
             config,
@@ -122,9 +125,7 @@ mod tests {
     fn test_config() -> WalletTrackingConfig {
         WalletTrackingConfig {
             enabled: true,
-            wallets: vec![
-                "DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK".to_string(),
-            ],
+            wallets: vec!["DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK".to_string()],
             priority_boost: true,
         }
     }

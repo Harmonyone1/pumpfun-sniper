@@ -353,8 +353,7 @@ impl BondingCurveData {
         if self.virtual_token_reserves == 0 {
             return 0.0;
         }
-        (self.virtual_sol_reserves as f64 / 1e9)
-            / (self.virtual_token_reserves as f64 / 1e6)
+        (self.virtual_sol_reserves as f64 / 1e9) / (self.virtual_token_reserves as f64 / 1e6)
     }
 
     /// Calculate market cap in SOL
@@ -380,7 +379,10 @@ mod tests {
         let analysis = analyzer.analyze(&curve);
 
         // Small exit should have low slippage
-        assert!(analysis.slippage_at_0_1_sol < 5.0, "0.1 SOL exit should have <5% slippage");
+        assert!(
+            analysis.slippage_at_0_1_sol < 5.0,
+            "0.1 SOL exit should have <5% slippage"
+        );
     }
 
     #[test]
@@ -406,7 +408,10 @@ mod tests {
         let curve = make_curve(10_000_000, 1_000_000_000_000);
         let analysis = analyzer.analyze(&curve);
 
-        assert!(!analysis.exit_feasible, "Very low liquidity should not be feasible");
+        assert!(
+            !analysis.exit_feasible,
+            "Very low liquidity should not be feasible"
+        );
     }
 
     #[test]
@@ -417,7 +422,10 @@ mod tests {
         let curve = make_curve(10_000_000_000, 1_000_000_000_000);
         let analysis = analyzer.analyze(&curve);
 
-        assert!(analysis.max_safe_exit_sol > 0.0, "Should have some safe exit capacity");
+        assert!(
+            analysis.max_safe_exit_sol > 0.0,
+            "Should have some safe exit capacity"
+        );
         assert!(
             analysis.max_safe_exit_sol < 5.0,
             "Safe exit should be less than half of reserves"
@@ -447,13 +455,19 @@ mod tests {
 
         analysis.exit_feasible = true;
         analysis.max_safe_exit_sol = 0.03;
-        assert_eq!(analysis.risk_assessment(), "VERY HIGH - Minimal exit capacity");
+        assert_eq!(
+            analysis.risk_assessment(),
+            "VERY HIGH - Minimal exit capacity"
+        );
 
         analysis.max_safe_exit_sol = 0.1;
         assert_eq!(analysis.risk_assessment(), "HIGH - Limited exit capacity");
 
         analysis.max_safe_exit_sol = 0.3;
-        assert_eq!(analysis.risk_assessment(), "MODERATE - Adequate exit capacity");
+        assert_eq!(
+            analysis.risk_assessment(),
+            "MODERATE - Adequate exit capacity"
+        );
 
         analysis.max_safe_exit_sol = 1.0;
         assert_eq!(analysis.risk_assessment(), "LOW - Good exit capacity");

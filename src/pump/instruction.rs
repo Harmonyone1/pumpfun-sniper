@@ -4,8 +4,8 @@
 
 use solana_sdk::pubkey::Pubkey;
 
+use super::program::{match_discriminator, InstructionType};
 use crate::error::{Error, Result};
-use super::program::{InstructionType, match_discriminator};
 
 /// Parsed pump.fun instruction
 #[derive(Debug, Clone)]

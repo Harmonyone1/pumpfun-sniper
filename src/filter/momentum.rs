@@ -43,12 +43,12 @@ impl Default for MomentumConfig {
     fn default() -> Self {
         Self {
             min_observation_secs: 60,       // SURVIVOR: Wait 60s for snipers to exit
-            max_observation_secs: 180,     // SURVIVOR: 3 min max observation
-            min_trade_count: 10,           // SURVIVOR: Need substantial activity
-            min_volume_sol: 2.0,           // SURVIVOR: Real volume required
-            min_price_change_pct: 5.0,     // SURVIVOR: Must survive (positive price)
-            min_unique_traders: 5,         // SURVIVOR: Need trader distribution
-            min_buy_ratio: 0.55,           // SURVIVOR: Majority buying
+            max_observation_secs: 180,      // SURVIVOR: 3 min max observation
+            min_trade_count: 10,            // SURVIVOR: Need substantial activity
+            min_volume_sol: 2.0,            // SURVIVOR: Real volume required
+            min_price_change_pct: 5.0,      // SURVIVOR: Must survive (positive price)
+            min_unique_traders: 5,          // SURVIVOR: Need trader distribution
+            min_buy_ratio: 0.55,            // SURVIVOR: Majority buying
             min_volatility: 0.01,           // SURVIVOR: Active trading required
             max_holder_concentration: 0.50, // SURVIVOR: No whale dominance (max 50%)
             min_survival_ratio: 0.70,       // SURVIVOR: Price >= 70% of peak
@@ -65,7 +65,7 @@ pub struct TradeEvent {
     pub is_buy: bool,
     pub sol_amount: f64,
     pub token_amount: f64,
-    pub price: f64,  // SOL per token
+    pub price: f64, // SOL per token
     pub trader: String,
 }
 
@@ -92,9 +92,9 @@ pub struct MomentumMetrics {
     pub volume_buy_ratio: f64, // buy_volume / (buy_volume + sell_volume)
     pub net_flow_sol: f64,     // buy_volume - sell_volume
     // SURVIVOR: Survival metrics
-    pub survival_ratio: f64,       // current_price / peak_price
-    pub holder_concentration: f64, // top holder as % of supply (set externally)
-    pub holder_data_fetched: bool, // whether holder data has been fetched
+    pub survival_ratio: f64,        // current_price / peak_price
+    pub holder_concentration: f64,  // top holder as % of supply (set externally)
+    pub holder_data_fetched: bool,  // whether holder data has been fetched
     pub second_wave_buy_ratio: f64, // buy ratio in last 30% of observation window
 }
 
@@ -175,47 +175,81 @@ impl MomentumMetrics {
         let mut missing = Vec::new();
 
         if self.observation_secs < config.min_observation_secs as f64 {
-            missing.push(format!("obs:{:.0}s<{}s", self.observation_secs, config.min_observation_secs));
+            missing.push(format!(
+                "obs:{:.0}s<{}s",
+                self.observation_secs, config.min_observation_secs
+            ));
         }
         if self.trade_count < config.min_trade_count {
-            missing.push(format!("trades:{}<{}", self.trade_count, config.min_trade_count));
+            missing.push(format!(
+                "trades:{}<{}",
+                self.trade_count, config.min_trade_count
+            ));
         }
         if self.total_volume_sol < config.min_volume_sol {
-            missing.push(format!("vol:{:.2}<{:.2}", self.total_volume_sol, config.min_volume_sol));
+            missing.push(format!(
+                "vol:{:.2}<{:.2}",
+                self.total_volume_sol, config.min_volume_sol
+            ));
         }
         // DATA-DRIVEN: Check for positive price change
         if self.price_change_pct < config.min_price_change_pct {
-            missing.push(format!("price:{:+.1}%<+{:.1}%", self.price_change_pct, config.min_price_change_pct));
+            missing.push(format!(
+                "price:{:+.1}%<+{:.1}%",
+                self.price_change_pct, config.min_price_change_pct
+            ));
         }
         if self.unique_traders < config.min_unique_traders {
-            missing.push(format!("traders:{}<{}", self.unique_traders, config.min_unique_traders));
+            missing.push(format!(
+                "traders:{}<{}",
+                self.unique_traders, config.min_unique_traders
+            ));
         }
         // DATA-DRIVEN: Show volume-weighted buy ratio
         if self.volume_buy_ratio < config.min_buy_ratio {
-            missing.push(format!("vol_buy:{:.0}%<{:.0}%", self.volume_buy_ratio * 100.0, config.min_buy_ratio * 100.0));
+            missing.push(format!(
+                "vol_buy:{:.0}%<{:.0}%",
+                self.volume_buy_ratio * 100.0,
+                config.min_buy_ratio * 100.0
+            ));
         }
         // DATA-DRIVEN: Show net flow requirement
         if self.net_flow_sol < 0.0 {
             missing.push(format!("net_flow:{:+.2}SOL<0", self.net_flow_sol));
         }
         if self.volatility < config.min_volatility {
-            missing.push(format!("volatility:{:.4}<{:.4}", self.volatility, config.min_volatility));
+            missing.push(format!(
+                "volatility:{:.4}<{:.4}",
+                self.volatility, config.min_volatility
+            ));
         }
         // SURVIVOR: Survival ratio check
         if self.survival_ratio < config.min_survival_ratio {
-            missing.push(format!("survival:{:.0}%<{:.0}%", self.survival_ratio * 100.0, config.min_survival_ratio * 100.0));
+            missing.push(format!(
+                "survival:{:.0}%<{:.0}%",
+                self.survival_ratio * 100.0,
+                config.min_survival_ratio * 100.0
+            ));
         }
         // SURVIVOR: Holder data must be fetched
         if !self.holder_data_fetched {
             missing.push("holder_data:pending".to_string());
         } else if self.holder_concentration > config.max_holder_concentration {
             // SURVIVOR: Holder concentration check (only if data fetched)
-            missing.push(format!("whale:{:.0}%>{:.0}%", self.holder_concentration * 100.0, config.max_holder_concentration * 100.0));
+            missing.push(format!(
+                "whale:{:.0}%>{:.0}%",
+                self.holder_concentration * 100.0,
+                config.max_holder_concentration * 100.0
+            ));
         }
         // SURVIVOR: Second wave check (only when observation complete)
         if self.observation_secs >= config.min_observation_secs as f64 {
             if self.second_wave_buy_ratio < config.min_second_wave_ratio {
-                missing.push(format!("2nd_wave:{:.0}%<{:.0}%", self.second_wave_buy_ratio * 100.0, config.min_second_wave_ratio * 100.0));
+                missing.push(format!(
+                    "2nd_wave:{:.0}%<{:.0}%",
+                    self.second_wave_buy_ratio * 100.0,
+                    config.min_second_wave_ratio * 100.0
+                ));
             }
         }
 
@@ -247,7 +281,13 @@ struct WatchedToken {
 }
 
 impl WatchedToken {
-    fn new(mint: String, symbol: String, name: String, bonding_curve: String, initial_market_cap: f64) -> Self {
+    fn new(
+        mint: String,
+        symbol: String,
+        name: String,
+        bonding_curve: String,
+        initial_market_cap: f64,
+    ) -> Self {
         Self {
             mint,
             symbol,
@@ -281,11 +321,15 @@ impl WatchedToken {
         let total_volume: f64 = self.trades.iter().map(|t| t.sol_amount).sum();
 
         // DATA-DRIVEN: Calculate volume-weighted metrics
-        let buy_volume_sol: f64 = self.trades.iter()
+        let buy_volume_sol: f64 = self
+            .trades
+            .iter()
             .filter(|t| t.is_buy)
             .map(|t| t.sol_amount)
             .sum();
-        let sell_volume_sol: f64 = self.trades.iter()
+        let sell_volume_sol: f64 = self
+            .trades
+            .iter()
             .filter(|t| !t.is_buy)
             .map(|t| t.sol_amount)
             .sum();
@@ -321,8 +365,9 @@ impl WatchedToken {
             let prices: Vec<f64> = self.trades.iter().map(|t| t.price).collect();
             let mean = prices.iter().sum::<f64>() / prices.len() as f64;
             if mean > 0.0 {
-                let variance = prices.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / prices.len() as f64;
-                variance.sqrt() / mean  // Coefficient of variation
+                let variance =
+                    prices.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / prices.len() as f64;
+                variance.sqrt() / mean // Coefficient of variation
             } else {
                 0.0
             }
@@ -339,9 +384,11 @@ impl WatchedToken {
         // SURVIVOR: Calculate second-wave buy ratio (activity in last 30% of observation)
         let observation_elapsed = self.started.elapsed();
         let second_wave_threshold = Duration::from_secs_f64(
-            observation_elapsed.as_secs_f64() * 0.70 // Start of last 30%
+            observation_elapsed.as_secs_f64() * 0.70, // Start of last 30%
         );
-        let second_wave_trades: Vec<_> = self.trades.iter()
+        let second_wave_trades: Vec<_> = self
+            .trades
+            .iter()
             .filter(|t| t.timestamp.duration_since(self.started) >= second_wave_threshold)
             .collect();
         let second_wave_buy_ratio = if second_wave_trades.is_empty() {
@@ -389,13 +436,9 @@ pub enum MomentumStatus {
         reason: String,
     },
     /// Token shows momentum, ready for entry
-    Ready {
-        metrics: MomentumMetrics,
-    },
+    Ready { metrics: MomentumMetrics },
     /// Token expired without showing momentum
-    Expired {
-        metrics: MomentumMetrics,
-    },
+    Expired { metrics: MomentumMetrics },
     /// Token not found in watchlist
     NotWatched,
 }
@@ -493,7 +536,8 @@ impl MomentumValidator {
             token.holder_data_fetched = true;
             debug!(
                 "Set holder concentration for {}: {:.1}%",
-                token.symbol, concentration * 100.0
+                token.symbol,
+                concentration * 100.0
             );
         }
     }
@@ -568,7 +612,10 @@ impl MomentumValidator {
                 let metrics = token.calculate_metrics();
                 warn!(
                     "Token {} expired without momentum: trades={}, vol={:.2} SOL, price_chg={:.1}%",
-                    token.symbol, metrics.trade_count, metrics.total_volume_sol, metrics.price_change_pct
+                    token.symbol,
+                    metrics.trade_count,
+                    metrics.total_volume_sol,
+                    metrics.price_change_pct
                 );
                 expired.push(mint.clone());
                 false
@@ -586,8 +633,12 @@ impl MomentumValidator {
         let result = watchlist.contains_key(mint);
         if !result && !watchlist.is_empty() {
             // Log for debugging - trade for unknown token
-            tracing::debug!("is_watching check failed: mint={}, watchlist has {} tokens: {:?}",
-                mint, watchlist.len(), watchlist.keys().collect::<Vec<_>>());
+            tracing::debug!(
+                "is_watching check failed: mint={}, watchlist has {} tokens: {:?}",
+                mint,
+                watchlist.len(),
+                watchlist.keys().collect::<Vec<_>>()
+            );
         }
         result
     }
@@ -601,7 +652,9 @@ impl MomentumValidator {
     /// Get token info if watched
     pub async fn get_token_info(&self, mint: &str) -> Option<(String, String, String)> {
         let watchlist = self.watchlist.read().await;
-        watchlist.get(mint).map(|t| (t.symbol.clone(), t.name.clone(), t.bonding_curve.clone()))
+        watchlist
+            .get(mint)
+            .map(|t| (t.symbol.clone(), t.name.clone(), t.bonding_curve.clone()))
     }
 }
 
@@ -627,12 +680,18 @@ mod tests {
     async fn test_watch_and_record() {
         let validator = MomentumValidator::default();
 
-        validator.watch_token("mint1", "TEST", "Test Token", "curve1", 30.0).await;
+        validator
+            .watch_token("mint1", "TEST", "Test Token", "curve1", 30.0)
+            .await;
         assert!(validator.is_watching("mint1").await);
 
         // Record some trades
-        validator.record_trade("mint1", true, 0.1, 1000.0, "trader1").await;
-        validator.record_trade("mint1", true, 0.2, 2000.0, "trader2").await;
+        validator
+            .record_trade("mint1", true, 0.1, 1000.0, "trader1")
+            .await;
+        validator
+            .record_trade("mint1", true, 0.2, 2000.0, "trader2")
+            .await;
 
         let status = validator.check_momentum("mint1").await;
         matches!(status, MomentumStatus::Observing { .. });
@@ -641,12 +700,12 @@ mod tests {
     #[test]
     fn test_metrics_thresholds() {
         let config = MomentumConfig {
-            min_observation_secs: 0,  // No wait for testing
+            min_observation_secs: 0, // No wait for testing
             min_trade_count: 2,
             min_volume_sol: 0.1,
             min_price_change_pct: 1.0,
-            min_unique_traders: 5,         // SURVIVOR: 5 traders
-            min_buy_ratio: 0.55,           // SURVIVOR: 55% buy volume
+            min_unique_traders: 5, // SURVIVOR: 5 traders
+            min_buy_ratio: 0.55,   // SURVIVOR: 55% buy volume
             min_volatility: 0.001,
             ..Default::default()
         };
@@ -667,5 +726,3 @@ mod tests {
         assert!(metrics.meets_thresholds(&config));
     }
 }
-
-

@@ -112,11 +112,11 @@ impl Privilege {
     /// Get risk level (0-10)
     pub fn risk_level(&self) -> u8 {
         match self {
-            Privilege::MintTokens => 10,      // Critical
-            Privilege::FreezeAccounts => 9,   // Very high
-            Privilege::CloseAccounts => 7,    // High
-            Privilege::UpdateMetadata => 3,   // Low
-            Privilege::Unknown(_) => 5,       // Medium (unknown)
+            Privilege::MintTokens => 10,    // Critical
+            Privilege::FreezeAccounts => 9, // Very high
+            Privilege::CloseAccounts => 7,  // High
+            Privilege::UpdateMetadata => 3, // Low
+            Privilege::Unknown(_) => 5,     // Medium (unknown)
         }
     }
 }
@@ -204,7 +204,10 @@ impl CreatorPrivilegeChecker {
         let freeze_authority_active =
             data[freeze_authority_offset..freeze_authority_offset + 4] == [1, 0, 0, 0];
         let freeze_authority = if freeze_authority_active {
-            Some(bs58::encode(&data[freeze_authority_offset + 4..freeze_authority_offset + 36]).into_string())
+            Some(
+                bs58::encode(&data[freeze_authority_offset + 4..freeze_authority_offset + 36])
+                    .into_string(),
+            )
         } else {
             None
         };
@@ -235,7 +238,10 @@ impl CreatorPrivilegeChecker {
     }
 
     /// Quick check without RPC (from cached data)
-    pub fn check_from_data(&self, mint_data: &[u8]) -> Result<CreatorPrivileges, PrivilegeCheckError> {
+    pub fn check_from_data(
+        &self,
+        mint_data: &[u8],
+    ) -> Result<CreatorPrivileges, PrivilegeCheckError> {
         if mint_data.len() < 82 {
             return Err(PrivilegeCheckError::InvalidMintData(
                 "Data too short".to_string(),
@@ -253,7 +259,10 @@ impl CreatorPrivilegeChecker {
         let freeze_authority_active =
             mint_data[freeze_authority_offset..freeze_authority_offset + 4] == [1, 0, 0, 0];
         let freeze_authority = if freeze_authority_active {
-            Some(bs58::encode(&mint_data[freeze_authority_offset + 4..freeze_authority_offset + 36]).into_string())
+            Some(
+                bs58::encode(&mint_data[freeze_authority_offset + 4..freeze_authority_offset + 36])
+                    .into_string(),
+            )
         } else {
             None
         };
@@ -280,7 +289,9 @@ impl CreatorPrivilegeChecker {
     /// Should this token be rejected based on privileges?
     pub fn should_reject(&self, privileges: &CreatorPrivileges) -> Option<String> {
         if self.config.reject_mint_authority && privileges.mint_authority_active {
-            return Some("Mint authority is active - creator can mint unlimited tokens".to_string());
+            return Some(
+                "Mint authority is active - creator can mint unlimited tokens".to_string(),
+            );
         }
         if self.config.reject_freeze_authority && privileges.freeze_authority_active {
             return Some("Freeze authority is active - creator can freeze your tokens".to_string());

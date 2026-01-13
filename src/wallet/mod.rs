@@ -36,7 +36,6 @@ pub use credentials::CredentialManager;
 pub use manager::WalletManager;
 pub use safety::{SafetyEnforcer, SafetyViolation};
 pub use types::{
-    AiProposal, DailyExtractionStats, InitiatedBy, ProposalStatus, ProposedAction,
-    TransferHistory, TransferReason, TransferRecord, WalletEntry, WalletRegistry,
-    WalletStatus, WalletType,
+    AiProposal, DailyExtractionStats, InitiatedBy, ProposalStatus, ProposedAction, TransferHistory,
+    TransferReason, TransferRecord, WalletEntry, WalletRegistry, WalletStatus, WalletType,
 };

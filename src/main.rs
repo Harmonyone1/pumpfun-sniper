@@ -299,18 +299,21 @@ async fn main() -> Result<()> {
             format,
             watch,
             interval,
-        } => commands::scan(
-            &config,
-            min_liquidity,
-            max_liquidity,
-            min_volume,
-            limit,
-            auto_buy,
-            buy_amount,
-            &format,
-            watch,
-            interval,
-        ).await,
+        } => {
+            commands::scan(
+                &config,
+                min_liquidity,
+                max_liquidity,
+                min_volume,
+                limit,
+                auto_buy,
+                buy_amount,
+                &format,
+                watch,
+                interval,
+            )
+            .await
+        }
         Commands::HotScan {
             min_m5,
             min_ratio,
@@ -322,19 +325,22 @@ async fn main() -> Result<()> {
             watch,
             interval,
             jito,
-        } => commands::hot_scan(
-            &config,
-            min_m5,
-            min_ratio,
-            min_liquidity,
-            max_mcap,
-            auto_buy,
-            buy_amount,
-            dry_run,
-            watch,
-            interval,
-            jito,
-        ).await,
+        } => {
+            commands::hot_scan(
+                &config,
+                min_m5,
+                min_ratio,
+                min_liquidity,
+                max_mcap,
+                auto_buy,
+                buy_amount,
+                dry_run,
+                watch,
+                interval,
+                jito,
+            )
+            .await
+        }
         Commands::Wallet { action } => match action {
             WalletAction::Status => commands::wallet_status(&config).await,
             WalletAction::List => commands::wallet_list(&config).await,
@@ -344,13 +350,20 @@ async fn main() -> Result<()> {
                 wallet_type,
                 address,
                 generate,
-            } => commands::wallet_add(&config, &name, &alias, &wallet_type, address, generate).await,
-            WalletAction::Extract { amount, force, dry_run } => {
-                commands::wallet_extract(&config, amount, force, dry_run).await
+            } => {
+                commands::wallet_add(&config, &name, &alias, &wallet_type, address, generate).await
             }
-            WalletAction::Transfer { from, to, amount, force } => {
-                commands::wallet_transfer(&config, &from, &to, amount, force).await
-            }
+            WalletAction::Extract {
+                amount,
+                force,
+                dry_run,
+            } => commands::wallet_extract(&config, amount, force, dry_run).await,
+            WalletAction::Transfer {
+                from,
+                to,
+                amount,
+                force,
+            } => commands::wallet_transfer(&config, &from, &to, amount, force).await,
             WalletAction::History { limit } => commands::wallet_history(&config, limit).await,
             WalletAction::Proposals { approve, reject } => {
                 commands::wallet_proposals(&config, approve, reject).await

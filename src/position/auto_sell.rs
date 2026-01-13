@@ -79,7 +79,10 @@ impl AutoSeller {
         tokio::spawn(async move {
             while let Some(update) = price_rx.recv().await {
                 // Get position for this token
-                let position = match position_manager.get_position(&update.mint.to_string()).await {
+                let position = match position_manager
+                    .get_position(&update.mint.to_string())
+                    .await
+                {
                     Some(p) => p,
                     None => continue, // No position, skip
                 };
@@ -90,9 +93,7 @@ impl AutoSeller {
                     .await;
 
                 // Check for triggers
-                if let Some(event) =
-                    Self::check_triggers(&config, &position, update.price)
-                {
+                if let Some(event) = Self::check_triggers(&config, &position, update.price) {
                     info!(
                         "Auto-sell triggered for {}: {:?} at {}% P&L",
                         update.mint, event.trigger, event.pnl_pct

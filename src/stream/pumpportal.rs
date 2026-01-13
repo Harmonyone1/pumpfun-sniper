@@ -123,12 +123,12 @@ pub struct TradeEvent {
     pub signature: String,
     pub mint: String,
     pub trader_public_key: String,
-    pub tx_type: String, // "buy" or "sell"
-    pub token_amount: f64,  // Can have decimals in the API
-    pub sol_amount: f64,    // Already in SOL (not lamports)
+    pub tx_type: String,   // "buy" or "sell"
+    pub token_amount: f64, // Can have decimals in the API
+    pub sol_amount: f64,   // Already in SOL (not lamports)
     pub bonding_curve_key: String,
-    pub v_tokens_in_bonding_curve: f64,  // Can have decimals
-    pub v_sol_in_bonding_curve: f64,     // Can have decimals
+    pub v_tokens_in_bonding_curve: f64, // Can have decimals
+    pub v_sol_in_bonding_curve: f64,    // Can have decimals
     pub market_cap_sol: f64,
 }
 
@@ -298,9 +298,9 @@ impl PumpPortalClient {
             .map_err(|e| Error::Config(format!("Invalid WebSocket URL: {}", e)))?;
 
         // Connect
-        let (ws_stream, _) = connect_async(url)
-            .await
-            .map_err(|e| Error::ShredStreamConnection(format!("WebSocket connect failed: {}", e)))?;
+        let (ws_stream, _) = connect_async(url).await.map_err(|e| {
+            Error::ShredStreamConnection(format!("WebSocket connect failed: {}", e))
+        })?;
 
         info!("Connected to PumpPortal WebSocket");
 
@@ -315,8 +315,8 @@ impl PumpPortalClient {
         // Subscribe to new tokens
         if subscribe_new_tokens {
             let msg = SubscriptionMessage::subscribe_new_tokens();
-            let json = serde_json::to_string(&msg)
-                .map_err(|e| Error::Serialization(e.to_string()))?;
+            let json =
+                serde_json::to_string(&msg).map_err(|e| Error::Serialization(e.to_string()))?;
             write
                 .send(Message::Text(json))
                 .await
@@ -327,25 +327,27 @@ impl PumpPortalClient {
         // Subscribe to ALL trades on pump.fun
         if subscribe_all_trades {
             let msg = SubscriptionMessage::subscribe_all_trades();
-            let json = serde_json::to_string(&msg)
-                .map_err(|e| Error::Serialization(e.to_string()))?;
-            write
-                .send(Message::Text(json))
-                .await
-                .map_err(|e| Error::ShredStreamConnection(format!("Failed to subscribe to trades: {}", e)))?;
+            let json =
+                serde_json::to_string(&msg).map_err(|e| Error::Serialization(e.to_string()))?;
+            write.send(Message::Text(json)).await.map_err(|e| {
+                Error::ShredStreamConnection(format!("Failed to subscribe to trades: {}", e))
+            })?;
             info!("Subscribed to ALL trade events");
         }
 
         // Subscribe to wallet trades
         if !track_wallets.is_empty() {
             let msg = SubscriptionMessage::subscribe_account_trades(track_wallets.to_vec());
-            let json = serde_json::to_string(&msg)
-                .map_err(|e| Error::Serialization(e.to_string()))?;
+            let json =
+                serde_json::to_string(&msg).map_err(|e| Error::Serialization(e.to_string()))?;
             write
                 .send(Message::Text(json))
                 .await
                 .map_err(|e| Error::ShredStreamConnection(format!("Failed to subscribe: {}", e)))?;
-            info!("Subscribed to {} wallet(s) for trade tracking", track_wallets.len());
+            info!(
+                "Subscribed to {} wallet(s) for trade tracking",
+                track_wallets.len()
+            );
         }
 
         // Set up ping interval
@@ -436,10 +438,7 @@ impl PumpPortalClient {
     }
 
     /// Handle incoming WebSocket message
-    async fn handle_message(
-        text: &str,
-        event_tx: &mpsc::Sender<PumpPortalEvent>,
-    ) -> Result<()> {
+    async fn handle_message(text: &str, event_tx: &mpsc::Sender<PumpPortalEvent>) -> Result<()> {
         // Log first 200 chars of incoming message for debugging
         debug!("Incoming message: {}", &text[..text.len().min(200)]);
 
@@ -477,7 +476,11 @@ impl PumpPortalClient {
             Err(e) => {
                 // Only log if it looks like a trade event
                 if text.contains("\"txType\":\"buy\"") || text.contains("\"txType\":\"sell\"") {
-                    warn!("Failed to parse trade event: {} - JSON: {}", e, &text[..text.len().min(500)]);
+                    warn!(
+                        "Failed to parse trade event: {} - JSON: {}",
+                        e,
+                        &text[..text.len().min(500)]
+                    );
                 }
             }
         }
@@ -515,8 +518,8 @@ impl From<TradeEvent> for crate::stream::decoder::TokenTradeEvent {
             mint: Pubkey::from_str(&event.mint).unwrap_or_default(),
             bonding_curve: Pubkey::from_str(&event.bonding_curve_key).unwrap_or_default(),
             trader: Pubkey::from_str(&event.trader_public_key).unwrap_or_default(),
-            token_amount: event.token_amount as u64,  // Truncate to u64
-            sol_amount: (event.sol_amount * 1e9) as u64,  // Convert SOL to lamports
+            token_amount: event.token_amount as u64, // Truncate to u64
+            sol_amount: (event.sol_amount * 1e9) as u64, // Convert SOL to lamports
             is_buy: event.tx_type == "buy",
             timestamp: chrono::Utc::now(),
         }

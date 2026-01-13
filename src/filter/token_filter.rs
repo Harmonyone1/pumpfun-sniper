@@ -31,10 +31,14 @@ impl std::fmt::Display for FilterReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FilterReason::Disabled => write!(f, "filtering disabled"),
-            FilterReason::BlockedName(pattern) => write!(f, "name matches blocked pattern: {}", pattern),
+            FilterReason::BlockedName(pattern) => {
+                write!(f, "name matches blocked pattern: {}", pattern)
+            }
             FilterReason::NamePatternMismatch => write!(f, "name doesn't match required patterns"),
             FilterReason::DevHoldingsExceeded(pct) => write!(f, "dev holdings {}% exceed max", pct),
-            FilterReason::LiquidityBelowMinimum(sol) => write!(f, "liquidity {} SOL below minimum", sol),
+            FilterReason::LiquidityBelowMinimum(sol) => {
+                write!(f, "liquidity {} SOL below minimum", sol)
+            }
             FilterReason::Custom(reason) => write!(f, "{}", reason),
         }
     }
@@ -104,17 +108,16 @@ impl TokenFilter {
                     "Token {} ({}) blocked by pattern: {}",
                     event.name, event.symbol, pattern
                 );
-                return FilterResult::Filtered(FilterReason::BlockedName(
-                    pattern.to_string(),
-                ));
+                return FilterResult::Filtered(FilterReason::BlockedName(pattern.to_string()));
             }
         }
 
         // Check name patterns (if any configured)
         if !self.name_patterns.is_empty() {
-            let matches = self.name_patterns.iter().any(|p| {
-                p.is_match(&event.name) || p.is_match(&event.symbol)
-            });
+            let matches = self
+                .name_patterns
+                .iter()
+                .any(|p| p.is_match(&event.name) || p.is_match(&event.symbol));
 
             if !matches {
                 debug!(
@@ -140,9 +143,7 @@ impl TokenFilter {
         }
 
         if dev_holdings_pct > self.config.max_dev_holdings_pct {
-            return FilterResult::Filtered(FilterReason::DevHoldingsExceeded(
-                dev_holdings_pct,
-            ));
+            return FilterResult::Filtered(FilterReason::DevHoldingsExceeded(dev_holdings_pct));
         }
 
         FilterResult::Pass
@@ -156,20 +157,14 @@ impl TokenFilter {
         }
 
         if liquidity_sol < self.config.min_liquidity_sol {
-            return FilterResult::Filtered(FilterReason::LiquidityBelowMinimum(
-                liquidity_sol,
-            ));
+            return FilterResult::Filtered(FilterReason::LiquidityBelowMinimum(liquidity_sol));
         }
 
         FilterResult::Pass
     }
 
     /// Check all on-chain criteria
-    pub fn check_on_chain(
-        &self,
-        dev_holdings_pct: f64,
-        liquidity_sol: f64,
-    ) -> FilterResult {
+    pub fn check_on_chain(&self, dev_holdings_pct: f64, liquidity_sol: f64) -> FilterResult {
         if let FilterResult::Filtered(reason) = self.check_dev_holdings(dev_holdings_pct) {
             return FilterResult::Filtered(reason);
         }

@@ -89,12 +89,8 @@ impl PumpDecoder {
             PumpInstruction::Create(create) => {
                 Self::decode_create_event(signature, slot, create, accounts)
             }
-            PumpInstruction::Buy(buy) => {
-                Self::decode_buy_event(signature, slot, buy, accounts)
-            }
-            PumpInstruction::Sell(sell) => {
-                Self::decode_sell_event(signature, slot, sell, accounts)
-            }
+            PumpInstruction::Buy(buy) => Self::decode_buy_event(signature, slot, buy, accounts),
+            PumpInstruction::Sell(sell) => Self::decode_sell_event(signature, slot, sell, accounts),
             PumpInstruction::Unknown(_) => {
                 debug!("Unknown pump.fun instruction in tx {}", signature);
                 Ok(None)

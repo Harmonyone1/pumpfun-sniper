@@ -153,10 +153,7 @@ impl ProfitExtractor {
         amount: f64,
         rule: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!(
-            "Triggering extraction: {} SOL (rule: {})",
-            amount, rule
-        );
+        info!("Triggering extraction: {} SOL (rule: {})", amount, rule);
 
         let result = self
             .wallet_manager

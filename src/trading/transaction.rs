@@ -106,9 +106,9 @@ impl TransactionBuilder {
             AccountMeta::new(payer.pubkey(), true),              // user (signer)
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false), // system_program
             AccountMeta::new_readonly(spl_associated_token_account::ID, false), // associated_token_program
-            AccountMeta::new_readonly(spl_token::ID, false),     // token_program
-            AccountMeta::new_readonly(event_authority()?, false), // event_authority
-            AccountMeta::new_readonly(*PUMP_PROGRAM_ID, false),  // program
+            AccountMeta::new_readonly(spl_token::ID, false),                    // token_program
+            AccountMeta::new_readonly(event_authority()?, false),               // event_authority
+            AccountMeta::new_readonly(*PUMP_PROGRAM_ID, false),                 // program
         ];
 
         let sell_instruction = Instruction {
@@ -169,11 +169,8 @@ impl TransactionBuilder {
         };
 
         // Build tip instruction (SOL transfer to Jito tip account)
-        let tip_instruction = system_instruction::transfer(
-            &payer.pubkey(),
-            tip_account,
-            tip_lamports,
-        );
+        let tip_instruction =
+            system_instruction::transfer(&payer.pubkey(), tip_account, tip_lamports);
 
         // Combine: buy first, then tip
         let transaction = Transaction::new_signed_with_payer(

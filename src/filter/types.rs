@@ -28,15 +28,15 @@ pub struct WalletHistory {
     #[serde(default)]
     pub avg_time_to_first_buy_secs: Option<u64>, // After token launch
     #[serde(default)]
-    pub sells_within_10_min: u32,                // Sniper behavior indicator
+    pub sells_within_10_min: u32, // Sniper behavior indicator
 
     // Risk indicators
     #[serde(default)]
-    pub deployed_rug_count: u32,          // Tokens that went to ~0
+    pub deployed_rug_count: u32, // Tokens that went to ~0
     #[serde(default)]
-    pub associated_wallets: Vec<String>,  // Funding relationships
+    pub associated_wallets: Vec<String>, // Funding relationships
     #[serde(default)]
-    pub cluster_id: Option<String>,       // If part of coordinated group
+    pub cluster_id: Option<String>, // If part of coordinated group
 
     // Cache metadata
     pub fetched_at: DateTime<Utc>,
@@ -228,9 +228,9 @@ pub struct OrderFlowAnalysis {
 
     // Pattern detection
     pub burst_detected: bool,
-    pub burst_intensity: f64, // 0.0 to 1.0
+    pub burst_intensity: f64,    // 0.0 to 1.0
     pub wash_trading_score: f64, // 0.0 to 1.0
-    pub organic_score: f64,   // 0.0 to 1.0
+    pub organic_score: f64,      // 0.0 to 1.0
 
     // Timing analysis
     pub early_sell_pressure: f64, // Sells in first 5 min as ratio

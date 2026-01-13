@@ -81,10 +81,7 @@ impl HeliusClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::Rpc(format!(
-                "Helius API error {}: {}",
-                status, body
-            )));
+            return Err(Error::Rpc(format!("Helius API error {}: {}", status, body)));
         }
 
         let transactions: Vec<HeliusTransaction> = response
@@ -98,9 +95,10 @@ impl HeliusClient {
 
         Ok(WalletHistory {
             address: address.to_string(),
-            first_seen: transactions.last().and_then(|t| t.timestamp).map(|ts| {
-                DateTime::from_timestamp(ts, 0).unwrap_or_else(|| Utc::now())
-            }),
+            first_seen: transactions
+                .last()
+                .and_then(|t| t.timestamp)
+                .map(|ts| DateTime::from_timestamp(ts, 0).unwrap_or_else(|| Utc::now())),
             total_trades,
             winning_trades,
             total_volume_sol: total_volume,
@@ -125,11 +123,7 @@ impl HeliusClient {
     /// Fetch token holders for a mint
     ///
     /// Returns top holders and distribution metrics
-    pub async fn get_token_holders(
-        &self,
-        mint: &str,
-        limit: u32,
-    ) -> Result<Vec<TokenHolderInfo>> {
+    pub async fn get_token_holders(&self, mint: &str, limit: u32) -> Result<Vec<TokenHolderInfo>> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "helius-holders",
@@ -158,10 +152,7 @@ impl HeliusClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::Rpc(format!(
-                "Helius RPC error {}: {}",
-                status, body
-            )));
+            return Err(Error::Rpc(format!("Helius RPC error {}: {}", status, body)));
         }
 
         let rpc_response: HeliusRpcResponse<TokenAccountsResult> = response
@@ -173,9 +164,9 @@ impl HeliusClient {
             return Err(Error::Rpc(format!("Helius RPC error: {}", error.message)));
         }
 
-        let result = rpc_response.result.ok_or_else(|| {
-            Error::Rpc("No result in Helius RPC response".to_string())
-        })?;
+        let result = rpc_response
+            .result
+            .ok_or_else(|| Error::Rpc("No result in Helius RPC response".to_string()))?;
 
         // Convert to our format
         let holders: Vec<TokenHolderInfo> = result
@@ -233,10 +224,7 @@ impl HeliusClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::Rpc(format!(
-                "Helius RPC error {}: {}",
-                status, body
-            )));
+            return Err(Error::Rpc(format!("Helius RPC error {}: {}", status, body)));
         }
 
         let rpc_response: HeliusRpcResponse<AccountInfoResult> = response
@@ -248,13 +236,13 @@ impl HeliusClient {
             return Err(Error::Rpc(format!("Helius RPC error: {}", error.message)));
         }
 
-        let result = rpc_response.result.ok_or_else(|| {
-            Error::Rpc("No result in mint info response".to_string())
-        })?;
+        let result = rpc_response
+            .result
+            .ok_or_else(|| Error::Rpc("No result in mint info response".to_string()))?;
 
-        let value = result.value.ok_or_else(|| {
-            Error::Rpc("Mint account not found".to_string())
-        })?;
+        let value = result
+            .value
+            .ok_or_else(|| Error::Rpc("Mint account not found".to_string()))?;
 
         // Parse the mint data
         if let Some(parsed) = value.data.parsed {
@@ -296,8 +284,10 @@ impl HeliusClient {
                         .map(|transfers| {
                             transfers
                                 .iter()
-                                .filter(|t| t.from_user_account.as_deref() == Some(wallet)
-                                    || t.to_user_account.as_deref() == Some(wallet))
+                                .filter(|t| {
+                                    t.from_user_account.as_deref() == Some(wallet)
+                                        || t.to_user_account.as_deref() == Some(wallet)
+                                })
                                 .map(|t| t.amount as f64 / 1e9)
                                 .sum::<f64>()
                         })
@@ -307,20 +297,22 @@ impl HeliusClient {
                     let token_mint = tx
                         .token_transfers
                         .as_ref()
-                        .and_then(|transfers| {
-                            transfers.first().map(|t| t.mint.clone())
-                        });
+                        .and_then(|transfers| transfers.first().map(|t| t.mint.clone()));
 
                     if sol_amount > 0.0 {
                         trades.push(WalletTrade {
                             signature: tx.signature.clone(),
-                            timestamp: tx.timestamp.and_then(|ts| {
-                                DateTime::from_timestamp(ts, 0)
-                            }),
-                            is_buy: tx_type.contains("BUY") ||
-                                tx.native_transfers.as_ref().map(|t| {
-                                    t.iter().any(|tr| tr.from_user_account.as_deref() == Some(wallet))
-                                }).unwrap_or(false),
+                            timestamp: tx.timestamp.and_then(|ts| DateTime::from_timestamp(ts, 0)),
+                            is_buy: tx_type.contains("BUY")
+                                || tx
+                                    .native_transfers
+                                    .as_ref()
+                                    .map(|t| {
+                                        t.iter().any(|tr| {
+                                            tr.from_user_account.as_deref() == Some(wallet)
+                                        })
+                                    })
+                                    .unwrap_or(false),
                             sol_amount,
                             token_mint,
                             profit_sol: None, // Would need more analysis
@@ -336,13 +328,86 @@ impl HeliusClient {
     /// Calculate trading statistics from trades
     fn calculate_stats(&self, trades: &[WalletTrade]) -> (u32, u32, f64) {
         let total_trades = trades.len() as u32;
-        let winning_trades = trades.iter().filter(|t| {
-            t.profit_sol.map(|p| p > 0.0).unwrap_or(false)
-        }).count() as u32;
+        let winning_trades = trades
+            .iter()
+            .filter(|t| t.profit_sol.map(|p| p > 0.0).unwrap_or(false))
+            .count() as u32;
         let total_volume = trades.iter().map(|t| t.sol_amount).sum();
 
         (total_trades, winning_trades, total_volume)
     }
+
+    /// Get funding transfers (SOL received) for a wallet
+    ///
+    /// Used for bundled wallet detection - wallets funded from same source
+    pub async fn get_funding_transfers(
+        &self,
+        address: &str,
+        limit: u32,
+    ) -> Result<Vec<SolTransfer>> {
+        let url = format!(
+            "{}/v0/addresses/{}/transactions?api-key={}&limit={}",
+            self.rest_base_url, address, self.api_key, limit
+        );
+
+        debug!("Fetching funding transfers for {}", address);
+
+        let response = self
+            .client
+            .get(&url)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|e| Error::Rpc(format!("Helius request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Rpc(format!("Helius API error {}: {}", status, body)));
+        }
+
+        let transactions: Vec<HeliusTransaction> = response
+            .json()
+            .await
+            .map_err(|e| Error::Serialization(format!("Failed to parse Helius response: {}", e)))?;
+
+        // Extract SOL transfers TO this wallet (funding)
+        let mut transfers = Vec::new();
+        for tx in &transactions {
+            if let Some(ref native) = tx.native_transfers {
+                for transfer in native {
+                    // Only incoming transfers (TO this wallet)
+                    if transfer.to_user_account.as_deref() == Some(address) {
+                        if let Some(ref from) = transfer.from_user_account {
+                            transfers.push(SolTransfer {
+                                signature: tx.signature.clone(),
+                                from: from.clone(),
+                                to: address.to_string(),
+                                amount_lamports: transfer.amount,
+                                amount_sol: transfer.amount as f64 / 1e9,
+                                timestamp: tx.timestamp.and_then(|ts| {
+                                    DateTime::from_timestamp(ts, 0)
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(transfers)
+    }
+}
+
+/// SOL transfer record for funding analysis
+#[derive(Debug, Clone)]
+pub struct SolTransfer {
+    pub signature: String,
+    pub from: String,
+    pub to: String,
+    pub amount_lamports: u64,
+    pub amount_sol: f64,
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 // ============ Helius API Response Types ============

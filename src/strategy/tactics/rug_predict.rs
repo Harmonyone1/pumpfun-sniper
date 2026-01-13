@@ -81,7 +81,9 @@ impl RugWarningSignal {
                     0.5
                 }
             }
-            RugWarningSignal::InsiderExodus { top_holder_sells, .. } => {
+            RugWarningSignal::InsiderExodus {
+                top_holder_sells, ..
+            } => {
                 if *top_holder_sells > 5 {
                     0.85
                 } else if *top_holder_sells > 3 {
@@ -127,10 +129,10 @@ pub struct RugPrediction {
 /// Urgency level for rug prediction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RugUrgency {
-    Low,       // Monitor
-    Medium,    // Consider reducing position
-    High,      // Exit recommended
-    Critical,  // Exit immediately
+    Low,      // Monitor
+    Medium,   // Consider reducing position
+    High,     // Exit recommended
+    Critical, // Exit immediately
 }
 
 impl RugUrgency {

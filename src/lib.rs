@@ -3,8 +3,8 @@
 //! High-performance token sniper for pump.fun using Jito ShredStream.
 
 pub mod cli;
-pub mod dexscreener;
 pub mod config;
+pub mod dexscreener;
 pub mod error;
 pub mod filter;
 pub mod position;

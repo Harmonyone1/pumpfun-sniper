@@ -13,6 +13,6 @@ pub mod program;
 
 // Re-export commonly used types
 pub use accounts::BondingCurve;
-pub use instruction::{PumpInstruction, CreateInstruction, BuyInstruction, SellInstruction};
+pub use instruction::{BuyInstruction, CreateInstruction, PumpInstruction, SellInstruction};
 pub use price::calculate_price;
-pub use program::{PUMP_PROGRAM_ID, DISCRIMINATORS};
+pub use program::{DISCRIMINATORS, PUMP_PROGRAM_ID};

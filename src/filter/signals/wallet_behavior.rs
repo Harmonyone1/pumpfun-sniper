@@ -49,9 +49,12 @@ impl WalletBehaviorSignalProvider {
             );
         } else {
             signals.push(
-                Signal::neutral(SignalType::KnownDeployer, "Creator not in deployer blacklist")
-                    .with_latency(start.elapsed())
-                    .with_cached(true),
+                Signal::neutral(
+                    SignalType::KnownDeployer,
+                    "Creator not in deployer blacklist",
+                )
+                .with_latency(start.elapsed())
+                .with_cached(true),
             );
         }
 
@@ -98,21 +101,21 @@ impl WalletBehaviorSignalProvider {
             let age_signal = if age_days < 1 {
                 Signal::new(
                     SignalType::WalletAge,
-                    -0.15,  // Reduced from -0.7 - new wallets normal on pump.fun
-                    0.4,    // Low confidence - less meaningful signal
+                    -0.15, // Reduced from -0.7 - new wallets normal on pump.fun
+                    0.4,   // Low confidence - less meaningful signal
                     format!("Very new wallet: {} days old", age_days),
                 )
             } else if age_days < 7 {
                 Signal::new(
                     SignalType::WalletAge,
-                    -0.10,  // Reduced from -0.4
+                    -0.10, // Reduced from -0.4
                     0.4,
                     format!("New wallet: {} days old", age_days),
                 )
             } else if age_days < 30 {
                 Signal::new(
                     SignalType::WalletAge,
-                    0.0,    // Neutral - was -0.1
+                    0.0, // Neutral - was -0.1
                     0.5,
                     format!("Moderately new wallet: {} days old", age_days),
                 )
@@ -221,18 +224,12 @@ impl WalletBehaviorSignalProvider {
         } else {
             // No cached data - return unavailable signals with reduced confidence
             signals.push(
-                Signal::unavailable(
-                    SignalType::WalletAge,
-                    "Wallet age data not cached",
-                )
-                .with_latency(start.elapsed()),
+                Signal::unavailable(SignalType::WalletAge, "Wallet age data not cached")
+                    .with_latency(start.elapsed()),
             );
             signals.push(
-                Signal::unavailable(
-                    SignalType::WalletHistory,
-                    "Wallet history not cached",
-                )
-                .with_latency(start.elapsed()),
+                Signal::unavailable(SignalType::WalletHistory, "Wallet history not cached")
+                    .with_latency(start.elapsed()),
             );
         }
 
@@ -318,7 +315,10 @@ mod tests {
             .iter()
             .find(|s| s.signal_type == SignalType::KnownDeployer)
             .unwrap();
-        assert_eq!(deployer_signal.value, -1.0, "Known deployer should be extreme risk");
+        assert_eq!(
+            deployer_signal.value, -1.0,
+            "Known deployer should be extreme risk"
+        );
     }
 
     #[tokio::test]
@@ -332,7 +332,10 @@ mod tests {
             .iter()
             .find(|s| s.signal_type == SignalType::KnownDeployer)
             .unwrap();
-        assert_eq!(deployer_signal.value, 0.0, "Unknown wallet should be neutral");
+        assert_eq!(
+            deployer_signal.value, 0.0,
+            "Unknown wallet should be neutral"
+        );
     }
 
     #[tokio::test]
@@ -348,13 +351,16 @@ mod tests {
             .iter()
             .find(|s| s.signal_type == SignalType::KnownSniper);
         assert!(sniper_signal.is_some(), "Should detect sniper creator");
-        assert!(sniper_signal.unwrap().value < 0.0, "Sniper creator should be negative");
+        assert!(
+            sniper_signal.unwrap().value < 0.0,
+            "Sniper creator should be negative"
+        );
     }
 
     #[tokio::test]
     async fn test_cached_history_analysis() {
-        use chrono::Utc;
         use crate::filter::types::WalletHistory;
+        use chrono::Utc;
 
         let cache = Arc::new(FilterCache::new());
 
@@ -385,14 +391,23 @@ mod tests {
             .iter()
             .find(|s| s.signal_type == SignalType::WalletAge);
         assert!(age_signal.is_some(), "Should have wallet age signal");
-        assert!(age_signal.unwrap().value > 0.0, "Mature wallet should be positive");
+        assert!(
+            age_signal.unwrap().value > 0.0,
+            "Mature wallet should be positive"
+        );
 
         // Should have wallet history signal (positive for high activity)
         let history_signal = signals
             .iter()
             .find(|s| s.signal_type == SignalType::WalletHistory);
-        assert!(history_signal.is_some(), "Should have wallet history signal");
-        assert!(history_signal.unwrap().value > 0.0, "High activity should be positive");
+        assert!(
+            history_signal.is_some(),
+            "Should have wallet history signal"
+        );
+        assert!(
+            history_signal.unwrap().value > 0.0,
+            "High activity should be positive"
+        );
     }
 
     #[tokio::test]
@@ -407,6 +422,10 @@ mod tests {
             .iter()
             .find(|s| s.signal_type == SignalType::WalletAge);
         assert!(age_signal.is_some(), "Should have wallet age signal");
-        assert_eq!(age_signal.unwrap().confidence, 0.0, "Unavailable should have 0 confidence");
+        assert_eq!(
+            age_signal.unwrap().confidence,
+            0.0,
+            "Unavailable should have 0 confidence"
+        );
     }
 }

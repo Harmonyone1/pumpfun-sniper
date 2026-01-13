@@ -93,9 +93,9 @@ pub struct PriceActionAnalyzer {
     max_records: usize,
 
     // State
-    local_highs: VecDeque<f64>,  // Swing highs for structure analysis
-    local_lows: VecDeque<f64>,   // Swing lows for structure analysis
-    all_time_high: f64,          // Overall max for drawdown calculation
+    local_highs: VecDeque<f64>, // Swing highs for structure analysis
+    local_lows: VecDeque<f64>,  // Swing lows for structure analysis
+    all_time_high: f64,         // Overall max for drawdown calculation
     total_volume: f64,
     volume_weighted_price_sum: f64,
     launch_time: Option<std::time::Instant>,
@@ -182,7 +182,11 @@ impl PriceActionAnalyzer {
             // Swing high: prev > before_prev AND prev > curr
             if prev_price > before_prev && prev_price > curr_price {
                 // Only add if it's different from last recorded high
-                if self.local_highs.back().map_or(true, |&h| (h - prev_price).abs() > 0.0001) {
+                if self
+                    .local_highs
+                    .back()
+                    .map_or(true, |&h| (h - prev_price).abs() > 0.0001)
+                {
                     self.local_highs.push_back(prev_price);
                     self.last_high_time = Some(now);
                     while self.local_highs.len() > 10 {
@@ -194,7 +198,11 @@ impl PriceActionAnalyzer {
             // Swing low: prev < before_prev AND prev < curr
             if prev_price < before_prev && prev_price < curr_price {
                 // Only add if it's different from last recorded low
-                if self.local_lows.back().map_or(true, |&l| (l - prev_price).abs() > 0.0001) {
+                if self
+                    .local_lows
+                    .back()
+                    .map_or(true, |&l| (l - prev_price).abs() > 0.0001)
+                {
                     self.local_lows.push_back(prev_price);
                     while self.local_lows.len() > 10 {
                         self.local_lows.pop_front();
@@ -229,10 +237,18 @@ impl PriceActionAnalyzer {
         // Local high/low from swing points (for structure analysis)
         let local_high_swing = self.local_highs.iter().cloned().fold(0.0_f64, f64::max);
         let local_low = self.local_lows.iter().cloned().fold(f64::MAX, f64::min);
-        let local_low = if local_low == f64::MAX { current_price } else { local_low };
+        let local_low = if local_low == f64::MAX {
+            current_price
+        } else {
+            local_low
+        };
 
         // Use all_time_high for local_high (more accurate for drawdown)
-        let local_high = if self.all_time_high > 0.0 { self.all_time_high } else { local_high_swing };
+        let local_high = if self.all_time_high > 0.0 {
+            self.all_time_high
+        } else {
+            local_high_swing
+        };
 
         // Drawdown from all-time high
         let drawdown_from_high = if self.all_time_high > 0.0 {
@@ -251,7 +267,8 @@ impl PriceActionAnalyzer {
             _ => 0,
         };
 
-        let time_since_local_high_ms = self.last_high_time
+        let time_since_local_high_ms = self
+            .last_high_time
             .map(|t| std::time::Instant::now().duration_since(t).as_millis() as u64)
             .unwrap_or(0);
 
@@ -368,11 +385,11 @@ mod tests {
 
         // Create pattern with two swing lows (second higher than first)
         // Swing low requires: price goes down, then up (the low is confirmed)
-        analyzer.record_price(100.0, 1.0);  // Start
-        analyzer.record_price(90.0, 1.0);   // Down (potential first low)
-        analyzer.record_price(105.0, 1.0);  // Up - confirms 90 as first swing low
-        analyzer.record_price(95.0, 1.0);   // Down (potential second low, higher than 90)
-        analyzer.record_price(110.0, 1.0);  // Up - confirms 95 as second swing low
+        analyzer.record_price(100.0, 1.0); // Start
+        analyzer.record_price(90.0, 1.0); // Down (potential first low)
+        analyzer.record_price(105.0, 1.0); // Up - confirms 90 as first swing low
+        analyzer.record_price(95.0, 1.0); // Down (potential second low, higher than 90)
+        analyzer.record_price(110.0, 1.0); // Up - confirms 95 as second swing low
 
         let pa = analyzer.analyze();
         // Now we have swing lows [90, 95] - ascending = higher_lows

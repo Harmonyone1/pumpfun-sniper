@@ -6,8 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::types::Position;
 use super::delta_tracker::RollingWindow;
+use super::types::Position;
 
 /// Portfolio risk blocks - reasons why new positions are blocked
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,10 +36,19 @@ impl PortfolioBlock {
             PortfolioBlock::MaxPositionsReached { current, max } => {
                 format!("Max positions reached: {}/{}", current, max)
             }
-            PortfolioBlock::MaxExposureReached { current_sol, max_sol } => {
-                format!("Max exposure reached: {:.3}/{:.3} SOL", current_sol, max_sol)
+            PortfolioBlock::MaxExposureReached {
+                current_sol,
+                max_sol,
+            } => {
+                format!(
+                    "Max exposure reached: {:.3}/{:.3} SOL",
+                    current_sol, max_sol
+                )
             }
-            PortfolioBlock::CircuitBreakerTripped { loss_sol, limit_sol } => {
+            PortfolioBlock::CircuitBreakerTripped {
+                loss_sol,
+                limit_sol,
+            } => {
                 format!(
                     "Circuit breaker: hourly loss {:.3} exceeds limit {:.3} SOL",
                     loss_sol, limit_sol
@@ -48,16 +57,25 @@ impl PortfolioBlock {
             PortfolioBlock::ConsecutiveLossLimit { count, limit } => {
                 format!("Consecutive losses: {}/{}", count, limit)
             }
-            PortfolioBlock::DailyLossLimitReached { loss_sol, limit_sol } => {
+            PortfolioBlock::DailyLossLimitReached {
+                loss_sol,
+                limit_sol,
+            } => {
                 format!("Daily loss limit: {:.3}/{:.3} SOL", loss_sol, limit_sol)
             }
-            PortfolioBlock::PositionTooLarge { requested_sol, max_sol } => {
+            PortfolioBlock::PositionTooLarge {
+                requested_sol,
+                max_sol,
+            } => {
                 format!(
                     "Position too large: {:.3} SOL exceeds max {:.3} SOL",
                     requested_sol, max_sol
                 )
             }
-            PortfolioBlock::TradingPaused { reason, resume_in_secs } => {
+            PortfolioBlock::TradingPaused {
+                reason,
+                resume_in_secs,
+            } => {
                 format!("Trading paused: {} (resume in {}s)", reason, resume_in_secs)
             }
         }
@@ -139,7 +157,11 @@ impl PortfolioRiskGovernor {
             consecutive_losses: 0,
             paused_until: None,
             pause_reason: None,
-            day_start: chrono::Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc(),
+            day_start: chrono::Utc::now()
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
         }
     }
 
@@ -257,7 +279,8 @@ impl PortfolioRiskGovernor {
     /// Pause trading for a duration
     pub fn pause_trading(&mut self, reason: String, duration_secs: u64) {
         tracing::warn!("Pausing trading: {} ({}s)", reason, duration_secs);
-        self.paused_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(duration_secs));
+        self.paused_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(duration_secs));
         self.pause_reason = Some(reason);
     }
 
@@ -279,13 +302,20 @@ impl PortfolioRiskGovernor {
         let today_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
 
         if today_start > self.day_start {
-            tracing::info!("Daily reset: previous day PnL was {:.3} SOL", self.daily_pnl);
+            tracing::info!(
+                "Daily reset: previous day PnL was {:.3} SOL",
+                self.daily_pnl
+            );
             self.daily_pnl = 0.0;
             self.day_start = today_start;
             self.consecutive_losses = 0;
 
             // Resume trading if it was paused due to daily limit
-            if self.pause_reason.as_ref().map_or(false, |r| r.contains("daily")) {
+            if self
+                .pause_reason
+                .as_ref()
+                .map_or(false, |r| r.contains("daily"))
+            {
                 self.resume_trading();
             }
         }
@@ -330,7 +360,9 @@ impl PortfolioRiskGovernor {
 
     /// Get remaining position slots
     pub fn remaining_slots(&self) -> usize {
-        self.config.max_concurrent_positions.saturating_sub(self.positions.len())
+        self.config
+            .max_concurrent_positions
+            .saturating_sub(self.positions.len())
     }
 
     /// Adjust position size based on portfolio constraints
@@ -349,8 +381,8 @@ impl PortfolioRiskGovernor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::{ExitStyle, TradingStrategy};
     use super::*;
-    use super::super::types::{TradingStrategy, ExitStyle};
 
     fn make_position(mint: &str, size_sol: f64) -> Position {
         Position {
@@ -385,7 +417,10 @@ mod tests {
         governor.open_position(make_position("mint2", 0.1));
 
         let result = governor.can_open_position(0.1);
-        assert!(matches!(result, Err(PortfolioBlock::MaxPositionsReached { .. })));
+        assert!(matches!(
+            result,
+            Err(PortfolioBlock::MaxPositionsReached { .. })
+        ));
     }
 
     #[test]
@@ -400,7 +435,10 @@ mod tests {
         governor.open_position(make_position("mint1", 0.3));
 
         let result = governor.can_open_position(0.3);
-        assert!(matches!(result, Err(PortfolioBlock::MaxExposureReached { .. })));
+        assert!(matches!(
+            result,
+            Err(PortfolioBlock::MaxExposureReached { .. })
+        ));
     }
 
     #[test]
@@ -412,7 +450,10 @@ mod tests {
         let governor = PortfolioRiskGovernor::new(config);
 
         let result = governor.can_open_position(0.3);
-        assert!(matches!(result, Err(PortfolioBlock::PositionTooLarge { .. })));
+        assert!(matches!(
+            result,
+            Err(PortfolioBlock::PositionTooLarge { .. })
+        ));
     }
 
     #[test]

@@ -32,16 +32,17 @@ fn spam_patterns() -> &'static Regex {
 
 fn trending_patterns() -> &'static Regex {
     TRENDING_PATTERNS.get_or_init(|| {
-        Regex::new(r"(?i)(trump|biden|elon|musk|doge|pepe|shib|bonk|wojak|cat|dog|moon|rocket|ai\s*bot)")
-            .expect("Invalid trending patterns regex")
+        Regex::new(
+            r"(?i)(trump|biden|elon|musk|doge|pepe|shib|bonk|wojak|cat|dog|moon|rocket|ai\s*bot)",
+        )
+        .expect("Invalid trending patterns regex")
     })
 }
 
 fn suspicious_chars() -> &'static Regex {
     SUSPICIOUS_CHARS.get_or_init(|| {
         // Unicode lookalikes, invisible chars (backreferences not supported)
-        Regex::new(r"[\x{200B}-\x{200D}\x{FEFF}\x{00A0}]")
-            .expect("Invalid suspicious chars regex")
+        Regex::new(r"[\x{200B}-\x{200D}\x{FEFF}\x{00A0}]").expect("Invalid suspicious chars regex")
     })
 }
 
@@ -356,8 +357,14 @@ mod tests {
         let context = make_context("FREE MONEY SCAM", "SCAM", "https://example.com");
         let signals = provider.compute_token_signals(&context).await;
 
-        let name_signal = signals.iter().find(|s| s.signal_type == SignalType::NameQuality).unwrap();
-        assert!(name_signal.value < -0.5, "Scam name should have negative value");
+        let name_signal = signals
+            .iter()
+            .find(|s| s.signal_type == SignalType::NameQuality)
+            .unwrap();
+        assert!(
+            name_signal.value < -0.5,
+            "Scam name should have negative value"
+        );
     }
 
     #[tokio::test]
@@ -366,18 +373,34 @@ mod tests {
         let context = make_context("test token asdf", "TEST", "https://example.com");
         let signals = provider.compute_token_signals(&context).await;
 
-        let name_signal = signals.iter().find(|s| s.signal_type == SignalType::NameQuality).unwrap();
-        assert!(name_signal.value < 0.0, "Spam name should have negative value");
+        let name_signal = signals
+            .iter()
+            .find(|s| s.signal_type == SignalType::NameQuality)
+            .unwrap();
+        assert!(
+            name_signal.value < 0.0,
+            "Spam name should have negative value"
+        );
     }
 
     #[tokio::test]
     async fn test_normal_name() {
         let provider = MetadataSignalProvider::new();
-        let context = make_context("Solana Dog Token", "SDOG", "https://arweave.net/metadata.json");
+        let context = make_context(
+            "Solana Dog Token",
+            "SDOG",
+            "https://arweave.net/metadata.json",
+        );
         let signals = provider.compute_token_signals(&context).await;
 
-        let name_signal = signals.iter().find(|s| s.signal_type == SignalType::NameQuality).unwrap();
-        assert!(name_signal.value >= 0.0, "Normal name should be neutral or positive");
+        let name_signal = signals
+            .iter()
+            .find(|s| s.signal_type == SignalType::NameQuality)
+            .unwrap();
+        assert!(
+            name_signal.value >= 0.0,
+            "Normal name should be neutral or positive"
+        );
     }
 
     #[tokio::test]
@@ -386,8 +409,14 @@ mod tests {
         let context = make_context("Trump Pepe", "TPEPE", "https://example.com");
         let signals = provider.compute_token_signals(&context).await;
 
-        let name_signal = signals.iter().find(|s| s.signal_type == SignalType::NameQuality).unwrap();
-        assert!(name_signal.value > 0.0, "Trending name should be slightly positive");
+        let name_signal = signals
+            .iter()
+            .find(|s| s.signal_type == SignalType::NameQuality)
+            .unwrap();
+        assert!(
+            name_signal.value > 0.0,
+            "Trending name should be slightly positive"
+        );
     }
 
     #[tokio::test]
@@ -396,7 +425,10 @@ mod tests {
         let context = make_context("Token", "TKN", "https://bit.ly/abc123");
         let signals = provider.compute_token_signals(&context).await;
 
-        let uri_signal = signals.iter().find(|s| s.signal_type == SignalType::UriAnalysis).unwrap();
+        let uri_signal = signals
+            .iter()
+            .find(|s| s.signal_type == SignalType::UriAnalysis)
+            .unwrap();
         assert!(uri_signal.value < 0.0, "URL shortener should be suspicious");
     }
 
@@ -406,7 +438,10 @@ mod tests {
         let context = make_context("Token", "TKN", "https://arweave.net/abc123");
         let signals = provider.compute_token_signals(&context).await;
 
-        let uri_signal = signals.iter().find(|s| s.signal_type == SignalType::UriAnalysis).unwrap();
+        let uri_signal = signals
+            .iter()
+            .find(|s| s.signal_type == SignalType::UriAnalysis)
+            .unwrap();
         assert!(uri_signal.value > 0.0, "Arweave URI should be positive");
     }
 
@@ -416,8 +451,14 @@ mod tests {
         let context = make_context("", "TKN", "https://example.com");
         let signals = provider.compute_token_signals(&context).await;
 
-        let name_signal = signals.iter().find(|s| s.signal_type == SignalType::NameQuality).unwrap();
-        assert!(name_signal.value < -0.5, "Empty name should be very negative");
+        let name_signal = signals
+            .iter()
+            .find(|s| s.signal_type == SignalType::NameQuality)
+            .unwrap();
+        assert!(
+            name_signal.value < -0.5,
+            "Empty name should be very negative"
+        );
     }
 
     #[tokio::test]
@@ -426,7 +467,10 @@ mod tests {
         let context = make_context("SUPER TOKEN MOON", "STM", "https://example.com");
         let signals = provider.compute_token_signals(&context).await;
 
-        let name_signal = signals.iter().find(|s| s.signal_type == SignalType::NameQuality).unwrap();
+        let name_signal = signals
+            .iter()
+            .find(|s| s.signal_type == SignalType::NameQuality)
+            .unwrap();
         assert!(name_signal.value < 0.0, "All caps name should be negative");
     }
 }
