@@ -439,17 +439,19 @@ impl PositionManager {
     }
 
     /// Update the token amount for a position (used when actual balance differs from estimate)
+    ///
+    /// IMPORTANT: We do NOT recalculate entry_price here because actual_amount may be in
+    /// raw token units (with 6+ decimals) while our original entry_price was calculated
+    /// using normalized human-readable amounts. Recalculating would corrupt P&L tracking.
     pub async fn update_token_amount(&self, mint: &str, actual_amount: u64) -> Result<()> {
         let mut positions = self.positions.write().await;
         if let Some(position) = positions.get_mut(mint) {
             let old_amount = position.token_amount;
             position.token_amount = actual_amount;
-            // Recalculate entry price based on actual tokens received
-            if actual_amount > 0 {
-                position.entry_price = position.total_cost_sol / actual_amount as f64;
-            }
+            // Do NOT recalculate entry_price - preserve the original price from purchase
+            // The entry_price was calculated correctly at buy time using cost/estimated_tokens
             info!(
-                "Updated {} token amount: {} -> {} (entry price adjusted to {:.10})",
+                "Updated {} token amount: {} -> {} (entry price preserved at {:.10})",
                 mint, old_amount, actual_amount, position.entry_price
             );
         }

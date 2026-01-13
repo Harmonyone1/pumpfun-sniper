@@ -2303,6 +2303,28 @@ pub async fn hot_scan(
     ));
     position_manager.load().await?;
 
+    // Initialize smart money wallet profiler and Helius client (if enabled)
+    let (helius_client, wallet_profiler) = if config.smart_money.enabled {
+        use crate::filter::helius::HeliusClient;
+        use crate::filter::smart_money::wallet_profiler::{WalletProfiler, WalletProfilerConfig};
+
+        if let Some(helius) = HeliusClient::from_rpc_url(&config.rpc.endpoint) {
+            info!("Smart money wallet profiler ENABLED - analyzing creators before buy");
+            let helius_arc = std::sync::Arc::new(helius);
+            let profiler = std::sync::Arc::new(WalletProfiler::new(
+                helius_arc.clone(),
+                WalletProfilerConfig::default(),
+            ));
+            (Some(helius_arc), Some(profiler))
+        } else {
+            warn!("Smart money enabled but Helius API key not found in RPC URL - profiler disabled");
+            (None, None)
+        }
+    } else {
+        info!("Smart money wallet profiler disabled");
+        (None, None)
+    };
+
     // Track already-bought mints this session with persistence (mint -> timestamp)
     // TTL: Remove entries older than 24 hours to allow re-buying of rebounding tokens
     const BOUGHT_MINTS_TTL_HOURS: i64 = 24;
@@ -2930,10 +2952,67 @@ pub async fn hot_scan(
                             }
                         }
 
+                        // SMART MONEY CHECK: Analyze token creator's past performance
+                        let final_buy_amount = if let (Some(ref helius), Some(ref profiler)) = (&helius_client, &wallet_profiler) {
+                            match helius.get_token_creator(&token.mint).await {
+                                Ok(creator) => {
+                                    match profiler.get_or_compute(&creator).await {
+                                        Ok(profile) => {
+                                            // Check if creator should be avoided
+                                            if profile.should_avoid() {
+                                                warn!(
+                                                    "Skipping {} - creator {} is {:?} (should avoid)",
+                                                    token.symbol, &creator[..8], profile.alpha_score.category
+                                                );
+                                                continue;
+                                            }
+
+                                            // Adjust position size based on alpha score
+                                            let alpha_multiplier = if profile.is_elite() {
+                                                info!(
+                                                    "[{}] ELITE creator {} | Win: {:.0}% | R: {:.1}x | Alpha: {:.2}",
+                                                    token.symbol,
+                                                    &creator[..8],
+                                                    profile.win_rate * 100.0,
+                                                    profile.avg_r_multiple,
+                                                    profile.alpha_score.value
+                                                );
+                                                1.5 // 50% more for elite wallets
+                                            } else if profile.win_rate >= 0.5 {
+                                                debug!(
+                                                    "[{}] Good creator {} | Win: {:.0}% | Alpha: {:.2}",
+                                                    token.symbol, &creator[..8], profile.win_rate * 100.0, profile.alpha_score.value
+                                                );
+                                                1.0 // Normal for decent wallets
+                                            } else {
+                                                debug!(
+                                                    "[{}] Weak creator {} | Win: {:.0}% | Alpha: {:.2}",
+                                                    token.symbol, &creator[..8], profile.win_rate * 100.0, profile.alpha_score.value
+                                                );
+                                                0.7 // 30% less for weak wallets
+                                            };
+
+                                            buy_amount * alpha_multiplier
+                                        }
+                                        Err(e) => {
+                                            debug!("Could not profile creator for {}: {} - using default size", token.symbol, e);
+                                            buy_amount
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Could not get creator for {}: {} - using default size", token.symbol, e);
+                                    buy_amount
+                                }
+                            }
+                        } else {
+                            buy_amount // No profiler, use default
+                        };
+
                         if dry_run {
                             warn!(
                                 "DRY-RUN: Would buy {:.4} SOL of {}",
-                                buy_amount, token.symbol
+                                final_buy_amount, token.symbol
                             );
                             bought.insert(token.mint.clone(), chrono::Utc::now().timestamp());
                             // Persist bought_mints to disk (with timestamps)
@@ -2946,8 +3025,8 @@ pub async fn hot_scan(
                             let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
 
                             info!(
-                                "Buying {} SOL of {} via {}",
-                                buy_amount,
+                                "Buying {:.4} SOL of {} via {}",
+                                final_buy_amount,
                                 token.symbol,
                                 if use_local_api {
                                     "Local API"
@@ -2960,7 +3039,7 @@ pub async fn hot_scan(
                                 trader
                                     .buy_local(
                                         &token.mint,
-                                        buy_amount,
+                                        final_buy_amount,
                                         slippage,
                                         priority_fee,
                                         &keypair,
@@ -2969,7 +3048,7 @@ pub async fn hot_scan(
                                     .await
                             } else {
                                 trader
-                                    .buy(&token.mint, buy_amount, slippage, priority_fee)
+                                    .buy(&token.mint, final_buy_amount, slippage, priority_fee)
                                     .await
                             };
 
@@ -2982,7 +3061,7 @@ pub async fn hot_scan(
                                     persist_bought_mints(&*bought_mints_path, &*bought);
 
                                     // Record position
-                                    let estimated_tokens = (buy_amount / token.price_native) as u64;
+                                    let estimated_tokens = (final_buy_amount / token.price_native) as u64;
                                     let position = crate::position::manager::Position {
                                         mint: token.mint.clone(),
                                         name: token.name.clone(),
@@ -2990,7 +3069,7 @@ pub async fn hot_scan(
                                         bonding_curve: String::new(), // Not available from DexScreener
                                         token_amount: estimated_tokens,
                                         entry_price: token.price_native,
-                                        total_cost_sol: buy_amount,
+                                        total_cost_sol: final_buy_amount,
                                         entry_time: chrono::Utc::now(),
                                         entry_signature: sig,
                                         entry_type:

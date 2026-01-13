@@ -397,6 +397,104 @@ impl HeliusClient {
 
         Ok(transfers)
     }
+
+    /// Get the creator (deployer) of a token
+    ///
+    /// Fetches the first transaction for the mint to identify who created it.
+    /// This is critical for smart money analysis - the creator's past performance
+    /// predicts token success rate.
+    pub async fn get_token_creator(&self, mint: &str) -> Result<String> {
+        // First try: Get signatures for the mint (earliest transaction = creation)
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "helius-signatures",
+            "method": "getSignaturesForAddress",
+            "params": [
+                mint,
+                {
+                    "limit": 1,
+                    "before": null
+                }
+            ]
+        });
+
+        debug!("Fetching token creator for {}", mint);
+
+        // Get the earliest signature by fetching with commitment
+        let response = self
+            .client
+            .post(&self.rpc_base_url)
+            .json(&request)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|e| Error::Rpc(format!("Helius RPC request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Rpc(format!("Helius RPC error {}: {}", status, body)));
+        }
+
+        let rpc_response: HeliusRpcResponse<Vec<SignatureInfo>> = response
+            .json()
+            .await
+            .map_err(|e| Error::Serialization(format!("Failed to parse RPC response: {}", e)))?;
+
+        if let Some(error) = rpc_response.error {
+            return Err(Error::Rpc(format!("Helius RPC error: {}", error.message)));
+        }
+
+        let signatures = rpc_response
+            .result
+            .ok_or_else(|| Error::Rpc("No signatures found for mint".to_string()))?;
+
+        if signatures.is_empty() {
+            return Err(Error::Rpc("No transactions found for mint".to_string()));
+        }
+
+        // Now fetch the transaction to get fee payer (creator)
+        let sig = &signatures[0].signature;
+        let url = format!(
+            "{}/v0/transactions/?api-key={}&transactions={}",
+            self.rest_base_url, self.api_key, sig
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|e| Error::Rpc(format!("Helius request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Rpc(format!("Helius API error {}: {}", status, body)));
+        }
+
+        let transactions: Vec<HeliusTransaction> = response
+            .json()
+            .await
+            .map_err(|e| Error::Serialization(format!("Failed to parse transaction: {}", e)))?;
+
+        // The fee payer of the creation transaction is typically the creator
+        transactions
+            .first()
+            .and_then(|tx| tx.fee_payer.clone())
+            .ok_or_else(|| Error::Rpc("Could not determine token creator".to_string()))
+    }
+}
+
+/// Signature info from getSignaturesForAddress
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct SignatureInfo {
+    signature: String,
+    slot: u64,
+    #[serde(rename = "blockTime")]
+    block_time: Option<i64>,
 }
 
 /// SOL transfer record for funding analysis
