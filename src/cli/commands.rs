@@ -884,8 +884,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             entry_signature: signature.clone(),
                                             entry_type,
                                             quick_profit_taken: false,
+                                            second_profit_taken: false,
                                             peak_price: estimated_price,
                                             current_price: estimated_price,
+                                            kill_switch_triggered: false,
+                                            kill_switch_reason: None,
                                         };
 
                                         if let Err(e) = position_manager.open_position(position).await {
@@ -1148,8 +1151,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 entry_signature: sig.clone(),
                                                 entry_type: crate::position::manager::EntryType::Probe, // Conservative for trade-based entries
                                                 quick_profit_taken: false,
+                                                second_profit_taken: false,
                                                 peak_price: estimated_price,
                                                 current_price: estimated_price,
+                                                kill_switch_triggered: false,
+                                                kill_switch_reason: None,
                                             };
                                             if let Err(e) = position_manager.open_position(position).await {
                                                 error!("Failed to record position: {}", e);
@@ -2377,7 +2383,13 @@ pub async fn hot_scan(
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
             let poll_interval_ms = monitor_config.auto_sell.price_poll_interval_ms;
-            info!("Features: Trailing Stop (5%), No-Movement Exit (120s), Quick Profit, LOCAL FALLBACK");
+            info!("Features: Dynamic Trailing ({}%-{}%), Layered Exits ({}%/{}%/{}%), Kill-Switch, LOCAL FALLBACK",
+                monitor_config.auto_sell.trailing_stop_base_pct,
+                monitor_config.auto_sell.trailing_stop_tight_pct,
+                monitor_config.auto_sell.quick_profit_pct,
+                monitor_config.auto_sell.second_profit_pct,
+                monitor_config.auto_sell.take_profit_pct
+            );
             info!("Poll interval: {}ms", poll_interval_ms);
             if !monitor_use_local_api {
                 info!(
@@ -2555,47 +2567,83 @@ pub async fn hot_scan(
                         );
                     }
 
-                    let trailing_stop_pct = 5.0;
-                    let no_movement_secs = 120;
-                    let no_movement_threshold = 2.0;
+                    // Get config values for layered exits
+                    let no_movement_secs = monitor_config.auto_sell.no_movement_secs;
+                    let no_movement_threshold = monitor_config.auto_sell.no_movement_threshold_pct;
+                    let second_profit_pct = monitor_config.auto_sell.second_profit_pct;
+
+                    // === DYNAMIC TRAILING STOP ===
+                    // Tighten trailing stop as profit grows to prevent round-tripping
+                    let trailing_stop_pct = if monitor_config.auto_sell.dynamic_trailing_enabled {
+                        if pnl_pct >= 25.0 {
+                            monitor_config.auto_sell.trailing_stop_tight_pct  // 3% at high gains
+                        } else if pnl_pct >= 15.0 {
+                            monitor_config.auto_sell.trailing_stop_medium_pct // 4% at medium gains
+                        } else {
+                            monitor_config.auto_sell.trailing_stop_base_pct   // 5% base
+                        }
+                    } else {
+                        5.0 // Fixed trailing stop if dynamic disabled
+                    };
 
                     let mut should_sell = false;
                     let mut sell_pct = "100%";
                     let mut reason = String::new();
 
+                    // === KILL-SWITCH CHECK (HIGHEST PRIORITY) ===
+                    // If kill-switch triggered, force immediate exit regardless of P&L
+                    if let Some(ks_reason) = monitor_positions.is_kill_switch_triggered(&position.mint).await {
+                        should_sell = true;
+                        reason = format!("KILL-SWITCH: {}", ks_reason);
+                        warn!("KILL-SWITCH EXIT: {} - {}", position.symbol, ks_reason);
+                    }
+
                     // 1. Stop loss
-                    if pnl_pct <= -sl_pct {
+                    if !should_sell && pnl_pct <= -sl_pct {
                         should_sell = true;
                         reason = format!("STOP LOSS at {:.1}% (limit: -{:.0}%)", pnl_pct, sl_pct);
                     }
 
                     // 2. Trailing stop (only if in profit and dropped from peak)
+                    // Now uses dynamic trailing stop percentage
                     if !should_sell && pnl_pct > 0.0 && drop_from_peak_pct >= trailing_stop_pct {
                         should_sell = true;
                         reason = format!(
-                            "TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%)",
-                            drop_from_peak_pct, pnl_pct
+                            "TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%, trail: {:.0}%)",
+                            drop_from_peak_pct, pnl_pct, trailing_stop_pct
                         );
                     }
 
-                    // 3. Take profit
+                    // 3. Take profit (final exit)
                     if !should_sell && pnl_pct >= tp_pct {
                         should_sell = true;
                         reason = format!("TAKE PROFIT at {:.1}% (target: {:.0}%)", pnl_pct, tp_pct);
                     }
 
-                    // 4. Quick profit (partial exit)
+                    // 4. Quick profit - FIRST LAYER (50% sell at quick_profit_pct)
                     if !should_sell
                         && !position.quick_profit_taken
                         && pnl_pct >= quick_profit_pct
-                        && pnl_pct < tp_pct
+                        && pnl_pct < second_profit_pct
                     {
                         should_sell = true;
                         sell_pct = "50%";
-                        reason = format!("QUICK PROFIT at {:.1}% - selling 50%", pnl_pct);
+                        reason = format!("LAYER 1: Quick profit at {:.1}% - selling 50%", pnl_pct);
                     }
 
-                    // 5. No-movement exit
+                    // 5. Second profit - SECOND LAYER (25% sell at second_profit_pct)
+                    if !should_sell
+                        && position.quick_profit_taken
+                        && !position.second_profit_taken
+                        && pnl_pct >= second_profit_pct
+                        && pnl_pct < tp_pct
+                    {
+                        should_sell = true;
+                        sell_pct = "25%";
+                        reason = format!("LAYER 2: Second profit at {:.1}% - selling 25%", pnl_pct);
+                    }
+
+                    // 6. No-movement exit
                     if !should_sell
                         && hold_time_secs >= no_movement_secs
                         && pnl_pct.abs() < no_movement_threshold
@@ -2604,7 +2652,7 @@ pub async fn hot_scan(
                         reason = format!("NO MOVEMENT: {:.1}% after {}s", pnl_pct, hold_time_secs);
                     }
 
-                    // 6. Max hold time
+                    // 7. Max hold time
                     if !should_sell {
                         if let Some(max_secs) = max_hold {
                             if hold_time_secs >= max_secs {
@@ -2693,25 +2741,26 @@ pub async fn hot_scan(
                                         * 100.0;
 
                                     if sell_pct == "50%" {
-                                        let half_amount = position.token_amount / 2;
+                                        // LAYER 1: Quick profit - sell 50%
+                                        let sell_amount = position.token_amount / 2;
                                         // Use actual received SOL (fallback to estimate if 0)
                                         let received = if actual_received > 0.0 {
                                             actual_received
                                         } else {
-                                            (half_amount as f64 * current_price) * 0.98
+                                            (sell_amount as f64 * current_price) * 0.98
                                         };
                                         let pnl_sol = received - (position.total_cost_sol / 2.0);
                                         let _ = monitor_positions
                                             .close_position(
                                                 &position.mint,
-                                                half_amount,
+                                                sell_amount,
                                                 received,
                                             )
                                             .await;
                                         let _ = monitor_positions
                                             .mark_quick_profit_taken(&position.mint)
                                             .await;
-                                        info!("=== TRADE CLOSED (Partial) ===");
+                                        info!("=== LAYER 1 PROFIT TAKEN (50%) ===");
                                         info!(
                                             "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
                                             position.symbol,
@@ -2719,8 +2768,40 @@ pub async fn hot_scan(
                                             current_price,
                                             price_change_pct
                                         );
-                                        info!("  Tokens: {} | Received: {:.4} SOL (actual) | P&L: {:+.4} SOL | Hold: {}s",
-                                              half_amount, received, pnl_sol, hold_secs);
+                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
+                                              sell_amount, received, pnl_sol, hold_secs);
+                                    } else if sell_pct == "25%" {
+                                        // LAYER 2: Second profit - sell 25% of original (50% of remaining)
+                                        let sell_amount = position.token_amount / 2; // Half of what's left
+                                        let received = if actual_received > 0.0 {
+                                            actual_received
+                                        } else {
+                                            (sell_amount as f64 * current_price) * 0.98
+                                        };
+                                        // Cost basis is proportional to remaining position
+                                        let cost_ratio = sell_amount as f64 / position.token_amount as f64;
+                                        let cost_basis = position.total_cost_sol * cost_ratio;
+                                        let pnl_sol = received - cost_basis;
+                                        let _ = monitor_positions
+                                            .close_position(
+                                                &position.mint,
+                                                sell_amount,
+                                                received,
+                                            )
+                                            .await;
+                                        let _ = monitor_positions
+                                            .mark_second_profit_taken(&position.mint)
+                                            .await;
+                                        info!("=== LAYER 2 PROFIT TAKEN (25%) ===");
+                                        info!(
+                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                            position.symbol,
+                                            position.entry_price,
+                                            current_price,
+                                            price_change_pct
+                                        );
+                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
+                                              sell_amount, received, pnl_sol, hold_secs);
                                     } else {
                                         // Use actual received SOL (fallback to estimate if 0)
                                         let received = if actual_received > 0.0 {
@@ -2915,8 +2996,11 @@ pub async fn hot_scan(
                                         entry_type:
                                             crate::position::manager::EntryType::Opportunity,
                                         quick_profit_taken: false,
+                                        second_profit_taken: false,
                                         peak_price: token.price_native,
                                         current_price: token.price_native,
+                                        kill_switch_triggered: false,
+                                        kill_switch_reason: None,
                                     };
 
                                     if let Err(e) = position_manager.open_position(position).await {

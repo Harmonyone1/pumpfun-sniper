@@ -1,6 +1,7 @@
 //! Profit extraction engine
 //!
 //! Monitors conditions and triggers automatic profit extraction to vault.
+//! Integrates with position manager to extract realized profits.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use super::manager::WalletManager;
 use super::types::{InitiatedBy, TransferReason};
+use crate::position::manager::PositionManager;
 
 /// Extraction configuration
 #[derive(Debug, Clone)]
@@ -51,6 +53,7 @@ impl Default for ExtractionConfig {
 pub struct ProfitExtractor {
     config: ExtractionConfig,
     wallet_manager: Arc<WalletManager>,
+    position_manager: Option<Arc<PositionManager>>,
     last_extraction: Option<chrono::DateTime<Utc>>,
 }
 
@@ -60,6 +63,21 @@ impl ProfitExtractor {
         Self {
             config,
             wallet_manager,
+            position_manager: None,
+            last_extraction: None,
+        }
+    }
+
+    /// Create a new profit extractor with position manager integration
+    pub fn with_position_manager(
+        config: ExtractionConfig,
+        wallet_manager: Arc<WalletManager>,
+        position_manager: Arc<PositionManager>,
+    ) -> Self {
+        Self {
+            config,
+            wallet_manager,
+            position_manager: Some(position_manager),
             last_extraction: None,
         }
     }
@@ -135,9 +153,36 @@ impl ProfitExtractor {
             return Ok(());
         }
 
-        // Rule 2: Profit threshold (requires position manager integration)
-        // TODO: Integrate with position manager to get realized profits
-        // For now, this is a placeholder
+        // Rule 2: Profit threshold - extract realized profits if above threshold
+        let pending_profits = if let Some(ref pm) = self.position_manager {
+            pm.get_pending_extraction().await
+        } else {
+            0.0
+        };
+
+        if pending_profits >= self.config.profit_threshold_sol {
+            // Calculate extraction amount (percentage of profits)
+            let extract_amount = pending_profits * (self.config.profit_percentage / 100.0);
+
+            // Ensure we don't extract more than available
+            let safe_extract = extract_amount.min(hot_balance - 0.1); // Keep minimum 0.1 SOL
+
+            if safe_extract > 0.01 {
+                // Minimum extraction of 0.01 SOL
+                info!(
+                    "Realized profits threshold reached: {:.4} SOL pending, extracting {:.4} SOL ({:.0}%)",
+                    pending_profits, safe_extract, self.config.profit_percentage
+                );
+
+                if self.trigger_extraction(safe_extract, "realized_profits").await.is_ok() {
+                    // Mark profits as extracted in position manager
+                    if let Some(ref pm) = self.position_manager {
+                        pm.mark_profits_extracted(safe_extract).await;
+                    }
+                }
+                return Ok(());
+            }
+        }
 
         debug!(
             "Extraction check complete - hot balance: {} SOL, no extraction triggered",

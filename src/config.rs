@@ -195,7 +195,43 @@ pub struct AutoSellConfig {
     /// Distance from peak to trigger sell (e.g., 15 = sell if drops 15% from peak)
     #[serde(default = "default_trailing_distance")]
     pub trailing_stop_distance_pct: f64,
+
+    // === LAYERED EXITS ===
+    /// Quick profit: sell 50% at this level (first layer)
+    #[serde(default = "default_quick_profit_pct")]
+    pub quick_profit_pct: f64,
+    /// Second profit: sell 25% at this level (second layer)
+    #[serde(default = "default_second_profit_pct")]
+    pub second_profit_pct: f64,
+    /// No-movement exit: exit if price moves less than this % after no_movement_secs
+    #[serde(default = "default_no_movement_threshold")]
+    pub no_movement_threshold_pct: f64,
+    /// Seconds before triggering no-movement exit
+    #[serde(default = "default_no_movement_secs")]
+    pub no_movement_secs: u64,
+
+    // === DYNAMIC TRAILING STOP ===
+    /// Enable dynamic trailing stop that tightens as profit grows
+    #[serde(default = "default_true")]
+    pub dynamic_trailing_enabled: bool,
+    /// Base trailing stop % (used when P&L < 15%)
+    #[serde(default = "default_trailing_base")]
+    pub trailing_stop_base_pct: f64,
+    /// Medium trailing stop % (used when P&L 15-25%)
+    #[serde(default = "default_trailing_medium")]
+    pub trailing_stop_medium_pct: f64,
+    /// Tight trailing stop % (used when P&L > 25%)
+    #[serde(default = "default_trailing_tight")]
+    pub trailing_stop_tight_pct: f64,
 }
+
+fn default_quick_profit_pct() -> f64 { 4.0 }
+fn default_second_profit_pct() -> f64 { 8.0 }
+fn default_no_movement_threshold() -> f64 { 2.0 }
+fn default_no_movement_secs() -> u64 { 120 }
+fn default_trailing_base() -> f64 { 5.0 }
+fn default_trailing_medium() -> f64 { 4.0 }
+fn default_trailing_tight() -> f64 { 3.0 }
 
 fn default_trailing_activation() -> f64 {
     10.0
@@ -731,6 +767,14 @@ impl Default for Config {
                 trailing_stop_enabled: true,
                 trailing_stop_activation_pct: default_trailing_activation(),
                 trailing_stop_distance_pct: default_trailing_distance(),
+                quick_profit_pct: default_quick_profit_pct(),
+                second_profit_pct: default_second_profit_pct(),
+                no_movement_threshold_pct: default_no_movement_threshold(),
+                no_movement_secs: default_no_movement_secs(),
+                dynamic_trailing_enabled: true,
+                trailing_stop_base_pct: default_trailing_base(),
+                trailing_stop_medium_pct: default_trailing_medium(),
+                trailing_stop_tight_pct: default_trailing_tight(),
             },
             safety: SafetyConfig {
                 require_sell_confirmation: true,

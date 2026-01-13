@@ -34,6 +34,38 @@ impl Default for EntryType {
 }
 
 impl EntryType {
+    /// Map wallet category to entry type
+    /// Elite wallets get StrongBuy (tighter stops, higher conviction)
+    /// Unknown/Neutral wallets get Opportunity
+    /// Avoid wallets get Probe (quick scalps only)
+    pub fn from_wallet_category(category: crate::filter::smart_money::WalletCategory) -> Self {
+        use crate::filter::smart_money::WalletCategory;
+        match category {
+            WalletCategory::TrueSignal => EntryType::StrongBuy,
+            WalletCategory::Profitable => EntryType::Opportunity,
+            WalletCategory::Neutral | WalletCategory::Unknown => EntryType::Opportunity,
+            WalletCategory::Unprofitable | WalletCategory::BundledTeam | WalletCategory::MevBot => {
+                EntryType::Probe
+            }
+        }
+    }
+
+    /// Get adjusted stop loss for elite wallet entries
+    /// Elite wallets tend to re-enter quickly, so use tighter stops
+    pub fn stop_loss_pct_for_elite(&self, is_elite: bool) -> f64 {
+        if is_elite {
+            // Tighter stops for elite entries - they'll re-enter if needed
+            match self {
+                EntryType::StrongBuy => 10.0,  // Was 15% - now 10% for elite
+                EntryType::Opportunity => 12.0, // Was 15% - now 12%
+                EntryType::Probe => 8.0,        // Was 12% - now 8%
+                EntryType::Legacy => 12.0,
+            }
+        } else {
+            self.stop_loss_pct()
+        }
+    }
+
     /// Get the take profit target for this entry type
     /// DATA-DRIVEN: Lowered for realistic 2-minute holds
     pub fn take_profit_pct(&self) -> f64 {
@@ -111,12 +143,21 @@ pub struct Position {
     /// Whether quick partial profit has been taken (50% sell at quick_profit_pct)
     #[serde(default)]
     pub quick_profit_taken: bool,
+    /// Whether second partial profit has been taken (25% sell at second_profit_pct)
+    #[serde(default)]
+    pub second_profit_taken: bool,
     /// Peak price seen since entry (for trailing stop)
     #[serde(default)]
     pub peak_price: f64,
     /// Current price (updated by price feed)
     #[serde(skip)]
     pub current_price: f64,
+    /// Kill-switch triggered - exit immediately
+    #[serde(default)]
+    pub kill_switch_triggered: bool,
+    /// Kill-switch reason (if triggered)
+    #[serde(default)]
+    pub kill_switch_reason: Option<String>,
 }
 
 impl Position {
@@ -154,6 +195,10 @@ pub struct DailyStats {
     pub total_profit_sol: f64,
     pub total_loss_sol: f64,
     pub net_pnl_sol: f64,
+    /// Realized profits available for extraction (not yet extracted)
+    pub realized_profit_pending_extraction: f64,
+    /// Total profits extracted to vault today
+    pub extracted_today_sol: f64,
 }
 
 impl DailyStats {
@@ -169,11 +214,25 @@ impl DailyStats {
         if pnl_sol >= 0.0 {
             self.winning_trades += 1;
             self.total_profit_sol += pnl_sol;
+            // Track profits available for extraction
+            self.realized_profit_pending_extraction += pnl_sol;
         } else {
             self.losing_trades += 1;
             self.total_loss_sol += pnl_sol.abs();
         }
         self.net_pnl_sol = self.total_profit_sol - self.total_loss_sol;
+    }
+
+    /// Mark profits as extracted (moved to vault)
+    pub fn mark_extracted(&mut self, amount: f64) {
+        self.realized_profit_pending_extraction =
+            (self.realized_profit_pending_extraction - amount).max(0.0);
+        self.extracted_today_sol += amount;
+    }
+
+    /// Get realized profits pending extraction
+    pub fn pending_extraction(&self) -> f64 {
+        self.realized_profit_pending_extraction
     }
 
     pub fn win_rate(&self) -> f64 {
@@ -342,6 +401,43 @@ impl PositionManager {
         self.save().await
     }
 
+    /// Mark second profit as taken for a position
+    pub async fn mark_second_profit_taken(&self, mint: &str) -> Result<()> {
+        let mut positions = self.positions.write().await;
+        if let Some(position) = positions.get_mut(mint) {
+            position.second_profit_taken = true;
+        }
+        drop(positions);
+        self.save().await
+    }
+
+    /// Trigger kill-switch for a position - forces immediate exit
+    pub async fn trigger_kill_switch(&self, mint: &str, reason: &str) -> Result<()> {
+        let mut positions = self.positions.write().await;
+        if let Some(position) = positions.get_mut(mint) {
+            position.kill_switch_triggered = true;
+            position.kill_switch_reason = Some(reason.to_string());
+            info!(
+                "KILL-SWITCH triggered for {}: {}",
+                position.symbol, reason
+            );
+        }
+        drop(positions);
+        self.save().await
+    }
+
+    /// Check if kill-switch is triggered for a position
+    pub async fn is_kill_switch_triggered(&self, mint: &str) -> Option<String> {
+        let positions = self.positions.read().await;
+        positions.get(mint).and_then(|p| {
+            if p.kill_switch_triggered {
+                p.kill_switch_reason.clone()
+            } else {
+                None
+            }
+        })
+    }
+
     /// Update the token amount for a position (used when actual balance differs from estimate)
     pub async fn update_token_amount(&self, mint: &str, actual_amount: u64) -> Result<()> {
         let mut positions = self.positions.write().await;
@@ -388,6 +484,18 @@ impl PositionManager {
     /// Get daily statistics
     pub async fn get_daily_stats(&self) -> DailyStats {
         self.daily_stats.read().await.clone()
+    }
+
+    /// Get realized profits pending extraction
+    pub async fn get_pending_extraction(&self) -> f64 {
+        self.daily_stats.read().await.pending_extraction()
+    }
+
+    /// Mark profits as extracted (called after successful vault transfer)
+    pub async fn mark_profits_extracted(&self, amount: f64) {
+        let mut stats = self.daily_stats.write().await;
+        stats.mark_extracted(amount);
+        info!("Marked {} SOL as extracted to vault", amount);
     }
 
     /// Check if daily loss limit is reached
