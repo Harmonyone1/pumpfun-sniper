@@ -2804,7 +2804,20 @@ pub async fn hot_scan(
                                         .get_balance(&monitor_wallet)
                                         .unwrap_or(0) as f64
                                         / 1_000_000_000.0;
-                                    let actual_received = (sol_after - sol_before).max(0.0);
+                                    let raw_received = (sol_after - sol_before).max(0.0);
+
+                                    // Sanity check: received SOL shouldn't be more than 10x position cost
+                                    // If it is, the balance query likely failed - use estimate instead
+                                    let max_reasonable = position.total_cost_sol * 10.0;
+                                    let actual_received = if raw_received > max_reasonable {
+                                        warn!(
+                                            "[{}] Balance query anomaly: before={:.4}, after={:.4}, diff={:.4} - using estimate",
+                                            position.symbol, sol_before, sol_after, raw_received
+                                        );
+                                        0.0 // Force fallback to estimate
+                                    } else {
+                                        raw_received
+                                    };
 
                                     // Calculate trade metrics
                                     let hold_secs =
