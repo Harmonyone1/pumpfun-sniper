@@ -2384,6 +2384,25 @@ pub async fn hot_scan(
     let failed_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // Initialize kill-switch evaluator for smart money exits
+    let kill_switch_evaluator: Option<std::sync::Arc<KillSwitchEvaluator>> =
+        if config.smart_money.enabled && config.smart_money.kill_switches.enabled {
+            info!("Initializing kill-switch evaluator for hot_scan...");
+            let evaluator = std::sync::Arc::new(KillSwitchEvaluator::new(
+                config.smart_money.kill_switches.clone(),
+                config.smart_money.holder_watcher.clone(),
+            ));
+            info!(
+                "Kill-switches ENABLED: deployer_sell={}, top_holder_sell={}",
+                config.smart_money.kill_switches.deployer_sell_any,
+                config.smart_money.kill_switches.top_holder_sell
+            );
+            Some(evaluator)
+        } else {
+            info!("Kill-switches disabled in hot_scan mode");
+            None
+        };
+
     let dex_client = DexScreenerClient::new();
     let scan_config = HotScanConfig {
         min_m5_change: min_m5,
@@ -2405,6 +2424,8 @@ pub async fn hot_scan(
         let monitor_bought_mints_path = bought_mints_path.clone();
         let monitor_sold_mints = sold_mints.clone();
         let monitor_failed_mints = failed_mints.clone();
+        let monitor_kill_switch = kill_switch_evaluator.clone();
+        let monitor_helius = helius_client.clone();
         let monitor_use_local_api = use_local_api;
         // Determine which wallet to query for token balances
         let monitor_wallet = if use_local_api {
@@ -2633,11 +2654,21 @@ pub async fn hot_scan(
                     let mut reason = String::new();
 
                     // === KILL-SWITCH CHECK (HIGHEST PRIORITY) ===
-                    // If kill-switch triggered, force immediate exit regardless of P&L
+                    // First check position flag (set by other systems)
                     if let Some(ks_reason) = monitor_positions.is_kill_switch_triggered(&position.mint).await {
                         should_sell = true;
                         reason = format!("KILL-SWITCH: {}", ks_reason);
                         warn!("KILL-SWITCH EXIT: {} - {}", position.symbol, ks_reason);
+                    }
+                    // Then actively evaluate kill-switch conditions
+                    if !should_sell {
+                        if let Some(ref evaluator) = monitor_kill_switch {
+                            if let KillSwitchDecision::Exit(alert) = evaluator.should_exit(&position.mint) {
+                                should_sell = true;
+                                reason = format!("KILL-SWITCH: {} (urgency: {:?})", alert.reason, alert.urgency);
+                                warn!("KILL-SWITCH EXIT: {} - {} [{:?}]", position.symbol, alert.reason, alert.urgency);
+                            }
+                        }
                     }
 
                     // 1. Stop loss
@@ -3168,6 +3199,46 @@ pub async fn hot_scan(
                                         }
                                     } else if actual_balance == 0 {
                                         warn!("Token balance query returned 0 - tx may not have confirmed yet");
+                                    }
+
+                                    // === SET UP KILL-SWITCH MONITORING ===
+                                    // Fetch creator and top holders for this token
+                                    if let Some(ref evaluator) = kill_switch_evaluator {
+                                        if let Some(ref helius) = helius_client {
+                                            // Get token creator
+                                            let creator = match helius.get_token_creator(&token.mint).await {
+                                                Ok(c) => {
+                                                    info!("[{}] Creator for kill-switch: {}", token.symbol, &c[..8]);
+                                                    c
+                                                }
+                                                Err(e) => {
+                                                    warn!("[{}] Could not get creator: {} - using empty", token.symbol, e);
+                                                    String::new()
+                                                }
+                                            };
+
+                                            // Get top holders (address, amount, percentage)
+                                            let holders = match helius.get_token_holders(&token.mint, 10).await {
+                                                Ok(h) => {
+                                                    info!("[{}] Fetched {} top holders for kill-switch monitoring", token.symbol, h.len());
+                                                    h.into_iter()
+                                                        .map(|hi| (hi.address, hi.amount, hi.percentage))
+                                                        .collect::<Vec<_>>()
+                                                }
+                                                Err(e) => {
+                                                    warn!("[{}] Could not get holders: {} - monitoring creator only", token.symbol, e);
+                                                    vec![]
+                                                }
+                                            };
+
+                                            // Start kill-switch monitoring
+                                            evaluator.watch_position(&token.mint, &creator, holders);
+                                            info!(
+                                                "[{}] Kill-switch monitoring ACTIVE (creator: {}, holders: tracked)",
+                                                token.symbol,
+                                                if creator.is_empty() { "unknown" } else { &creator[..8] }
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {
