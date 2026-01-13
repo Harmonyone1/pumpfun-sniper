@@ -267,14 +267,14 @@ pub struct ScoringThresholds {
 impl Default for ScoringThresholds {
     fn default() -> Self {
         Self {
-            strong_buy: 0.65,
-            opportunity: 0.35,
-            probe: 0.15,
-            avoid: -0.3,
-            min_confidence: 0.3,
-            min_data_completeness: 0.5,     // Require 50% data completeness
-            min_enriched_components: 2,       // At least 2 enriched components
-            min_time_since_launch_secs: 15,   // Wait 15s for initial data
+            strong_buy: 0.40,      // Lowered from 0.65 - more aggressive
+            opportunity: 0.10,     // Lowered from 0.35 - allow more opportunities
+            probe: -0.20,          // Lowered from 0.15 - probe even negative scores
+            avoid: -0.50,          // Lowered from -0.3 - only avoid very bad tokens
+            min_confidence: 0.20,  // Lowered from 0.3 - trade with less certainty
+            min_data_completeness: 0.3,     // Lowered from 0.5 - trade with less data
+            min_enriched_components: 1,       // Lowered from 2 - need less enrichment
+            min_time_since_launch_secs: 5,    // Lowered from 15s - faster entry
         }
     }
 }

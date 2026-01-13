@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-use crate::filter::types::WalletHistory;
+use crate::filter::helius::MintInfo;
+use crate::filter::types::{TokenHolderInfo, WalletHistory};
 
 // Submodules for specific cache types
 // pub mod known_actors;
@@ -55,6 +56,50 @@ impl CachedWallet {
     pub fn new(history: WalletHistory, ttl: Duration) -> Self {
         Self {
             history,
+            cached_at: Instant::now(),
+            ttl,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.cached_at.elapsed() > self.ttl
+    }
+}
+
+/// Entry in the holder cache with TTL
+#[derive(Clone)]
+pub struct CachedHolders {
+    pub holders: Vec<TokenHolderInfo>,
+    pub cached_at: Instant,
+    pub ttl: Duration,
+}
+
+impl CachedHolders {
+    pub fn new(holders: Vec<TokenHolderInfo>, ttl: Duration) -> Self {
+        Self {
+            holders,
+            cached_at: Instant::now(),
+            ttl,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.cached_at.elapsed() > self.ttl
+    }
+}
+
+/// Entry in the mint info cache with TTL
+#[derive(Clone)]
+pub struct CachedMintInfo {
+    pub info: MintInfo,
+    pub cached_at: Instant,
+    pub ttl: Duration,
+}
+
+impl CachedMintInfo {
+    pub fn new(info: MintInfo, ttl: Duration) -> Self {
+        Self {
+            info,
             cached_at: Instant::now(),
             ttl,
         }
@@ -172,6 +217,12 @@ pub struct FilterCache {
     /// Wallet data cache (concurrent hashmap)
     wallet_cache: DashMap<String, CachedWallet>,
 
+    /// Token holder cache (mint -> holders)
+    holder_cache: DashMap<String, CachedHolders>,
+
+    /// Mint info cache (mint -> mint authority info)
+    mint_info_cache: DashMap<String, CachedMintInfo>,
+
     /// Known actors (loaded at startup, refreshed periodically)
     known_actors: Arc<RwLock<KnownActors>>,
 
@@ -225,6 +276,8 @@ impl FilterCache {
     pub fn with_config(config: CacheConfig) -> Self {
         Self {
             wallet_cache: DashMap::with_capacity(config.wallet_cache_size),
+            holder_cache: DashMap::with_capacity(config.score_cache_size),
+            mint_info_cache: DashMap::with_capacity(config.score_cache_size),
             known_actors: Arc::new(RwLock::new(KnownActors::default())),
             stats: Arc::new(CacheStats::default()),
             config,
@@ -267,6 +320,44 @@ impl FilterCache {
         }
 
         self.wallet_cache.insert(address.to_string(), entry);
+    }
+
+    /// Get token holders from cache
+    pub fn get_holders(&self, mint: &str) -> Option<Vec<TokenHolderInfo>> {
+        if let Some(entry) = self.holder_cache.get(mint) {
+            if !entry.is_expired() {
+                return Some(entry.holders.clone());
+            }
+            drop(entry);
+            self.holder_cache.remove(mint);
+        }
+        None
+    }
+
+    /// Store token holders in cache
+    pub fn set_holders(&self, mint: &str, holders: Vec<TokenHolderInfo>) {
+        let ttl = Duration::from_secs(self.config.score_cache_ttl_secs);
+        let entry = CachedHolders::new(holders, ttl);
+        self.holder_cache.insert(mint.to_string(), entry);
+    }
+
+    /// Get mint info from cache
+    pub fn get_mint_info(&self, mint: &str) -> Option<MintInfo> {
+        if let Some(entry) = self.mint_info_cache.get(mint) {
+            if !entry.is_expired() {
+                return Some(entry.info.clone());
+            }
+            drop(entry);
+            self.mint_info_cache.remove(mint);
+        }
+        None
+    }
+
+    /// Store mint info in cache
+    pub fn set_mint_info(&self, mint: &str, info: MintInfo) {
+        let ttl = Duration::from_secs(self.config.score_cache_ttl_secs);
+        let entry = CachedMintInfo::new(info, ttl);
+        self.mint_info_cache.insert(mint.to_string(), entry);
     }
 
     /// Check if wallet is a known deployer (fast, cached)
@@ -330,7 +421,19 @@ impl FilterCache {
     /// Clear all caches
     pub async fn clear(&self) {
         self.wallet_cache.clear();
+        self.holder_cache.clear();
+        self.mint_info_cache.clear();
         *self.known_actors.write().await = KnownActors::default();
+    }
+
+    /// Check if we have enriched data for a token (holders + mint info)
+    pub fn has_token_data(&self, mint: &str) -> bool {
+        self.holder_cache.contains_key(mint) || self.mint_info_cache.contains_key(mint)
+    }
+
+    /// Get total number of cached items
+    pub fn total_cached_items(&self) -> usize {
+        self.wallet_cache.len() + self.holder_cache.len() + self.mint_info_cache.len()
     }
 }
 
@@ -365,7 +468,7 @@ mod tests {
         // Test wallet cache
         let history = WalletHistory {
             address: "test".to_string(),
-            total_transactions: 100,
+            total_trades: 100,
             fetched_at: Utc::now(),
             ..Default::default()
         };
@@ -373,7 +476,7 @@ mod tests {
         cache.set_wallet("test", history.clone());
         let retrieved = cache.get_wallet("test");
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().total_transactions, 100);
+        assert_eq!(retrieved.unwrap().total_trades, 100);
     }
 
     #[tokio::test]

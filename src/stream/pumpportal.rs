@@ -10,13 +10,23 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{Error, Result};
+
+/// Command to send to the websocket for dynamic subscriptions
+#[derive(Debug, Clone)]
+pub enum SubscriptionCommand {
+    /// Subscribe to trades for specific tokens
+    SubscribeTokenTrades(Vec<String>),
+    /// Unsubscribe from token trades
+    UnsubscribeTokenTrades(Vec<String>),
+}
 
 /// PumpPortal WebSocket URL
 pub const PUMPPORTAL_WS_URL: &str = "wss://pumpportal.fun/api/data";
@@ -114,11 +124,11 @@ pub struct TradeEvent {
     pub mint: String,
     pub trader_public_key: String,
     pub tx_type: String, // "buy" or "sell"
-    pub token_amount: u64,
-    pub sol_amount: u64,
+    pub token_amount: f64,  // Can have decimals in the API
+    pub sol_amount: f64,    // Already in SOL (not lamports)
     pub bonding_curve_key: String,
-    pub v_tokens_in_bonding_curve: u64,
-    pub v_sol_in_bonding_curve: u64,
+    pub v_tokens_in_bonding_curve: f64,  // Can have decimals
+    pub v_sol_in_bonding_curve: f64,     // Can have decimals
     pub market_cap_sol: f64,
 }
 
@@ -161,23 +171,36 @@ impl Default for PumpPortalConfig {
     }
 }
 
+/// Sender for subscription commands
+pub type CommandSender = mpsc::Sender<SubscriptionCommand>;
+
 /// PumpPortal WebSocket client
 pub struct PumpPortalClient {
     config: PumpPortalConfig,
     event_tx: mpsc::Sender<PumpPortalEvent>,
     shutdown: tokio::sync::broadcast::Sender<()>,
+    command_tx: CommandSender,
+    command_rx: Arc<Mutex<mpsc::Receiver<SubscriptionCommand>>>,
 }
 
 impl PumpPortalClient {
     /// Create a new PumpPortal client
     pub fn new(config: PumpPortalConfig, event_tx: mpsc::Sender<PumpPortalEvent>) -> Self {
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
+        let (command_tx, command_rx) = mpsc::channel::<SubscriptionCommand>(100);
 
         Self {
             config,
             event_tx,
             shutdown,
+            command_tx,
+            command_rx: Arc::new(Mutex::new(command_rx)),
         }
+    }
+
+    /// Get a command sender for dynamic subscriptions
+    pub fn get_command_sender(&self) -> CommandSender {
+        self.command_tx.clone()
     }
 
     /// Start the WebSocket connection
@@ -194,6 +217,7 @@ impl PumpPortalClient {
         let event_tx = self.event_tx.clone();
         let mut shutdown_rx = self.shutdown.subscribe();
         let wallets = track_wallets;
+        let command_rx = self.command_rx.clone();
 
         tokio::spawn(async move {
             let mut reconnect_attempts = 0u32;
@@ -211,6 +235,7 @@ impl PumpPortalClient {
                     subscribe_new_tokens,
                     subscribe_all_trades,
                     &wallets,
+                    &command_rx,
                 )
                 .await
                 {
@@ -264,6 +289,7 @@ impl PumpPortalClient {
         subscribe_new_tokens: bool,
         subscribe_all_trades: bool,
         track_wallets: &[String],
+        command_rx: &Arc<Mutex<mpsc::Receiver<SubscriptionCommand>>>,
     ) -> Result<()> {
         info!("Connecting to PumpPortal WebSocket...");
 
@@ -328,6 +354,45 @@ impl PumpPortalClient {
 
         // Process messages
         loop {
+            // Try to receive commands without blocking
+            {
+                let mut cmd_rx = command_rx.lock().await;
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        SubscriptionCommand::SubscribeTokenTrades(mints) => {
+                            let msg = SubscriptionMessage::subscribe_token_trades(mints.clone());
+                            let json = match serde_json::to_string(&msg) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    error!("Failed to serialize subscription: {}", e);
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = write.send(Message::Text(json)).await {
+                                error!("Failed to send subscription: {}", e);
+                            } else {
+                                info!("Subscribed to trades for {} token(s)", mints.len());
+                            }
+                        }
+                        SubscriptionCommand::UnsubscribeTokenTrades(mints) => {
+                            let msg = SubscriptionMessage::unsubscribe_token_trades(mints.clone());
+                            let json = match serde_json::to_string(&msg) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    error!("Failed to serialize unsubscription: {}", e);
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = write.send(Message::Text(json)).await {
+                                error!("Failed to send unsubscription: {}", e);
+                            } else {
+                                debug!("Unsubscribed from trades for {} token(s)", mints.len());
+                            }
+                        }
+                    }
+                }
+            }
+
             tokio::select! {
                 // Ping to keep connection alive
                 _ = ping_timer.tick() => {
@@ -394,19 +459,27 @@ impl PumpPortalClient {
         }
 
         // Try parsing as trade event
-        if let Ok(trade_event) = serde_json::from_str::<TradeEvent>(text) {
-            debug!(
-                "Trade: {} {} {} tokens for {} SOL",
-                trade_event.tx_type,
-                trade_event.token_amount,
-                trade_event.mint,
-                trade_event.sol_amount as f64 / 1e9
-            );
-            event_tx
-                .send(PumpPortalEvent::Trade(trade_event))
-                .await
-                .map_err(|e| Error::Internal(e.to_string()))?;
-            return Ok(());
+        match serde_json::from_str::<TradeEvent>(text) {
+            Ok(trade_event) => {
+                info!(
+                    "Trade parsed: {} {} {} tokens for {} SOL",
+                    trade_event.tx_type,
+                    trade_event.token_amount,
+                    trade_event.mint,
+                    trade_event.sol_amount
+                );
+                event_tx
+                    .send(PumpPortalEvent::Trade(trade_event))
+                    .await
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                return Ok(());
+            }
+            Err(e) => {
+                // Only log if it looks like a trade event
+                if text.contains("\"txType\":\"buy\"") || text.contains("\"txType\":\"sell\"") {
+                    warn!("Failed to parse trade event: {} - JSON: {}", e, &text[..text.len().min(500)]);
+                }
+            }
         }
 
         // Unknown message format
@@ -442,8 +515,8 @@ impl From<TradeEvent> for crate::stream::decoder::TokenTradeEvent {
             mint: Pubkey::from_str(&event.mint).unwrap_or_default(),
             bonding_curve: Pubkey::from_str(&event.bonding_curve_key).unwrap_or_default(),
             trader: Pubkey::from_str(&event.trader_public_key).unwrap_or_default(),
-            token_amount: event.token_amount,
-            sol_amount: event.sol_amount,
+            token_amount: event.token_amount as u64,  // Truncate to u64
+            sol_amount: (event.sol_amount * 1e9) as u64,  // Convert SOL to lamports
             is_buy: event.tx_type == "buy",
             timestamp: chrono::Utc::now(),
         }

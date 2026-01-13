@@ -35,32 +35,46 @@ impl Default for EntryType {
 
 impl EntryType {
     /// Get the take profit target for this entry type
+    /// DATA-DRIVEN: Lowered for realistic 2-minute holds
     pub fn take_profit_pct(&self) -> f64 {
         match self {
-            EntryType::StrongBuy => 100.0,   // Hold for 2x
-            EntryType::Opportunity => 50.0,   // Standard 50% gain
-            EntryType::Probe => 25.0,         // Quick 25% scalp
-            EntryType::Legacy => 50.0,        // Default
+            EntryType::StrongBuy => 15.0,    // Was 100% - now 15% realistic
+            EntryType::Opportunity => 10.0,   // Was 50% - now 10% for quick profit
+            EntryType::Probe => 8.0,          // Was 25% - now 8% quick scalp
+            EntryType::Legacy => 10.0,        // Default
+        }
+    }
+
+    /// Get the QUICK profit level - exit 50% of position at this level
+    /// This secures profits early before potential dump
+    pub fn quick_profit_pct(&self) -> f64 {
+        match self {
+            EntryType::StrongBuy => 8.0,     // Take 50% off at 8% profit
+            EntryType::Opportunity => 5.0,    // Take 50% off at 5% profit
+            EntryType::Probe => 4.0,          // Take 50% off at 4% profit (very quick)
+            EntryType::Legacy => 5.0,         // Default
         }
     }
 
     /// Get the stop loss threshold for this entry type
+    /// WIDENED: Give trades more room to breathe
     pub fn stop_loss_pct(&self) -> f64 {
         match self {
-            EntryType::StrongBuy => 30.0,    // Wider stop for high conviction
-            EntryType::Opportunity => 20.0,   // Standard stop
-            EntryType::Probe => 15.0,         // Tight stop for learning positions
-            EntryType::Legacy => 30.0,        // Default
+            EntryType::StrongBuy => 15.0,    // Widened from 10% to 15%
+            EntryType::Opportunity => 12.0,   // Widened from 8% to 12%
+            EntryType::Probe => 10.0,         // Widened from 6% to 10%
+            EntryType::Legacy => 12.0,        // Widened from 8% to 12%
         }
     }
 
     /// Get the max hold time in seconds for this entry type
+    /// FASTER EXITS: Don't hold too long in volatile memecoins
     pub fn max_hold_secs(&self) -> Option<u64> {
         match self {
-            EntryType::StrongBuy => None,        // No time limit for high conviction
-            EntryType::Opportunity => Some(300), // 5 min max
-            EntryType::Probe => Some(60),        // 60 second max for probes
-            EntryType::Legacy => None,           // Default no limit
+            EntryType::StrongBuy => Some(180),   // Was None - now 3 min max
+            EntryType::Opportunity => Some(120), // Was 300 - now 2 min max
+            EntryType::Probe => Some(90),        // Was 60 - now 90 sec max
+            EntryType::Legacy => Some(120),      // Default 2 min
         }
     }
 
@@ -94,6 +108,12 @@ pub struct Position {
     /// Entry type/recommendation that led to this position
     #[serde(default)]
     pub entry_type: EntryType,
+    /// Whether quick partial profit has been taken (50% sell at quick_profit_pct)
+    #[serde(default)]
+    pub quick_profit_taken: bool,
+    /// Peak price seen since entry (for trailing stop)
+    #[serde(default)]
+    pub peak_price: f64,
     /// Current price (updated by price feed)
     #[serde(skip)]
     pub current_price: f64,
@@ -303,12 +323,45 @@ impl PositionManager {
         Ok(pnl)
     }
 
-    /// Update current price for a position
+    /// Update current price for a position and track peak price
     pub async fn update_price(&self, mint: &str, price: f64) {
         let mut positions = self.positions.write().await;
         if let Some(position) = positions.get_mut(mint) {
             position.current_price = price;
+            // Track peak price for trailing stop
+            if price > position.peak_price {
+                position.peak_price = price;
+            }
         }
+    }
+
+    /// Mark quick profit as taken for a position
+    pub async fn mark_quick_profit_taken(&self, mint: &str) -> Result<()> {
+        let mut positions = self.positions.write().await;
+        if let Some(position) = positions.get_mut(mint) {
+            position.quick_profit_taken = true;
+        }
+        drop(positions);
+        self.save().await
+    }
+
+    /// Update the token amount for a position (used when actual balance differs from estimate)
+    pub async fn update_token_amount(&self, mint: &str, actual_amount: u64) -> Result<()> {
+        let mut positions = self.positions.write().await;
+        if let Some(position) = positions.get_mut(mint) {
+            let old_amount = position.token_amount;
+            position.token_amount = actual_amount;
+            // Recalculate entry price based on actual tokens received
+            if actual_amount > 0 {
+                position.entry_price = position.total_cost_sol / actual_amount as f64;
+            }
+            info!(
+                "Updated {} token amount: {} -> {} (entry price adjusted to {:.10})",
+                mint, old_amount, actual_amount, position.entry_price
+            );
+        }
+        drop(positions);
+        self.save().await
     }
 
     /// Get a position by mint
@@ -344,6 +397,46 @@ impl PositionManager {
     pub async fn is_daily_loss_limit_reached(&self) -> bool {
         let stats = self.daily_stats.read().await;
         stats.total_loss_sol >= self.safety_config.daily_loss_limit_sol
+    }
+
+    /// Check if we can open a new position with given buy amount
+    /// Returns Ok(()) if allowed, Err with reason if not
+    pub async fn can_open_position(&self, buy_amount: f64) -> Result<()> {
+        // Check daily loss limit first
+        let stats = self.daily_stats.read().await;
+        if stats.total_loss_sol >= self.safety_config.daily_loss_limit_sol {
+            return Err(Error::DailyLossLimitReached {
+                lost: stats.total_loss_sol,
+                limit: self.safety_config.daily_loss_limit_sol,
+            });
+        }
+        drop(stats);
+
+        // Check max position size
+        let total_position_value = self.total_position_value().await;
+        let new_total = total_position_value + buy_amount;
+
+        if new_total > self.safety_config.max_position_sol {
+            return Err(Error::MaxPositionExceeded {
+                current: total_position_value,
+                buy: buy_amount,
+                max: self.safety_config.max_position_sol,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Get remaining capacity for new positions
+    pub async fn remaining_position_capacity(&self) -> f64 {
+        let total = self.total_position_value().await;
+        (self.safety_config.max_position_sol - total).max(0.0)
+    }
+
+    /// Get daily loss remaining before limit
+    pub async fn remaining_daily_loss(&self) -> f64 {
+        let stats = self.daily_stats.read().await;
+        (self.safety_config.daily_loss_limit_sol - stats.total_loss_sol).max(0.0)
     }
 
     /// Reset daily stats (call at UTC midnight)

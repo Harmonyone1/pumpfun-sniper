@@ -93,27 +93,27 @@ impl WalletBehaviorSignalProvider {
 
         // Try to get cached wallet history
         if let Some(history) = self.cache.get_wallet(&context.creator) {
-            // Wallet age signal
+            // Wallet age signal - reduced penalties for pump.fun (all wallets are new)
             let age_days = history.age_days().unwrap_or(0.0) as i64;
             let age_signal = if age_days < 1 {
                 Signal::new(
                     SignalType::WalletAge,
-                    -0.7,
-                    0.9,
+                    -0.15,  // Reduced from -0.7 - new wallets normal on pump.fun
+                    0.4,    // Low confidence - less meaningful signal
                     format!("Very new wallet: {} days old", age_days),
                 )
             } else if age_days < 7 {
                 Signal::new(
                     SignalType::WalletAge,
-                    -0.4,
-                    0.8,
+                    -0.10,  // Reduced from -0.4
+                    0.4,
                     format!("New wallet: {} days old", age_days),
                 )
             } else if age_days < 30 {
                 Signal::new(
                     SignalType::WalletAge,
-                    -0.1,
-                    0.7,
+                    0.0,    // Neutral - was -0.1
+                    0.5,
                     format!("Moderately new wallet: {} days old", age_days),
                 )
             } else if age_days < 90 {
@@ -134,7 +134,7 @@ impl WalletBehaviorSignalProvider {
             signals.push(age_signal.with_latency(start.elapsed()).with_cached(true));
 
             // Transaction count signal
-            let tx_count = history.total_transactions;
+            let tx_count = history.total_trades;
             let tx_signal = if tx_count < 5 {
                 Signal::new(
                     SignalType::WalletHistory,
@@ -184,7 +184,7 @@ impl WalletBehaviorSignalProvider {
 
             // Win rate (if we have enough data)
             if history.tokens_traded >= 5 {
-                let win_rate = history.win_rate;
+                let win_rate = history.win_rate();
                 let performance_signal = if win_rate > 0.7 {
                     Signal::new(
                         SignalType::WalletPriorPerformance,

@@ -152,7 +152,19 @@ pub struct AutoSellConfig {
     pub partial_take_profit: bool,
     #[serde(default = "default_price_poll_interval_ms")]
     pub price_poll_interval_ms: u64,
+    /// Enable trailing stop to lock in profits
+    #[serde(default = "default_true")]
+    pub trailing_stop_enabled: bool,
+    /// Profit % to activate trailing stop (e.g., 10 = activate at 10% profit)
+    #[serde(default = "default_trailing_activation")]
+    pub trailing_stop_activation_pct: f64,
+    /// Distance from peak to trigger sell (e.g., 15 = sell if drops 15% from peak)
+    #[serde(default = "default_trailing_distance")]
+    pub trailing_stop_distance_pct: f64,
 }
+
+fn default_trailing_activation() -> f64 { 10.0 }
+fn default_trailing_distance() -> f64 { 15.0 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SafetyConfig {
@@ -670,6 +682,9 @@ impl Default for Config {
                 stop_loss_pct: default_stop_loss_pct(),
                 partial_take_profit: false,
                 price_poll_interval_ms: default_price_poll_interval_ms(),
+                trailing_stop_enabled: true,
+                trailing_stop_activation_pct: default_trailing_activation(),
+                trailing_stop_distance_pct: default_trailing_distance(),
             },
             safety: SafetyConfig {
                 require_sell_confirmation: true,

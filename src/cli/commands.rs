@@ -3,9 +3,11 @@
 use anyhow::Result;
 use dialoguer::Confirm;
 use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
+use std::str::FromStr;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::filter::{AdaptiveFilter, MetadataSignalProvider, Recommendation, SignalContext, WalletBehaviorSignalProvider};
@@ -14,7 +16,46 @@ use crate::stream::pumpportal::{PumpPortalClient, PumpPortalEvent};
 use crate::stream::shredstream::ShredStreamClient;
 use crate::trading::pumpportal_api::PumpPortalTrader;
 use crate::strategy::engine::StrategyEngine;
-use crate::strategy::types::{TradingAction, ExitReason};
+use crate::strategy::types::TradingAction;
+
+/// Query actual token balance for a wallet and mint
+/// Returns the token balance or 0 if not found
+fn query_token_balance(
+    rpc_client: &solana_client::rpc_client::RpcClient,
+    wallet: &Pubkey,
+    mint: &str,
+) -> u64 {
+    use solana_client::rpc_request::TokenAccountsFilter;
+
+    let mint_pubkey = match Pubkey::from_str(mint) {
+        Ok(pk) => pk,
+        Err(_) => return 0,
+    };
+
+    match rpc_client.get_token_accounts_by_owner(
+        wallet,
+        TokenAccountsFilter::Mint(mint_pubkey),
+    ) {
+        Ok(accounts) => {
+            if let Some(account) = accounts.first() {
+                // Parse the token account data to get balance
+                if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
+                    if let Some(info) = parsed.parsed.get("info") {
+                        if let Some(token_amount) = info.get("tokenAmount") {
+                            if let Some(amount_str) = token_amount.get("amount") {
+                                if let Some(amount) = amount_str.as_str() {
+                                    return amount.parse::<u64>().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        }
+        Err(_) => 0,
+    }
+}
 
 /// Start the sniper bot
 pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
@@ -173,137 +214,188 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     // Wrap trader in Arc for sharing across tasks
     let trader_arc: Option<std::sync::Arc<PumpPortalTrader>> = pumpportal_trader.map(std::sync::Arc::new);
 
-    // Price feed runs in background, checking positions for TP/SL
+    // === IMPROVED POSITION MONITOR WITH LOCAL FALLBACK ===
+    // Features: Trailing stop, no-movement exit, quick profit, retry with local fallback
     if config.auto_sell.enabled && !dry_run {
-        let price_feed_config = config.clone();
-        let price_feed_positions = position_manager.clone();
-        let price_feed_trader = trader_arc.clone();
-        let price_feed_strategy = strategy_engine.clone();
-        tokio::spawn(async move {
-            let poll_interval = std::time::Duration::from_millis(price_feed_config.auto_sell.price_poll_interval_ms);
-            loop {
-                tokio::time::sleep(poll_interval).await;
+        let monitor_config = config.clone();
+        let monitor_positions = position_manager.clone();
+        let monitor_trader = trader_arc.clone();
+        let monitor_keypair = keypair.clone();
+        let monitor_rpc = rpc_client.clone();
 
-                // Check chain health if strategy engine is enabled
-                if let Some(ref engine) = price_feed_strategy {
-                    let engine_guard = engine.read().await;
-                    if engine_guard.should_pause_trading().await {
-                        tracing::debug!("Strategy engine indicates trading pause - skipping exit checks");
-                        continue;
-                    }
+        tokio::spawn(async move {
+            info!("=== POSITION MONITOR STARTED ===");
+            info!("Features: Trailing Stop (3%), No-Movement Exit (60s), Quick Profit, LOCAL FALLBACK");
+
+            // Track sell attempts for retry logic
+            let mut sell_attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                let positions = monitor_positions.get_all_positions().await;
+                if positions.is_empty() {
+                    continue;
                 }
 
-                // Check positions for TP/SL triggers
-                for position in price_feed_positions.get_all_positions().await {
+                for position in positions {
                     let current_price = position.current_price;
-                    if current_price > 0.0 {
-                        let pnl_pct = position.unrealized_pnl_pct();
-                        let hold_time_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
+                    if current_price <= 0.0 {
+                        continue;
+                    }
 
-                        // If strategy engine is available, use it for exit decisions
-                        if let Some(ref engine) = price_feed_strategy {
-                            let mut engine_guard = engine.write().await;
+                    // CONFIRMATION WAIT: Skip positions less than 10 seconds old
+                    // This gives time for buy tx to confirm and ATA to be created
+                    let position_age_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
+                    if position_age_secs < 10 {
+                        continue; // Too new, wait for confirmation
+                    }
 
-                            // Update price in strategy engine
-                            engine_guard.update_price(&position.mint, current_price, 0.0);
+                    // Calculate P&L from entry
+                    let pnl_pct = if position.entry_price > 0.0 {
+                        ((current_price - position.entry_price) / position.entry_price) * 100.0
+                    } else {
+                        0.0
+                    };
 
-                            // Check for exit signals from strategy engine
-                            if let Some(exit_signal) = engine_guard.check_exit(
-                                &position.mint,
-                                position.entry_price,
-                                current_price,
-                                pnl_pct,
-                                hold_time_secs,
-                            ).await {
-                                let sell_pct = format!("{}%", exit_signal.pct_to_sell as u32);
-                                let reason_str = match &exit_signal.reason {
-                                    ExitReason::TakeProfit { pnl_pct } => format!("Take profit at {:.1}%", pnl_pct),
-                                    ExitReason::StopLoss { loss_pct } => format!("Stop loss at -{:.1}%", loss_pct),
-                                    ExitReason::TrailingStopHit { peak_pnl_pct, current_pnl_pct } =>
-                                        format!("Trailing stop (peak: {:.1}%, now: {:.1}%)", peak_pnl_pct, current_pnl_pct),
-                                    ExitReason::MomentumFade => "Momentum fade".to_string(),
-                                    ExitReason::MaxHoldTime { held_secs } => format!("Max hold time {}s", held_secs),
-                                    ExitReason::RugPredicted { probability } => format!("Rug predicted ({:.0}%)", probability * 100.0),
-                                    ExitReason::CreatorSelling { pct_sold } => format!("Creator selling ({:.1}%)", pct_sold),
-                                    ExitReason::WhaleExited { .. } => "Whale exited".to_string(),
-                                    ExitReason::FatalRisk { risk } => format!("Fatal risk: {}", risk),
-                                    ExitReason::ManualExit => "Manual exit".to_string(),
-                                };
+                    // Calculate drop from peak (for trailing stop)
+                    let peak_price = if position.peak_price > 0.0 { position.peak_price } else { position.entry_price };
+                    let drop_from_peak_pct = if peak_price > 0.0 {
+                        ((peak_price - current_price) / peak_price) * 100.0
+                    } else {
+                        0.0
+                    };
 
-                                info!(
-                                    "Strategy exit signal for {}: {} (sell {})",
-                                    position.mint, reason_str, sell_pct
-                                );
+                    let hold_time_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
 
-                                if let Some(ref trader) = price_feed_trader {
-                                    let slippage = price_feed_config.trading.slippage_bps / 100;
-                                    let priority_fee = price_feed_config.trading.priority_fee_lamports as f64 / 1e9;
-                                    match trader.sell(&position.mint, &sell_pct, slippage, priority_fee).await {
-                                        Ok(sig) => {
-                                            info!("Strategy sell executed: {}", sig);
-                                            // Record the exit in strategy engine
-                                            let realized_pnl = position.total_cost_sol * (pnl_pct / 100.0);
-                                            engine_guard.record_exit(&position.mint, realized_pnl).await;
-                                        }
-                                        Err(e) => error!("Strategy sell failed: {}", e),
-                                    }
-                                }
-                                continue; // Skip basic TP/SL if strategy triggered
-                            }
-                        }
+                    // Get entry-type-specific thresholds
+                    let tp_pct = position.entry_type.take_profit_pct();
+                    let sl_pct = position.entry_type.stop_loss_pct();
+                    let quick_profit_pct = position.entry_type.quick_profit_pct();
+                    let max_hold = position.entry_type.max_hold_secs();
 
-                        // Fallback to basic TP/SL if strategy engine not available or didn't trigger
-                        // Use CONTEXT-AWARE exit parameters based on entry type
-                        let tp_pct = position.entry_type.take_profit_pct();
-                        let sl_pct = position.entry_type.stop_loss_pct();
-                        let max_hold = position.entry_type.max_hold_secs();
+                    // Trailing stop: 3% drop from peak (only if we're in profit)
+                    let trailing_stop_pct = 3.0;
+                    // No-movement exit: 60 seconds with less than 2% movement
+                    let no_movement_secs = 60;
+                    let no_movement_threshold = 2.0;
 
-                        // Check max hold time (especially important for Probe positions)
+                    let mut should_sell = false;
+                    let mut sell_pct = "100%";
+                    let mut reason = String::new();
+
+                    // 1. Check stop loss FIRST (cut losses quickly)
+                    if pnl_pct <= -sl_pct {
+                        should_sell = true;
+                        reason = format!("STOP LOSS at {:.1}% (limit: -{:.0}%)", pnl_pct, sl_pct);
+                    }
+
+                    // 2. Check trailing stop (only if in profit and dropped from peak)
+                    if !should_sell && pnl_pct > 0.0 && drop_from_peak_pct >= trailing_stop_pct {
+                        should_sell = true;
+                        reason = format!("TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%)", drop_from_peak_pct, pnl_pct);
+                    }
+
+                    // 3. Check take profit
+                    if !should_sell && pnl_pct >= tp_pct {
+                        should_sell = true;
+                        reason = format!("TAKE PROFIT at {:.1}% (target: {:.0}%)", pnl_pct, tp_pct);
+                    }
+
+                    // 4. Check quick profit (partial exit)
+                    if !should_sell && !position.quick_profit_taken && pnl_pct >= quick_profit_pct && pnl_pct < tp_pct {
+                        should_sell = true;
+                        sell_pct = "50%";
+                        reason = format!("QUICK PROFIT at {:.1}% - selling 50%", pnl_pct);
+                    }
+
+                    // 5. Check no-movement exit (60s with <2% move either way)
+                    if !should_sell && hold_time_secs >= no_movement_secs && pnl_pct.abs() < no_movement_threshold {
+                        should_sell = true;
+                        reason = format!("NO MOVEMENT: {:.1}% after {}s - exiting stale position", pnl_pct, hold_time_secs);
+                    }
+
+                    // 6. Check max hold time last (safety net)
+                    if !should_sell {
                         if let Some(max_secs) = max_hold {
                             if hold_time_secs >= max_secs {
-                                warn!(
-                                    "Max hold time ({} seconds) reached for {} (entry type: {:?})",
-                                    max_secs, position.mint, position.entry_type
-                                );
-                                if let Some(ref trader) = price_feed_trader {
-                                    let slippage = price_feed_config.trading.slippage_bps / 100;
-                                    let priority_fee = price_feed_config.trading.priority_fee_lamports as f64 / 1e9;
-                                    match trader.sell(&position.mint, "100%", slippage, priority_fee).await {
-                                        Ok(sig) => info!("Max hold sell executed: {}", sig),
-                                        Err(e) => error!("Max hold sell failed: {}", e),
+                                should_sell = true;
+                                reason = format!("MAX HOLD TIME ({} secs) P&L: {:.1}%", max_secs, pnl_pct);
+                            }
+                        }
+                    }
+
+                    // Execute sell if triggered
+                    if should_sell {
+                        warn!(
+                            "AUTO-SELL TRIGGERED: {} ({}) - {}",
+                            position.symbol, position.mint, reason
+                        );
+
+                        if let Some(ref trader) = monitor_trader {
+                            let slippage = monitor_config.trading.slippage_bps / 100;
+                            let priority_fee = monitor_config.trading.priority_fee_lamports as f64 / 1e9;
+
+                            // Retry logic: try up to 3 times with Lightning, then try local fallback
+                            let attempts = sell_attempts.entry(position.mint.clone()).or_insert(0);
+                            *attempts += 1;
+
+                            if *attempts > 5 {
+                                error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
+                                // Estimate received SOL as 0 since sell failed
+                                let _ = monitor_positions.close_position(&position.mint, position.token_amount, 0.0).await;
+                                sell_attempts.remove(&position.mint);
+                                continue;
+                            }
+
+                            // Try Lightning API first (attempts 1-3)
+                            let sell_result: Result<String, crate::error::Error> = if *attempts <= 3 {
+                                info!("Attempting Lightning API sell (attempt {})", attempts);
+                                trader.sell(&position.mint, sell_pct, slippage, priority_fee).await
+                            } else {
+                                // Attempts 4-5: Try local signing fallback
+                                warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
+                                trader.sell_local(&position.mint, sell_pct, slippage, priority_fee, &monitor_keypair, &monitor_rpc).await
+                            };
+
+                            match sell_result {
+                                Ok(sig) => {
+                                    info!("AUTO-SELL EXECUTED: {} - {}", position.symbol, sig);
+                                    sell_attempts.remove(&position.mint);
+
+                                    // Calculate trade metrics
+                                    let hold_secs = (chrono::Utc::now() - position.entry_time).num_seconds();
+                                    let price_change_pct = ((current_price - position.entry_price) / position.entry_price) * 100.0;
+
+                                    if sell_pct == "50%" {
+                                        // Partial exit - mark quick profit taken
+                                        let half_amount = position.token_amount / 2;
+                                        // Estimate received SOL based on current price (minus ~2% slippage estimate)
+                                        let estimated_received = (half_amount as f64 * current_price) * 0.98;
+                                        let pnl_sol = estimated_received - (position.total_cost_sol / 2.0);
+                                        let _ = monitor_positions.close_position(&position.mint, half_amount, estimated_received).await;
+                                        let _ = monitor_positions.mark_quick_profit_taken(&position.mint).await;
+                                        info!("=== TRADE CLOSED (Partial) ===");
+                                        info!("  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                              position.symbol, position.entry_price, current_price, price_change_pct);
+                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
+                                              half_amount, estimated_received, pnl_sol, hold_secs);
+                                    } else {
+                                        // Full exit
+                                        // Estimate received SOL based on current price (minus ~2% slippage estimate)
+                                        let estimated_received = (position.token_amount as f64 * current_price) * 0.98;
+                                        let pnl_sol = estimated_received - position.total_cost_sol;
+                                        let pnl_pct = (pnl_sol / position.total_cost_sol) * 100.0;
+                                        let _ = monitor_positions.close_position(&position.mint, position.token_amount, estimated_received).await;
+                                        info!("=== TRADE CLOSED (Full) ===");
+                                        info!("  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                              position.symbol, position.entry_price, current_price, price_change_pct);
+                                        info!("  Cost: {:.4} SOL | Received: {:.4} SOL | P&L: {:+.4} SOL ({:+.1}%) | Hold: {}s",
+                                              position.total_cost_sol, estimated_received, pnl_sol, pnl_pct, hold_secs);
                                     }
                                 }
-                                continue; // Skip other checks, we're exiting
-                            }
-                        }
-
-                        // Check take profit (using entry type's target)
-                        if pnl_pct >= tp_pct {
-                            info!(
-                                "Take profit triggered for {} at {:.1}% gain (target: {:.1}%, entry type: {:?})",
-                                position.mint, pnl_pct, tp_pct, position.entry_type
-                            );
-                            if let Some(ref trader) = price_feed_trader {
-                                let slippage = price_feed_config.trading.slippage_bps / 100;
-                                let priority_fee = price_feed_config.trading.priority_fee_lamports as f64 / 1e9;
-                                match trader.sell(&position.mint, "100%", slippage, priority_fee).await {
-                                    Ok(sig) => info!("TP sell executed: {}", sig),
-                                    Err(e) => error!("TP sell failed: {}", e),
-                                }
-                            }
-                        }
-                        // Check stop loss (using entry type's threshold)
-                        else if pnl_pct <= -(sl_pct) {
-                            warn!(
-                                "Stop loss triggered for {} at {:.1}% loss (limit: -{:.1}%, entry type: {:?})",
-                                position.mint, pnl_pct, sl_pct, position.entry_type
-                            );
-                            if let Some(ref trader) = price_feed_trader {
-                                let slippage = price_feed_config.trading.slippage_bps / 100;
-                                let priority_fee = price_feed_config.trading.priority_fee_lamports as f64 / 1e9;
-                                match trader.sell(&position.mint, "100%", slippage, priority_fee).await {
-                                    Ok(sig) => info!("SL sell executed: {}", sig),
-                                    Err(e) => error!("SL sell failed: {}", e),
+                                Err(e) => {
+                                    error!("AUTO-SELL FAILED for {} (attempt {}): {}", position.symbol, attempts, e);
                                 }
                             }
                         }
@@ -646,6 +738,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             entry_time: chrono::Utc::now(),
                                             entry_signature: signature.clone(),
                                             entry_type,
+                                            quick_profit_taken: false,
+                                            peak_price: estimated_price,
                                             current_price: estimated_price,
                                         };
 
@@ -756,7 +850,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                             // Calculate liquidity from bonding curve
                             // Note: PumpPortal sends values in SOL, not lamports
-                            let liquidity_sol = if trade.v_sol_in_bonding_curve < 1000 {
+                            let liquidity_sol = if trade.v_sol_in_bonding_curve < 1000.0 {
                                 trade.v_sol_in_bonding_curve as f64
                             } else {
                                 trade.v_sol_in_bonding_curve as f64 / 1e9
@@ -810,6 +904,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 entry_time: chrono::Utc::now(),
                                                 entry_signature: sig.clone(),
                                                 entry_type: crate::position::manager::EntryType::Probe, // Conservative for trade-based entries
+                                                quick_profit_taken: false,
+                                                peak_price: estimated_price,
                                                 current_price: estimated_price,
                                             };
                                             if let Err(e) = position_manager.open_position(position).await {
@@ -1526,6 +1622,776 @@ pub async fn wallet_emergency(
             println!("No emergency lock active - operations are normal.");
             println!("\nTo activate emergency lock: snipe wallet emergency --shutdown");
         }
+    }
+
+    Ok(())
+}
+
+/// Transfer SOL between wallets
+pub async fn wallet_transfer(
+    config: &Config,
+    from: &str,
+    to: &str,
+    amount: f64,
+    force: bool,
+) -> Result<()> {
+    use solana_sdk::signature::Signer;
+    use std::str::FromStr;
+
+    info!("Initiating transfer of {} SOL from {} to {}", amount, from, to);
+
+    // Load source wallet
+    let from_path = format!("{}/{}/keypair.json", config.wallet.credentials_dir, from);
+    if !std::path::Path::new(&from_path).exists() {
+        anyhow::bail!("Source wallet '{}' not found", from);
+    }
+
+    let from_data = std::fs::read_to_string(&from_path)?;
+    let from_secret: Vec<u8> = serde_json::from_str(&from_data)?;
+    let from_keypair = solana_sdk::signature::Keypair::from_bytes(&from_secret)?;
+
+    // Determine destination address
+    let to_pubkey = if to.len() >= 32 && to.len() <= 44 {
+        // Looks like a base58 address
+        solana_sdk::pubkey::Pubkey::from_str(to)?
+    } else {
+        // It's a wallet name - load the pubkey
+        let to_path = format!("{}/{}/keypair.json", config.wallet.credentials_dir, to);
+        if !std::path::Path::new(&to_path).exists() {
+            anyhow::bail!("Destination wallet '{}' not found", to);
+        }
+        let to_data = std::fs::read_to_string(&to_path)?;
+        let to_secret: Vec<u8> = serde_json::from_str(&to_data)?;
+        let to_keypair = solana_sdk::signature::Keypair::from_bytes(&to_secret)?;
+        to_keypair.pubkey()
+    };
+
+    // Check safety limits
+    if amount > config.wallet.safety.max_single_transfer_sol {
+        anyhow::bail!(
+            "Transfer amount {} SOL exceeds max_single_transfer_sol limit of {} SOL",
+            amount,
+            config.wallet.safety.max_single_transfer_sol
+        );
+    }
+
+    // Confirmation
+    if !force && amount > config.wallet.safety.confirm_above_sol {
+        use dialoguer::Confirm;
+        let confirmed = Confirm::new()
+            .with_prompt(format!(
+                "Transfer {} SOL from {} to {}?",
+                amount,
+                from,
+                to_pubkey
+            ))
+            .interact()?;
+
+        if !confirmed {
+            println!("Transfer cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Execute transfer
+    let rpc_client = solana_client::rpc_client::RpcClient::new_with_timeout(
+        config.rpc.endpoint.clone(),
+        std::time::Duration::from_millis(config.rpc.timeout_ms),
+    );
+
+    let lamports = (amount * 1e9) as u64;
+    let balance = rpc_client.get_balance(&from_keypair.pubkey())?;
+
+    if balance < lamports + 5000 {
+        anyhow::bail!(
+            "Insufficient balance: have {} SOL, need {} SOL + fees",
+            balance as f64 / 1e9,
+            amount
+        );
+    }
+
+    let recent_blockhash = rpc_client.get_latest_blockhash()?;
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &from_keypair.pubkey(),
+            &to_pubkey,
+            lamports,
+        )],
+        Some(&from_keypair.pubkey()),
+        &[&from_keypair],
+        recent_blockhash,
+    );
+
+    let sig = rpc_client.send_and_confirm_transaction(&tx)?;
+    info!("Transfer successful: {}", sig);
+    println!("Transferred {} SOL from {} to {}", amount, from, to_pubkey);
+    println!("Signature: {}", sig);
+
+    Ok(())
+}
+
+/// Scan existing tokens for opportunities
+pub async fn scan(
+    _config: &Config,
+    min_liquidity: f64,
+    max_liquidity: f64,
+    min_volume: f64,
+    limit: usize,
+    auto_buy: bool,
+    _buy_amount: f64,
+    format: &str,
+    watch: bool,
+    interval: u64,
+) -> Result<()> {
+    use crate::dexscreener::{DexScreenerClient, HotScanConfig};
+
+    info!("Starting token scan (liquidity: {}-{} SOL, volume >= {} SOL)", min_liquidity, max_liquidity, min_volume);
+
+    let client = DexScreenerClient::new();
+    let scan_config = HotScanConfig {
+        min_liquidity_usd: min_liquidity * 150.0, // Rough SOL to USD conversion
+        max_market_cap: max_liquidity * 150.0 * 100.0, // Max liquidity implies max mcap
+        ..Default::default()
+    };
+
+    loop {
+        let tokens = client.scan_hot_tokens(&scan_config).await?;
+        let tokens: Vec<_> = tokens.into_iter().take(limit).collect();
+
+        if format == "json" {
+            println!("{}", serde_json::to_string_pretty(&tokens.iter().map(|t| {
+                serde_json::json!({
+                    "mint": t.mint,
+                    "symbol": t.symbol,
+                    "name": t.name,
+                    "m5_change": t.m5_change,
+                    "liquidity_usd": t.liquidity_usd,
+                    "market_cap": t.market_cap,
+                    "score": t.score()
+                })
+            }).collect::<Vec<_>>())?);
+        } else {
+            println!("\n{:=<80}", "");
+            println!("Found {} tokens matching criteria:", tokens.len());
+            println!("{:-<80}", "");
+
+            for (i, token) in tokens.iter().enumerate() {
+                println!(
+                    "{}. {} ({}) | M5: {:+.1}% | MCap: ${:.0}k | Liq: ${:.0}k | Score: {:.1}",
+                    i + 1,
+                    token.symbol,
+                    &token.mint[..8],
+                    token.m5_change,
+                    token.market_cap / 1000.0,
+                    token.liquidity_usd / 1000.0,
+                    token.score()
+                );
+            }
+
+            if auto_buy && !tokens.is_empty() {
+                warn!("AUTO-BUY enabled - this is AGGRESSIVE mode!");
+                // TODO: Implement auto-buy logic
+            }
+        }
+
+        if !watch {
+            break;
+        }
+
+        info!("Waiting {} seconds until next scan...", interval);
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
+
+    Ok(())
+}
+
+/// Scan DexScreener for hot tokens with momentum
+pub async fn hot_scan(
+    config: &Config,
+    min_m5: f64,
+    min_ratio: f64,
+    min_liquidity: f64,
+    max_mcap: f64,
+    auto_buy: bool,
+    buy_amount: f64,
+    dry_run: bool,
+    watch: bool,
+    interval: u64,
+    jito: bool, // Enable Jito bundles for Local API trades
+) -> Result<()> {
+    use crate::dexscreener::{DexScreenerClient, HotScanConfig};
+    use solana_sdk::signature::Signer;
+
+    info!("=== HOT TOKEN SCANNER ===");
+    info!("Criteria: M5 >= {:.1}%, Ratio >= {:.1}, Liq >= ${:.0}, MCap <= ${:.0}", min_m5, min_ratio, min_liquidity, max_mcap);
+
+    if auto_buy {
+        warn!("AUTO-BUY enabled with {} SOL per trade", buy_amount);
+        if dry_run {
+            warn!("DRY-RUN mode - no real trades will be executed");
+        }
+    }
+
+    // Jito bundle support note
+    if jito {
+        warn!("--jito flag enabled: Jito bundles will be used for Local API trades (requires config.pumpportal.use_local_api = true)");
+        warn!("Note: Jito bundles provide MEV protection and faster confirmation, but require tip configuration in config.toml");
+    }
+
+    // Load keypair
+    let keypair_path = std::env::var("KEYPAIR_PATH")
+        .unwrap_or_else(|_| format!("{}/hot-trading/keypair.json", config.wallet.credentials_dir));
+    let keypair_data = std::fs::read_to_string(&keypair_path)?;
+    let secret_key: Vec<u8> = serde_json::from_str(&keypair_data)?;
+    let keypair = std::sync::Arc::new(solana_sdk::signature::Keypair::from_bytes(&secret_key)?);
+    info!("Using wallet: {}", keypair.pubkey());
+
+    // Initialize RPC
+    let rpc_client = std::sync::Arc::new(solana_client::rpc_client::RpcClient::new_with_timeout(
+        config.rpc.endpoint.clone(),
+        std::time::Duration::from_millis(config.rpc.timeout_ms),
+    ));
+
+    // Initialize trader
+    let use_local_api = config.pumpportal.api_key.is_empty();
+    let trader = if config.pumpportal.use_for_trading {
+        if use_local_api {
+            info!("Using Local API (sign + send locally)");
+            Some(std::sync::Arc::new(crate::trading::pumpportal_api::PumpPortalTrader::local()))
+        } else {
+            info!("Using Lightning API (0.5% fee)");
+            Some(std::sync::Arc::new(crate::trading::pumpportal_api::PumpPortalTrader::lightning(config.pumpportal.api_key.clone())))
+        }
+    } else {
+        None
+    };
+
+    // Initialize position manager for tracking
+    let position_manager = std::sync::Arc::new(crate::position::manager::PositionManager::new(
+        config.safety.clone(),
+        Some(format!("{}/positions.json", config.wallet.credentials_dir)),
+    ));
+    position_manager.load().await?;
+
+    // Track already-bought mints this session with persistence (mint -> timestamp)
+    // TTL: Remove entries older than 24 hours to allow re-buying of rebounding tokens
+    const BOUGHT_MINTS_TTL_HOURS: i64 = 24;
+    let bought_mints_path = format!("{}/bought_mints.json", config.wallet.credentials_dir);
+    let bought_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> = {
+        // Load from file if exists and prune stale entries
+        let now = chrono::Utc::now().timestamp();
+        let ttl_secs = BOUGHT_MINTS_TTL_HOURS * 3600;
+        let loaded: std::collections::HashMap<String, i64> = if std::path::Path::new(&bought_mints_path).exists() {
+            match std::fs::read_to_string(&bought_mints_path) {
+                Ok(data) => {
+                    // Try new format (HashMap with timestamps)
+                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, i64>>(&data) {
+                        let before = map.len();
+                        let pruned: std::collections::HashMap<String, i64> = map.into_iter()
+                            .filter(|(_, ts)| now - ts < ttl_secs)
+                            .collect();
+                        let removed = before - pruned.len();
+                        if removed > 0 {
+                            info!("Pruned {} stale entries from bought_mints (TTL: {}h)", removed, BOUGHT_MINTS_TTL_HOURS);
+                        }
+                        info!("Loaded {} bought mints from session state", pruned.len());
+                        pruned
+                    } else if let Ok(mints) = serde_json::from_str::<Vec<String>>(&data) {
+                        // Migrate old format (Vec<String>) to new format with current timestamp
+                        info!("Migrating {} bought mints from legacy format", mints.len());
+                        mints.into_iter().map(|m| (m, now)).collect()
+                    } else {
+                        std::collections::HashMap::new()
+                    }
+                }
+                Err(_) => std::collections::HashMap::new(),
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+        std::sync::Arc::new(tokio::sync::Mutex::new(loaded))
+    };
+    let bought_mints_path = std::sync::Arc::new(bought_mints_path);
+
+    let dex_client = DexScreenerClient::new();
+    let scan_config = HotScanConfig {
+        min_m5_change: min_m5,
+        min_buy_sell_ratio: min_ratio,
+        min_liquidity_usd: min_liquidity,
+        max_market_cap: max_mcap,
+        ..Default::default()
+    };
+
+    // === POSITION MONITOR BACKGROUND TASK ===
+    if config.auto_sell.enabled && !dry_run {
+        let monitor_config = config.clone();
+        let monitor_positions = position_manager.clone();
+        let monitor_trader = trader.clone();
+        let monitor_keypair = keypair.clone();
+        let monitor_rpc = rpc_client.clone();
+        let monitor_dex = DexScreenerClient::new();
+
+        tokio::spawn(async move {
+            info!("=== POSITION MONITOR STARTED ===");
+            let poll_interval_ms = monitor_config.auto_sell.price_poll_interval_ms;
+            info!("Features: Trailing Stop (3%), No-Movement Exit (60s), Quick Profit, LOCAL FALLBACK");
+            info!("Poll interval: {}ms", poll_interval_ms);
+
+            let mut sell_attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            // Track confirmed positions (tx landed and ATA exists)
+            let mut confirmed_positions: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+
+                let positions = monitor_positions.get_all_positions().await;
+                if positions.is_empty() {
+                    continue;
+                }
+
+                // Fetch current prices from DexScreener with fallback handling
+                for position in positions {
+                    // Get current price from DexScreener with retry
+                    let price_result = monitor_dex.get_token_info(&position.mint).await;
+
+                    let current_price = match price_result {
+                        Ok(Some(token_info)) => {
+                            if token_info.price_native > 0.0 {
+                                token_info.price_native
+                            } else {
+                                // Zero price from API - use last known price if available
+                                if position.current_price > 0.0 {
+                                    warn!("[{}] DexScreener returned 0 price, using last known: {:.10}",
+                                          position.symbol, position.current_price);
+                                    position.current_price
+                                } else {
+                                    continue;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Token not found on DexScreener - use last known price
+                            if position.current_price > 0.0 {
+                                warn!("[{}] Not found on DexScreener, using last known price: {:.10}",
+                                      position.symbol, position.current_price);
+                                position.current_price
+                            } else {
+                                warn!("[{}] Not found on DexScreener and no last price - skipping", position.symbol);
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            // API error - use last known price as fallback
+                            if position.current_price > 0.0 {
+                                warn!("[{}] DexScreener error: {} - using last known price: {:.10}",
+                                      position.symbol, e, position.current_price);
+                                position.current_price
+                            } else {
+                                error!("[{}] DexScreener error and no fallback price: {}", position.symbol, e);
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Update position price
+                    monitor_positions.update_price(&position.mint, current_price).await;
+
+                    // Small delay between API calls to avoid rate limiting
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    // Get updated position with peak_price tracked
+                    let position = match monitor_positions.get_position(&position.mint).await {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    // TX CONFIRMATION CHECK: Verify buy tx confirmed before allowing sells
+                    if !confirmed_positions.contains(&position.mint) {
+                        let position_age_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
+
+                        // First 5 seconds: just wait
+                        if position_age_secs < 5 {
+                            continue;
+                        }
+
+                        // After 5 seconds: check if we have tokens
+                        let wallet_pubkey = monitor_keypair.pubkey();
+                        let token_balance = query_token_balance(&monitor_rpc, &wallet_pubkey, &position.mint);
+
+                        if token_balance > 0 {
+                            info!("[{}] TX CONFIRMED - token balance: {}", position.symbol, token_balance);
+                            confirmed_positions.insert(position.mint.clone());
+                        } else if position_age_secs > 30 {
+                            // After 30 seconds with no tokens, assume tx failed
+                            warn!("[{}] TX LIKELY FAILED - no tokens after 30s, removing position", position.symbol);
+                            let _ = monitor_positions.close_position(&position.mint, position.token_amount, 0.0).await;
+                            continue;
+                        } else {
+                            // Still waiting for confirmation
+                            continue;
+                        }
+                    }
+
+                    // Calculate P&L from entry
+                    let pnl_pct = if position.entry_price > 0.0 {
+                        ((current_price - position.entry_price) / position.entry_price) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    // Calculate drop from peak (for trailing stop)
+                    let peak_price = if position.peak_price > 0.0 { position.peak_price } else { position.entry_price };
+                    let drop_from_peak_pct = if peak_price > 0.0 {
+                        ((peak_price - current_price) / peak_price) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    let hold_time_secs = (chrono::Utc::now() - position.entry_time).num_seconds().max(0) as u64;
+
+                    // Get entry-type-specific thresholds
+                    let tp_pct = position.entry_type.take_profit_pct();
+                    let sl_pct = position.entry_type.stop_loss_pct();
+                    let quick_profit_pct = position.entry_type.quick_profit_pct();
+                    let max_hold = position.entry_type.max_hold_secs();
+
+                    // Log position status periodically
+                    if hold_time_secs % 15 == 0 {
+                        info!(
+                            "[{}] Price: {:.10} | P&L: {:+.1}% | Peak: {:+.1}% | Hold: {}s",
+                            position.symbol, current_price, pnl_pct,
+                            if peak_price > position.entry_price {
+                                ((peak_price - position.entry_price) / position.entry_price) * 100.0
+                            } else { 0.0 },
+                            hold_time_secs
+                        );
+                    }
+
+                    let trailing_stop_pct = 3.0;
+                    let no_movement_secs = 60;
+                    let no_movement_threshold = 2.0;
+
+                    let mut should_sell = false;
+                    let mut sell_pct = "100%";
+                    let mut reason = String::new();
+
+                    // 1. Stop loss
+                    if pnl_pct <= -sl_pct {
+                        should_sell = true;
+                        reason = format!("STOP LOSS at {:.1}% (limit: -{:.0}%)", pnl_pct, sl_pct);
+                    }
+
+                    // 2. Trailing stop (only if in profit and dropped from peak)
+                    if !should_sell && pnl_pct > 0.0 && drop_from_peak_pct >= trailing_stop_pct {
+                        should_sell = true;
+                        reason = format!("TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%)", drop_from_peak_pct, pnl_pct);
+                    }
+
+                    // 3. Take profit
+                    if !should_sell && pnl_pct >= tp_pct {
+                        should_sell = true;
+                        reason = format!("TAKE PROFIT at {:.1}% (target: {:.0}%)", pnl_pct, tp_pct);
+                    }
+
+                    // 4. Quick profit (partial exit)
+                    if !should_sell && !position.quick_profit_taken && pnl_pct >= quick_profit_pct && pnl_pct < tp_pct {
+                        should_sell = true;
+                        sell_pct = "50%";
+                        reason = format!("QUICK PROFIT at {:.1}% - selling 50%", pnl_pct);
+                    }
+
+                    // 5. No-movement exit
+                    if !should_sell && hold_time_secs >= no_movement_secs && pnl_pct.abs() < no_movement_threshold {
+                        should_sell = true;
+                        reason = format!("NO MOVEMENT: {:.1}% after {}s", pnl_pct, hold_time_secs);
+                    }
+
+                    // 6. Max hold time
+                    if !should_sell {
+                        if let Some(max_secs) = max_hold {
+                            if hold_time_secs >= max_secs {
+                                should_sell = true;
+                                reason = format!("MAX HOLD TIME ({} secs) P&L: {:.1}%", max_secs, pnl_pct);
+                            }
+                        }
+                    }
+
+                    // Execute sell
+                    if should_sell {
+                        warn!("AUTO-SELL TRIGGERED: {} ({}) - {}", position.symbol, position.mint, reason);
+
+                        if let Some(ref trader) = monitor_trader {
+                            let slippage = monitor_config.trading.slippage_bps / 100;
+                            let priority_fee = monitor_config.trading.priority_fee_lamports as f64 / 1e9;
+
+                            let attempts = sell_attempts.entry(position.mint.clone()).or_insert(0);
+                            *attempts += 1;
+
+                            if *attempts > 5 {
+                                error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
+                                // Estimate received SOL as 0 since sell failed
+                                let _ = monitor_positions.close_position(&position.mint, position.token_amount, 0.0).await;
+                                sell_attempts.remove(&position.mint);
+                                continue;
+                            }
+
+                            // Try Lightning API first (attempts 1-3), then local (attempts 4-5)
+                            let sell_result: std::result::Result<String, crate::error::Error> = if *attempts <= 3 {
+                                info!("Attempting Lightning API sell (attempt {})", attempts);
+                                trader.sell(&position.mint, sell_pct, slippage, priority_fee).await
+                            } else {
+                                warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
+                                trader.sell_local(&position.mint, sell_pct, slippage, priority_fee, &monitor_keypair, &monitor_rpc).await
+                            };
+
+                            match sell_result {
+                                Ok(sig) => {
+                                    info!("AUTO-SELL EXECUTED: {} - {}", position.symbol, sig);
+                                    sell_attempts.remove(&position.mint);
+
+                                    // Calculate trade metrics
+                                    let hold_secs = (chrono::Utc::now() - position.entry_time).num_seconds();
+                                    let price_change_pct = ((current_price - position.entry_price) / position.entry_price) * 100.0;
+
+                                    if sell_pct == "50%" {
+                                        let half_amount = position.token_amount / 2;
+                                        // Estimate received SOL based on current price (minus ~2% slippage estimate)
+                                        let estimated_received = (half_amount as f64 * current_price) * 0.98;
+                                        let pnl_sol = estimated_received - (position.total_cost_sol / 2.0);
+                                        let _ = monitor_positions.close_position(&position.mint, half_amount, estimated_received).await;
+                                        let _ = monitor_positions.mark_quick_profit_taken(&position.mint).await;
+                                        info!("=== TRADE CLOSED (Partial) ===");
+                                        info!("  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                              position.symbol, position.entry_price, current_price, price_change_pct);
+                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
+                                              half_amount, estimated_received, pnl_sol, hold_secs);
+                                    } else {
+                                        // Estimate received SOL based on current price (minus ~2% slippage estimate)
+                                        let estimated_received = (position.token_amount as f64 * current_price) * 0.98;
+                                        let pnl_sol = estimated_received - position.total_cost_sol;
+                                        let pnl_pct = (pnl_sol / position.total_cost_sol) * 100.0;
+                                        let _ = monitor_positions.close_position(&position.mint, position.token_amount, estimated_received).await;
+                                        info!("=== TRADE CLOSED (Full) ===");
+                                        info!("  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
+                                              position.symbol, position.entry_price, current_price, price_change_pct);
+                                        info!("  Cost: {:.4} SOL | Received: {:.4} SOL | P&L: {:+.4} SOL ({:+.1}%) | Hold: {}s",
+                                              position.total_cost_sol, estimated_received, pnl_sol, pnl_pct, hold_secs);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("AUTO-SELL FAILED for {} (attempt {}): {}", position.symbol, attempts, e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Main scan loop
+    loop {
+        println!("\n{:=<80}", "");
+        println!("Scanning DexScreener for hot tokens...");
+
+        let hot_tokens = dex_client.scan_hot_tokens(&scan_config).await?;
+
+        if hot_tokens.is_empty() {
+            println!("No tokens matching criteria found.");
+        } else {
+            println!("Found {} hot tokens:", hot_tokens.len());
+            println!("{:-<80}", "");
+
+            for (i, token) in hot_tokens.iter().take(10).enumerate() {
+                let boost_indicator = if token.is_boosted { " [BOOSTED]" } else { "" };
+                println!(
+                    "{}. {} ({}) | M5: {:+.1}% H1: {:+.1}% | Ratio: {:.1} | MCap: ${:.0}k | Liq: ${:.0}k | Score: {:.1}{}",
+                    i + 1,
+                    token.symbol,
+                    &token.mint[..8],
+                    token.m5_change,
+                    token.h1_change,
+                    token.buy_sell_ratio,
+                    token.market_cap / 1000.0,
+                    token.liquidity_usd / 1000.0,
+                    token.score(),
+                    boost_indicator
+                );
+            }
+
+            // Auto-buy logic
+            if auto_buy {
+                // PRE-TRADE VALIDATION: Check if we can trade at all
+                if position_manager.is_daily_loss_limit_reached().await {
+                    warn!("TRADING PAUSED: Daily loss limit reached. Monitoring positions only.");
+                } else {
+                    let mut bought = bought_mints.lock().await;
+
+                    for token in hot_tokens.iter().take(3) {
+                        if bought.contains_key(&token.mint) {
+                            info!("Skipping {} - already bought this session", token.symbol);
+                            continue;
+                        }
+
+                        // Check if we already have a position
+                        if position_manager.get_position(&token.mint).await.is_some() {
+                            info!("Skipping {} - already have position", token.symbol);
+                            continue;
+                        }
+
+                        // PRE-TRADE VALIDATION: Check position limits BEFORE trading
+                        if let Err(e) = position_manager.can_open_position(buy_amount).await {
+                            warn!("Cannot open position for {}: {} - stopping buy loop", token.symbol, e);
+                            break; // Stop trying to buy more tokens
+                        }
+
+                        info!("AUTO-BUY candidate: {} ({}) score={:.1}", token.symbol, token.mint, token.score());
+
+                        // POOL READINESS CHECK: Verify pump.fun pool exists before buying
+                        if let Some(ref trader) = trader {
+                            if !trader.check_pool_ready(&token.mint).await {
+                                warn!("Skipping {} - pool not ready (may be too new)", token.symbol);
+                                continue;
+                            }
+                        }
+
+                        if dry_run {
+                            warn!("DRY-RUN: Would buy {:.4} SOL of {}", buy_amount, token.symbol);
+                            bought.insert(token.mint.clone(), chrono::Utc::now().timestamp());
+                            // Persist bought_mints to disk (with timestamps)
+                            if let Ok(data) = serde_json::to_string_pretty(&*bought) {
+                                let _ = std::fs::write(&*bought_mints_path, data);
+                            }
+                            continue;
+                        }
+
+                        if let Some(ref trader) = trader {
+                            let slippage = config.trading.slippage_bps / 100;
+                            let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
+
+                            info!("Buying {} SOL of {} via {}", buy_amount, token.symbol, if use_local_api { "Local API" } else { "Lightning" });
+
+                            let buy_result = if use_local_api {
+                                trader.buy_local(&token.mint, buy_amount, slippage, priority_fee, &keypair, &rpc_client).await
+                            } else {
+                                trader.buy(&token.mint, buy_amount, slippage, priority_fee).await
+                            };
+
+                            match buy_result {
+                                Ok(sig) => {
+                                    info!("BUY EXECUTED: {} - {}", token.symbol, sig);
+                                    bought.insert(token.mint.clone(), chrono::Utc::now().timestamp());
+                                    // Persist bought_mints to disk (with timestamps)
+                                    if let Ok(data) = serde_json::to_string_pretty(&*bought) {
+                                        let _ = std::fs::write(&*bought_mints_path, data);
+                                    }
+
+                                    // Record position
+                                    let estimated_tokens = (buy_amount / token.price_native) as u64;
+                                    let position = crate::position::manager::Position {
+                                        mint: token.mint.clone(),
+                                        name: token.name.clone(),
+                                        symbol: token.symbol.clone(),
+                                        bonding_curve: String::new(), // Not available from DexScreener
+                                        token_amount: estimated_tokens,
+                                        entry_price: token.price_native,
+                                        total_cost_sol: buy_amount,
+                                        entry_time: chrono::Utc::now(),
+                                        entry_signature: sig,
+                                        entry_type: crate::position::manager::EntryType::Opportunity,
+                                        quick_profit_taken: false,
+                                        peak_price: token.price_native,
+                                        current_price: token.price_native,
+                                    };
+
+                                    if let Err(e) = position_manager.open_position(position).await {
+                                        error!("Failed to record position: {}", e);
+                                    }
+
+                                    // Wait for tx confirmation, then query actual token balance
+                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                    let actual_balance = query_token_balance(&rpc_client, &keypair.pubkey(), &token.mint);
+                                    if actual_balance > 0 && actual_balance != estimated_tokens {
+                                        info!("Actual token balance: {} (estimated: {})", actual_balance, estimated_tokens);
+                                        // Update position with actual balance
+                                        if let Err(e) = position_manager.update_token_amount(&token.mint, actual_balance).await {
+                                            warn!("Failed to update token amount: {}", e);
+                                        }
+                                    } else if actual_balance == 0 {
+                                        warn!("Token balance query returned 0 - tx may not have confirmed yet");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("BUY FAILED for {}: {}", token.symbol, e);
+                                    // Mark as bought to avoid retrying failed tokens
+                                    bought.insert(token.mint.clone(), chrono::Utc::now().timestamp());
+                                    // Persist bought_mints to disk (with timestamps)
+                                    if let Ok(data) = serde_json::to_string_pretty(&*bought) {
+                                        let _ = std::fs::write(&*bought_mints_path, data);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !watch {
+            break;
+        }
+
+        // === TELEMETRY & MONITORING ===
+        let positions = position_manager.get_all_positions().await;
+        let daily_stats = position_manager.get_daily_stats().await;
+        let bought_count = bought_mints.lock().await.len();
+
+        // Session Stats Summary
+        println!("\n{:=<80}", "");
+        println!("SESSION STATS:");
+        println!("  Tokens Bought: {} | Open Positions: {}", bought_count, positions.len());
+        println!("  Daily Trades: {} | Wins: {} | Losses: {} | Win Rate: {:.1}%",
+            daily_stats.total_trades,
+            daily_stats.winning_trades,
+            daily_stats.losing_trades,
+            daily_stats.win_rate()
+        );
+        println!("  Profit: {:.4} SOL | Loss: {:.4} SOL | Net P&L: {:.4} SOL",
+            daily_stats.total_profit_sol,
+            daily_stats.total_loss_sol,
+            daily_stats.net_pnl_sol
+        );
+
+        // Position Details
+        if !positions.is_empty() {
+            println!("\n--- Open Positions: {} ---", positions.len());
+            let mut total_unrealized = 0.0;
+            for pos in &positions {
+                let hold_time = (chrono::Utc::now() - pos.entry_time).num_seconds();
+                let pnl_pct = pos.unrealized_pnl_pct();
+                total_unrealized += pos.unrealized_pnl();
+                println!(
+                    "  {} | Entry: {:.10} | P&L: {:+.1}% | Hold: {}s | TP: {:.0}% SL: -{:.0}%",
+                    pos.symbol,
+                    pos.entry_price,
+                    pnl_pct,
+                    hold_time,
+                    pos.entry_type.take_profit_pct(),
+                    pos.entry_type.stop_loss_pct()
+                );
+            }
+            println!("  Total Unrealized P&L: {:+.4} SOL", total_unrealized);
+        }
+
+        // Remaining capacity
+        let remaining_capacity = position_manager.remaining_position_capacity().await;
+        let remaining_loss = position_manager.remaining_daily_loss().await;
+        println!("\n  Remaining Position Capacity: {:.4} SOL", remaining_capacity);
+        println!("  Remaining Daily Loss Buffer: {:.4} SOL", remaining_loss);
+        println!("{:=<80}", "");
+
+        info!("Next scan in {} seconds...", interval);
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
     }
 
     Ok(())

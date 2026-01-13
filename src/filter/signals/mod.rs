@@ -89,6 +89,16 @@ pub enum SignalType {
     SymbolQuality,
     /// Metadata URI patterns
     UriAnalysis,
+
+    // === Token Authority Signals ===
+    /// Mint authority status (can creator mint more tokens?)
+    MintAuthority,
+    /// Freeze authority status (can creator freeze accounts?)
+    FreezeAuthority,
+
+    // === Holder Distribution Signals ===
+    /// Token holder concentration analysis
+    HolderConcentration,
 }
 
 impl SignalType {
@@ -102,7 +112,11 @@ impl SignalType {
                 | SignalType::SymbolQuality
                 | SignalType::UriAnalysis
                 | SignalType::LiquiditySeeding
-                | SignalType::WalletAge // Only if cached
+                | SignalType::WalletAge         // Only if cached
+                | SignalType::MintAuthority     // If cached from Helius
+                | SignalType::FreezeAuthority   // If cached from Helius
+                | SignalType::HolderConcentration // If cached from Helius
+                | SignalType::WalletHistory     // If cached from Helius
         )
     }
 
@@ -137,6 +151,13 @@ impl SignalType {
             SignalType::NameQuality => 0.5,
             SignalType::SymbolQuality => 0.3,
             SignalType::UriAnalysis => 0.4,
+
+            // CRITICAL - Token authority signals
+            SignalType::MintAuthority => 2.5,    // Can mint more = instant rug
+            SignalType::FreezeAuthority => 2.0,  // Can freeze accounts
+
+            // Holder distribution signals
+            SignalType::HolderConcentration => 1.5,
         }
     }
 
@@ -172,6 +193,12 @@ impl SignalType {
             SignalType::NameQuality | SignalType::SymbolQuality | SignalType::UriAnalysis => {
                 SignalCategory::Metadata
             }
+
+            SignalType::MintAuthority | SignalType::FreezeAuthority => {
+                SignalCategory::Distribution // Authority signals relate to token control
+            }
+
+            SignalType::HolderConcentration => SignalCategory::Distribution,
         }
     }
 }

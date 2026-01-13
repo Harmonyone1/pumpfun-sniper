@@ -551,25 +551,62 @@ impl StrategyEngine {
         randomizer.jitter_exit_delay()
     }
 
-    /// Check if trading should be paused
-    pub async fn should_pause_trading(&self) -> bool {
+    /// Check if trading should be paused, returning the reason if paused
+    pub async fn should_pause_trading_with_reason(&self) -> Option<String> {
         // Check chain health
         let chain_health = self.chain_health.read().await;
+        let chain_state = chain_health.get_state();
+        tracing::debug!(
+            "Chain health check: congestion={:?}, block_entries={}",
+            chain_state.congestion_level,
+            chain_health.should_block_entries()
+        );
         if chain_health.should_block_entries() {
-            return true;
+            return Some(format!("Chain congestion: {:?}", chain_state.congestion_level));
         }
         drop(chain_health);
 
         // Check execution quality
         let exec_feedback = self.execution_feedback.read().await;
         let quality = exec_feedback.get_quality();
+        tracing::debug!(
+            "Execution quality check: fill_rate={:.2}, slippage={:.2}, should_pause={}",
+            quality.recent_fill_rate,
+            quality.recent_avg_slippage,
+            quality.should_pause_trading
+        );
         if quality.should_pause_trading {
-            return true;
+            return Some(format!(
+                "Poor execution quality: fill_rate={:.1}%, avg_slippage={:.1}%",
+                quality.recent_fill_rate * 100.0,
+                quality.recent_avg_slippage
+            ));
         }
+        drop(exec_feedback);
 
         // Check portfolio circuit breaker
         let portfolio = self.portfolio_risk.read().await;
-        !portfolio.get_state().can_open_new
+        let state = portfolio.get_state();
+        tracing::debug!(
+            "Portfolio check: positions={}, exposure={:.3}, can_open={}, reason={:?}",
+            state.open_position_count,
+            state.total_exposure_sol,
+            state.can_open_new,
+            state.reason_if_blocked
+        );
+        if !state.can_open_new {
+            return Some(format!(
+                "Portfolio blocked: {}",
+                state.reason_if_blocked.as_deref().unwrap_or("unknown")
+            ));
+        }
+
+        None
+    }
+
+    /// Check if trading should be paused (convenience method)
+    pub async fn should_pause_trading(&self) -> bool {
+        self.should_pause_trading_with_reason().await.is_some()
     }
 
     /// Get current portfolio state

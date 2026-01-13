@@ -15,7 +15,7 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{Error, Result};
 
@@ -161,6 +161,25 @@ impl PumpPortalTrader {
         slippage_pct: u32,
         priority_fee: f64,
     ) -> Result<String> {
+        self.buy_with_pool(mint, sol_amount, slippage_pct, priority_fee, PoolType::Auto).await
+    }
+
+    /// Buy tokens using Lightning API with specific pool
+    ///
+    /// # Arguments
+    /// * `mint` - Token mint address
+    /// * `sol_amount` - Amount of SOL to spend
+    /// * `slippage_pct` - Slippage percentage (e.g., 25 for 25%)
+    /// * `priority_fee` - Priority fee in SOL
+    /// * `pool` - Pool type (Pump, Raydium, Auto)
+    pub async fn buy_with_pool(
+        &self,
+        mint: &str,
+        sol_amount: f64,
+        slippage_pct: u32,
+        priority_fee: f64,
+        pool: PoolType,
+    ) -> Result<String> {
         let api_key = self
             .api_key
             .as_ref()
@@ -173,7 +192,7 @@ impl PumpPortalTrader {
             denominated_in_sol: "true".to_string(),
             slippage: slippage_pct,
             priority_fee,
-            pool: Some(PoolType::Pump),
+            pool: Some(pool),
         };
 
         info!(
@@ -206,7 +225,7 @@ impl PumpPortalTrader {
 
         trade_response
             .signature
-            .ok_or_else(|| Error::TransactionSend("No signature in response".to_string()))
+            .ok_or_else(|| Error::TransactionSend("No signature in response - API returned empty result".to_string()))
     }
 
     /// Execute a sell using Lightning API
@@ -242,10 +261,10 @@ impl PumpPortalTrader {
             denominated_in_sol: denominated_in_sol.to_string(),
             slippage: slippage_pct,
             priority_fee,
-            pool: Some(PoolType::Pump),
+            pool: Some(PoolType::Auto), // Auto-detect pool (handles graduated tokens)
         };
 
-        info!("Executing sell: {} of token {}", amount, mint);
+        info!("Executing sell: {} of token {} (pool: auto)", amount, mint);
 
         let response = self
             .client
@@ -260,13 +279,21 @@ impl PumpPortalTrader {
             .await
             .map_err(|e| Error::Deserialization(format!("Failed to parse response: {}", e)))?;
 
+        // Check for error (singular)
         if let Some(error) = trade_response.error {
             return Err(Error::TransactionSend(error));
         }
 
+        // Check for errors (plural) - API sometimes returns errors as array
+        if let Some(errors) = trade_response.errors {
+            if !errors.is_empty() {
+                return Err(Error::TransactionSend(errors.join("; ")));
+            }
+        }
+
         trade_response
             .signature
-            .ok_or_else(|| Error::TransactionSend("No signature in response".to_string()))
+            .ok_or_else(|| Error::TransactionSend("No signature in response - API returned empty result".to_string()))
     }
 
     /// Get unsigned transaction for buy (Local API)
@@ -289,10 +316,10 @@ impl PumpPortalTrader {
             slippage: slippage_pct,
             priority_fee,
             public_key: public_key.to_string(),
-            pool: Some(PoolType::Pump),
+            pool: Some(PoolType::Auto), // Auto-detect pool
         };
 
-        debug!("Getting buy transaction from Local API");
+        debug!("Getting buy transaction from Local API (pool: auto)");
 
         let response = self
             .client
@@ -342,10 +369,10 @@ impl PumpPortalTrader {
             slippage: slippage_pct,
             priority_fee,
             public_key: public_key.to_string(),
-            pool: Some(PoolType::Pump),
+            pool: Some(PoolType::Auto), // Auto-detect pool (handles graduated tokens)
         };
 
-        debug!("Getting sell transaction from Local API");
+        debug!("Getting sell transaction from Local API (pool: auto)");
 
         let response = self
             .client
@@ -443,6 +470,152 @@ impl PumpPortalTrader {
         Ok(signature.to_string())
     }
 
+    /// Execute a buy with retry logic and confirmation checking
+    ///
+    /// Retries with increasing slippage if transaction fails due to slippage exceeded (error 6005).
+    /// Waits for transaction confirmation before returning.
+    ///
+    /// # Arguments
+    /// * `mint` - Token mint address
+    /// * `sol_amount` - Amount of SOL to spend
+    /// * `initial_slippage_pct` - Starting slippage percentage (will increase on retry)
+    /// * `priority_fee` - Priority fee in SOL
+    /// * `keypair` - Keypair to sign the transaction
+    /// * `rpc_client` - RPC client to send the transaction
+    /// * `max_retries` - Maximum number of retry attempts (default 3)
+    pub async fn buy_local_with_retry(
+        &self,
+        mint: &str,
+        sol_amount: f64,
+        initial_slippage_pct: u32,
+        priority_fee: f64,
+        keypair: &Keypair,
+        rpc_client: &RpcClient,
+        max_retries: u32,
+    ) -> Result<String> {
+        use solana_sdk::signature::Signature;
+        use std::str::FromStr;
+        use std::time::Duration;
+        use tokio::time::sleep;
+
+        let mut slippage = initial_slippage_pct.max(30); // Start at minimum 30%
+        let slippage_increment = 15; // Add 15% on each retry
+        let max_slippage = 75; // Cap at 75% for volatile memecoins
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                // Increase slippage for retry
+                slippage = (slippage + slippage_increment).min(max_slippage);
+                info!(
+                    "Retry attempt {} with increased slippage: {}%",
+                    attempt, slippage
+                );
+            }
+
+            // Get fresh transaction with current slippage
+            let public_key = keypair.pubkey().to_string();
+            let tx_bytes = match self
+                .get_buy_transaction(mint, sol_amount, slippage, priority_fee, &public_key)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!("Failed to get transaction: {}", e);
+                    if attempt < max_retries {
+                        sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+
+            // Deserialize and sign
+            let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
+                .map_err(|e| Error::Deserialization(format!("Failed to deserialize: {}", e)))?;
+
+            let message_bytes = tx.message.serialize();
+            let signature = keypair.sign_message(&message_bytes);
+            tx.signatures[0] = signature;
+
+            // Send transaction
+            use solana_client::rpc_config::RpcSendTransactionConfig;
+            use solana_sdk::commitment_config::CommitmentLevel;
+
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: Some(CommitmentLevel::Confirmed),
+                ..Default::default()
+            };
+
+            let sig = match rpc_client.send_transaction_with_config(&tx, config) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to send transaction: {}", e);
+                    if attempt < max_retries {
+                        sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    return Err(Error::TransactionSend(format!("RPC send failed: {}", e)));
+                }
+            };
+
+            info!("Transaction sent (attempt {}): {}", attempt + 1, sig);
+
+            // Wait for confirmation (up to 30 seconds)
+            let sig_parsed = Signature::from_str(&sig.to_string())
+                .map_err(|e| Error::Deserialization(format!("Invalid signature: {}", e)))?;
+
+            for _ in 0..30 {
+                sleep(Duration::from_secs(1)).await;
+
+                match rpc_client.get_signature_status(&sig_parsed) {
+                    Ok(Some(status)) => {
+                        match status {
+                            Ok(()) => {
+                                info!("Transaction CONFIRMED: {}", sig);
+                                return Ok(sig.to_string());
+                            }
+                            Err(tx_err) => {
+                                // Check if it's slippage error (Custom 6005)
+                                let err_str = format!("{:?}", tx_err);
+                                if err_str.contains("6005") || err_str.contains("Slippage") {
+                                    tracing::warn!(
+                                        "Slippage exceeded on attempt {}, will retry with higher slippage",
+                                        attempt + 1
+                                    );
+                                    break; // Break inner loop to retry
+                                } else {
+                                    // Other error, don't retry
+                                    return Err(Error::TransactionSend(format!(
+                                        "Transaction failed: {:?}",
+                                        tx_err
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Still pending, continue waiting
+                        debug!("Transaction still pending...");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Error checking status: {}", e);
+                    }
+                }
+            }
+
+            // If we get here, either timed out or slippage error - retry
+            if attempt < max_retries {
+                tracing::warn!("Transaction not confirmed, retrying...");
+            }
+        }
+
+        Err(Error::TransactionSend(format!(
+            "Failed after {} attempts - slippage may be too volatile",
+            max_retries + 1
+        )))
+    }
+
     /// Execute a sell using Local API (sign and send yourself)
     pub async fn sell_local(
         &self,
@@ -497,6 +670,339 @@ impl PumpPortalTrader {
         info!("Transaction sent! Signature: {}", signature);
 
         Ok(signature.to_string())
+    }
+
+    /// Execute a buy using Jito bundles with fallback to regular RPC
+    ///
+    /// Tries Jito first for MEV protection, falls back to regular RPC if Jito fails.
+    pub async fn buy_with_jito(
+        &self,
+        mint: &str,
+        sol_amount: f64,
+        slippage_pct: u32,
+        keypair: &Keypair,
+        jito_client: &crate::trading::jito::JitoClient,
+        rpc_client: &RpcClient,
+    ) -> Result<String> {
+        use crate::trading::jito::BundleStatus;
+        use solana_sdk::{
+            message::Message,
+            system_instruction,
+            transaction::Transaction,
+        };
+
+        let public_key = keypair.pubkey().to_string();
+
+        info!(
+            "Executing Jito buy: {} SOL for token {} (signer: {})",
+            sol_amount, mint, public_key
+        );
+
+        // Get recommended tip from Jito
+        let tip_lamports = jito_client.get_recommended_tip().await.unwrap_or(100000);
+        info!("Using Jito tip: {} lamports ({:.6} SOL)", tip_lamports, tip_lamports as f64 / 1e9);
+
+        // Get unsigned transaction from PumpPortal
+        let tx_bytes = match self
+            .get_buy_transaction(mint, sol_amount, slippage_pct, 0.00001, &public_key)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to get transaction from PumpPortal: {}", e);
+                return Err(e);
+            }
+        };
+
+        debug!("Got unsigned transaction from PumpPortal ({} bytes)", tx_bytes.len());
+
+        // Deserialize as VersionedTransaction
+        let mut buy_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
+            .map_err(|e| Error::Deserialization(format!("Failed to deserialize transaction: {}", e)))?;
+
+        // Sign the buy transaction
+        let message_bytes = buy_tx.message.serialize();
+        let signature = keypair.sign_message(&message_bytes);
+        buy_tx.signatures[0] = signature;
+
+        // Try Jito first
+        let jito_result = async {
+            // Get a random Jito tip account
+            let tip_account = jito_client.get_tip_account();
+
+            // Get recent blockhash for tip transaction
+            let blockhash = rpc_client.get_latest_blockhash()
+                .map_err(|e| Error::TransactionBuild(format!("Failed to get blockhash: {}", e)))?;
+
+            // Create tip transaction
+            let tip_ix = system_instruction::transfer(
+                &keypair.pubkey(),
+                &tip_account,
+                tip_lamports,
+            );
+
+            let tip_message = Message::new(&[tip_ix], Some(&keypair.pubkey()));
+            let mut tip_tx = Transaction::new_unsigned(tip_message);
+            tip_tx.sign(&[keypair], blockhash);
+
+            debug!("Created tip transaction to {}", tip_account);
+
+            // Clone buy_tx for Jito (we need original for fallback)
+            let buy_tx_clone: VersionedTransaction = bincode::deserialize(
+                &bincode::serialize(&buy_tx).unwrap()
+            ).unwrap();
+
+            // Submit bundle
+            let bundle_result = jito_client.submit_bundle_mixed(buy_tx_clone, tip_tx).await?;
+            info!("Bundle submitted: {}", bundle_result.bundle_id);
+
+            // Wait for confirmation (reduced to 15 seconds for faster fallback)
+            let status = jito_client.wait_for_confirmation(&bundle_result.bundle_id, 15).await?;
+
+            match status {
+                BundleStatus::Landed => {
+                    let sig = bundle_result.signatures.first()
+                        .cloned()
+                        .unwrap_or_else(|| bundle_result.bundle_id.clone());
+                    info!("Jito BUY CONFIRMED: {}", sig);
+                    Ok(sig)
+                }
+                BundleStatus::Failed(reason) => {
+                    Err(Error::JitoBundleSubmission(format!("Bundle failed: {}", reason)))
+                }
+                _ => {
+                    // Check if first signature landed on-chain
+                    if let Some(sig) = bundle_result.signatures.first() {
+                        use solana_sdk::signature::Signature;
+                        use std::str::FromStr;
+                        if let Ok(sig_parsed) = Signature::from_str(sig) {
+                            if let Ok(Some(status)) = rpc_client.get_signature_status(&sig_parsed) {
+                                if status.is_ok() {
+                                    info!("Jito tx confirmed via RPC check: {}", sig);
+                                    return Ok(sig.clone());
+                                }
+                            }
+                        }
+                    }
+                    Err(Error::JitoBundleSubmission("Bundle didn't land".to_string()))
+                }
+            }
+        }.await;
+
+        // If Jito succeeded, return
+        if let Ok(sig) = jito_result {
+            return Ok(sig);
+        }
+
+        // Fallback to regular RPC
+        warn!("Jito bundle failed, falling back to regular RPC...");
+
+        // Get fresh transaction for RPC (new blockhash)
+        let priority_fee = jito_client.config().min_tip_lamports as f64 / 1e9;
+
+        match self.buy_local_with_retry(mint, sol_amount, slippage_pct, priority_fee, keypair, rpc_client, 3).await {
+            Ok(sig) => {
+                info!("RPC FALLBACK BUY CONFIRMED: {}", sig);
+                Ok(sig)
+            }
+            Err(e) => {
+                error!("RPC fallback also failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Execute a sell using Jito bundles with fallback to regular RPC
+    ///
+    /// Tries Jito first for MEV protection, falls back to regular RPC if Jito fails.
+    pub async fn sell_with_jito(
+        &self,
+        mint: &str,
+        amount: &str,
+        slippage_pct: u32,
+        keypair: &Keypair,
+        jito_client: &crate::trading::jito::JitoClient,
+        rpc_client: &RpcClient,
+    ) -> Result<String> {
+        use crate::trading::jito::BundleStatus;
+        use solana_sdk::{
+            message::Message,
+            system_instruction,
+            transaction::Transaction,
+        };
+
+        let public_key = keypair.pubkey().to_string();
+
+        info!(
+            "Executing Jito sell: {} of token {} (signer: {})",
+            amount, mint, public_key
+        );
+
+        // Get recommended tip from Jito
+        let tip_lamports = jito_client.get_recommended_tip().await.unwrap_or(100000);
+        info!("Using Jito tip: {} lamports ({:.6} SOL)", tip_lamports, tip_lamports as f64 / 1e9);
+
+        // Get unsigned transaction from PumpPortal (use minimal priority fee since we're using Jito)
+        let tx_bytes = match self
+            .get_sell_transaction(mint, amount, slippage_pct, 0.00001, &public_key)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to get transaction from PumpPortal: {}", e);
+                return Err(e);
+            }
+        };
+
+        debug!("Got unsigned transaction from PumpPortal ({} bytes)", tx_bytes.len());
+
+        // Deserialize as VersionedTransaction
+        let mut sell_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
+            .map_err(|e| Error::Deserialization(format!("Failed to deserialize transaction: {}", e)))?;
+
+        // Sign the sell transaction
+        let message_bytes = sell_tx.message.serialize();
+        let signature = keypair.sign_message(&message_bytes);
+        sell_tx.signatures[0] = signature;
+
+        // Try Jito first
+        let jito_result = async {
+            // Get a random Jito tip account
+            let tip_account = jito_client.get_tip_account();
+
+            // Get recent blockhash for tip transaction
+            let blockhash = rpc_client.get_latest_blockhash()
+                .map_err(|e| Error::TransactionBuild(format!("Failed to get blockhash: {}", e)))?;
+
+            // Create tip transaction
+            let tip_ix = system_instruction::transfer(
+                &keypair.pubkey(),
+                &tip_account,
+                tip_lamports,
+            );
+
+            let tip_message = Message::new(&[tip_ix], Some(&keypair.pubkey()));
+            let mut tip_tx = Transaction::new_unsigned(tip_message);
+            tip_tx.sign(&[keypair], blockhash);
+
+            debug!("Created tip transaction to {}", tip_account);
+
+            // Clone sell_tx for Jito (we need original for fallback)
+            let sell_tx_clone: VersionedTransaction = bincode::deserialize(
+                &bincode::serialize(&sell_tx).unwrap()
+            ).unwrap();
+
+            // Submit bundle
+            let bundle_result = jito_client.submit_bundle_mixed(sell_tx_clone, tip_tx).await?;
+            info!("Bundle submitted: {}", bundle_result.bundle_id);
+
+            // Wait for confirmation (reduced to 15 seconds for faster fallback)
+            let status = jito_client.wait_for_confirmation(&bundle_result.bundle_id, 15).await?;
+
+            match status {
+                BundleStatus::Landed => {
+                    let sig = bundle_result.signatures.first()
+                        .cloned()
+                        .unwrap_or_else(|| bundle_result.bundle_id.clone());
+                    info!("Jito SELL CONFIRMED: {}", sig);
+                    Ok(sig)
+                }
+                BundleStatus::Failed(reason) => {
+                    Err(Error::JitoBundleSubmission(format!("Bundle failed: {}", reason)))
+                }
+                _ => {
+                    // Check if first signature landed on-chain
+                    if let Some(sig) = bundle_result.signatures.first() {
+                        use solana_sdk::signature::Signature;
+                        use std::str::FromStr;
+                        if let Ok(sig_parsed) = Signature::from_str(sig) {
+                            if let Ok(Some(status)) = rpc_client.get_signature_status(&sig_parsed) {
+                                if status.is_ok() {
+                                    info!("Jito tx confirmed via RPC check: {}", sig);
+                                    return Ok(sig.clone());
+                                }
+                            }
+                        }
+                    }
+                    Err(Error::JitoBundleSubmission("Bundle didn't land".to_string()))
+                }
+            }
+        }.await;
+
+        // If Jito succeeded, return
+        if let Ok(sig) = jito_result {
+            return Ok(sig);
+        }
+
+        // Fallback to regular RPC
+        warn!("Jito bundle failed, falling back to regular RPC for sell...");
+
+        // Get fresh transaction for RPC (new blockhash) with higher priority fee
+        let priority_fee = jito_client.config().min_tip_lamports as f64 / 1e9;
+
+        match self.sell_local(mint, amount, slippage_pct, priority_fee, keypair, rpc_client).await {
+            Ok(sig) => {
+                info!("RPC FALLBACK SELL CONFIRMED: {}", sig);
+                Ok(sig)
+            }
+            Err(e) => {
+                error!("RPC fallback also failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Check if a pump.fun token is tradeable (pool exists and is active)
+    /// Returns true if the token can be traded via PumpPortal
+    pub async fn check_pool_ready(&self, mint: &str) -> bool {
+        // Verify token ends with "pump" (pump.fun convention)
+        if !mint.ends_with("pump") {
+            debug!("Token {} does not end with 'pump' - not a pump.fun token", mint);
+            return false;
+        }
+
+        // Try to get a quote by making a minimal trade request to local API
+        // This will fail fast if the pool doesn't exist
+        let request = LocalTradeRequest {
+            action: TradeAction::Buy,
+            mint: mint.to_string(),
+            amount: "0.0001".to_string(), // Tiny amount just to check
+            denominated_in_sol: "true".to_string(),
+            slippage: 50, // High slippage for check
+            priority_fee: 0.0001,
+            public_key: "11111111111111111111111111111111".to_string(), // Dummy pubkey for check
+            pool: Some(PoolType::Pump),
+        };
+
+        let response = self.client
+            .post(PUMPPORTAL_LOCAL_API_URL)
+            .json(&request)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    debug!("Pool ready for {}", mint);
+                    true
+                } else {
+                    let text = resp.text().await.unwrap_or_default();
+                    if text.contains("Pool account not found") || text.contains("not found") {
+                        warn!("Pool NOT ready for {}: {}", mint, text);
+                        false
+                    } else {
+                        // Other errors might be temporary
+                        debug!("Pool check unclear for {}: {} - {}", mint, status, text);
+                        true // Assume ready if not a clear "not found" error
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Pool check failed for {}: {} - assuming not ready", mint, e);
+                false
+            }
+        }
     }
 }
 

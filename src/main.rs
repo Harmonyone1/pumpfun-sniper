@@ -68,6 +68,88 @@ enum Commands {
         #[command(subcommand)]
         action: WalletAction,
     },
+
+    /// Scan existing tokens for opportunities (aggressive mode)
+    Scan {
+        /// Minimum liquidity in SOL
+        #[arg(long, default_value = "1.0")]
+        min_liquidity: f64,
+
+        /// Maximum liquidity in SOL (avoid already-pumped tokens)
+        #[arg(long, default_value = "100.0")]
+        max_liquidity: f64,
+
+        /// Minimum 24h volume in SOL
+        #[arg(long, default_value = "0.5")]
+        min_volume: f64,
+
+        /// Maximum number of results to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+
+        /// Auto-buy top opportunities (AGGRESSIVE - use with caution!)
+        #[arg(long)]
+        auto_buy: bool,
+
+        /// Buy amount in SOL for auto-buy mode
+        #[arg(long, default_value = "0.15")]
+        buy_amount: f64,
+
+        /// Output format: table, json
+        #[arg(long, default_value = "table")]
+        format: String,
+
+        /// Watch mode - continuously scan for opportunities
+        #[arg(long)]
+        watch: bool,
+
+        /// Scan interval in seconds for watch mode
+        #[arg(long, default_value = "30")]
+        interval: u64,
+    },
+
+    /// Scan DexScreener for hot tokens with momentum (uses Survivor Mode validation)
+    HotScan {
+        /// Minimum 5-minute price change percentage
+        #[arg(long, default_value = "10.0")]
+        min_m5: f64,
+
+        /// Minimum buy/sell ratio
+        #[arg(long, default_value = "1.3")]
+        min_ratio: f64,
+
+        /// Minimum liquidity in USD
+        #[arg(long, default_value = "10000")]
+        min_liquidity: f64,
+
+        /// Maximum market cap in USD (avoid late entries)
+        #[arg(long, default_value = "500000")]
+        max_mcap: f64,
+
+        /// Auto-buy tokens that pass all filters
+        #[arg(long)]
+        auto_buy: bool,
+
+        /// Buy amount in SOL for auto-buy mode
+        #[arg(long, default_value = "0.15")]
+        buy_amount: f64,
+
+        /// Run in dry-run mode (no real trades)
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Watch mode - continuously scan
+        #[arg(long)]
+        watch: bool,
+
+        /// Scan interval in seconds for watch mode
+        #[arg(long, default_value = "30")]
+        interval: u64,
+
+        /// Use Jito bundles for better execution (recommended for hot tokens)
+        #[arg(long)]
+        jito: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -112,6 +194,22 @@ enum WalletAction {
         /// Simulate only, don't execute
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Transfer SOL between wallets
+    Transfer {
+        /// Source wallet name
+        from: String,
+
+        /// Destination wallet name or address
+        to: String,
+
+        /// Amount in SOL
+        amount: f64,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
     },
 
     /// View transfer history
@@ -191,6 +289,52 @@ async fn main() -> Result<()> {
         Commands::Status => commands::status(&config).await,
         Commands::Config => commands::show_config(&config),
         Commands::Health => commands::health(&config).await,
+        Commands::Scan {
+            min_liquidity,
+            max_liquidity,
+            min_volume,
+            limit,
+            auto_buy,
+            buy_amount,
+            format,
+            watch,
+            interval,
+        } => commands::scan(
+            &config,
+            min_liquidity,
+            max_liquidity,
+            min_volume,
+            limit,
+            auto_buy,
+            buy_amount,
+            &format,
+            watch,
+            interval,
+        ).await,
+        Commands::HotScan {
+            min_m5,
+            min_ratio,
+            min_liquidity,
+            max_mcap,
+            auto_buy,
+            buy_amount,
+            dry_run,
+            watch,
+            interval,
+            jito,
+        } => commands::hot_scan(
+            &config,
+            min_m5,
+            min_ratio,
+            min_liquidity,
+            max_mcap,
+            auto_buy,
+            buy_amount,
+            dry_run,
+            watch,
+            interval,
+            jito,
+        ).await,
         Commands::Wallet { action } => match action {
             WalletAction::Status => commands::wallet_status(&config).await,
             WalletAction::List => commands::wallet_list(&config).await,
@@ -203,6 +347,9 @@ async fn main() -> Result<()> {
             } => commands::wallet_add(&config, &name, &alias, &wallet_type, address, generate).await,
             WalletAction::Extract { amount, force, dry_run } => {
                 commands::wallet_extract(&config, amount, force, dry_run).await
+            }
+            WalletAction::Transfer { from, to, amount, force } => {
+                commands::wallet_transfer(&config, &from, &to, amount, force).await
             }
             WalletAction::History { limit } => commands::wallet_history(&config, limit).await,
             WalletAction::Proposals { approve, reject } => {

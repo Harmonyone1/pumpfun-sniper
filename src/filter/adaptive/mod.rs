@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::error::Result;
 use crate::filter::cache::FilterCache;
+use crate::filter::enrichment::EnrichmentService;
 use crate::filter::scoring::{Recommendation, ScoringEngine, ScoringResult};
 use crate::filter::signals::{Signal, SignalProvider, SignalType};
 use crate::filter::types::SignalContext;
@@ -38,6 +39,9 @@ pub struct AdaptiveFilter {
     /// Scoring engine
     scoring_engine: ScoringEngine,
 
+    /// Optional enrichment service for fetching data from Helius
+    enrichment: Option<Arc<EnrichmentService>>,
+
     /// Whether the filter is in degraded mode (some components failed)
     degraded_mode: Arc<RwLock<DegradedMode>>,
 }
@@ -53,17 +57,18 @@ pub struct DegradedMode {
 
 impl DegradedMode {
     /// Calculate confidence penalty for degraded mode
+    /// Reduced penalties for aggressive pump.fun trading
     pub fn confidence_penalty(&self) -> f64 {
         let mut penalty = 1.0;
 
         if self.background_unavailable {
-            penalty *= 0.7; // 30% reduction
+            penalty *= 0.95; // 5% reduction (was 30%)
         }
         if self.cache_cold {
-            penalty *= 0.8; // 20% reduction
+            penalty *= 0.95; // 5% reduction (was 20%)
         }
         if self.known_actors_failed {
-            penalty *= 0.9; // 10% reduction + conservative score offset
+            penalty *= 0.95; // 5% reduction (was 10%)
         }
 
         penalty
@@ -131,8 +136,15 @@ impl AdaptiveFilter {
             background_providers: Vec::new(),
             cache,
             scoring_engine,
+            enrichment: None,
             degraded_mode: Arc::new(RwLock::new(degraded_mode)),
         })
+    }
+
+    /// Set the enrichment service for fetching data from Helius
+    pub fn set_enrichment(&mut self, service: Arc<EnrichmentService>) {
+        self.enrichment = Some(service);
+        tracing::info!("Enrichment service configured");
     }
 
     /// Register a signal provider
@@ -154,7 +166,7 @@ impl AdaptiveFilter {
 
     /// Fast scoring using only hot-path providers (for sniping decisions)
     ///
-    /// Target latency: <50ms
+    /// Target latency: <50ms (may be higher if enrichment is needed)
     pub async fn score_fast(&self, context: &SignalContext) -> ScoringResult {
         let start = Instant::now();
 
@@ -163,10 +175,25 @@ impl AdaptiveFilter {
             return ScoringResult::fail_closed("Empty mint address");
         }
 
+        // Enrich token data if enrichment service is available
+        if let Some(ref enrichment) = self.enrichment {
+            if !self.cache.has_token_data(&context.mint) {
+                let enriched = enrichment.enrich_token(context).await;
+                if enriched {
+                    // Mark cache as warming up (not cold anymore)
+                    let mut degraded = self.degraded_mode.write().await;
+                    if degraded.cache_cold && self.cache.total_cached_items() > 10 {
+                        degraded.cache_cold = false;
+                        tracing::info!("Cache warmed up, exiting cold mode");
+                    }
+                }
+            }
+        }
+
         // Collect signals from hot-path providers (parallel)
         let mut signals = Vec::new();
 
-        // Add built-in fast signals
+        // Add built-in fast signals (now with enriched data available)
         signals.extend(self.compute_builtin_hot_signals(context).await);
 
         // Add custom provider signals
@@ -300,6 +327,176 @@ impl AdaptiveFilter {
         let name_signal = self.compute_name_quality_signal(context);
         signals.push(name_signal);
 
+        // === Enriched data signals (from Helius API) ===
+
+        // Mint authority check (CRITICAL - can mint more tokens)
+        if let Some(mint_info) = self.cache.get_mint_info(&context.mint) {
+            if mint_info.has_mint_authority() {
+                signals.push(
+                    Signal::extreme_risk(
+                        SignalType::MintAuthority,
+                        "FATAL: Mint authority active - creator can mint infinite tokens",
+                    )
+                    .with_latency(start.elapsed())
+                    .with_cached(true),
+                );
+            } else if mint_info.has_freeze_authority() {
+                signals.push(
+                    Signal::new(
+                        SignalType::FreezeAuthority,
+                        -0.7,
+                        0.95,
+                        "WARNING: Freeze authority active - creator can freeze accounts",
+                    )
+                    .with_latency(start.elapsed())
+                    .with_cached(true),
+                );
+            } else if mint_info.is_fully_renounced() {
+                signals.push(
+                    Signal::new(
+                        SignalType::MintAuthority,
+                        0.3,
+                        0.9,
+                        "All authorities renounced - safer token",
+                    )
+                    .with_latency(start.elapsed())
+                    .with_cached(true),
+                );
+            }
+        }
+
+        // Creator wallet history analysis
+        if let Some(history) = self.cache.get_wallet(&context.creator) {
+            // Check if creator is a rug deployer pattern
+            if history.is_likely_rug_deployer() {
+                signals.push(
+                    Signal::extreme_risk(
+                        SignalType::WalletHistory,
+                        format!(
+                            "Creator has deployed {} rugged tokens",
+                            history.deployed_rug_count
+                        ),
+                    )
+                    .with_latency(start.elapsed())
+                    .with_cached(true),
+                );
+            } else if history.is_likely_deployer() {
+                // Multiple deploys but not necessarily rugs
+                signals.push(
+                    Signal::new(
+                        SignalType::WalletHistory,
+                        -0.3,
+                        0.7,
+                        format!(
+                            "Creator has deployed {} tokens previously",
+                            history.tokens_deployed
+                        ),
+                    )
+                    .with_latency(start.elapsed())
+                    .with_cached(true),
+                );
+            }
+
+            // Wallet age check - reduced penalty for pump.fun (all wallets are new)
+            if history.is_new_wallet(7.0) {
+                signals.push(
+                    Signal::new(
+                        SignalType::WalletAge,
+                        -0.1,  // Reduced from -0.4 - new wallets are normal on pump.fun
+                        0.5,   // Lower confidence - this signal is less meaningful
+                        format!(
+                            "Creator wallet is new ({:.1} days old)",
+                            history.age_days().unwrap_or(0.0)
+                        ),
+                    )
+                    .with_latency(start.elapsed())
+                    .with_cached(true),
+                );
+            } else if let Some(age) = history.age_days() {
+                if age > 90.0 {
+                    signals.push(
+                        Signal::new(
+                            SignalType::WalletAge,
+                            0.2,
+                            0.6,
+                            format!("Creator wallet is established ({:.0} days old)", age),
+                        )
+                        .with_latency(start.elapsed())
+                        .with_cached(true),
+                    );
+                }
+            }
+
+            // Win rate check (if they have trading history)
+            if history.total_trades > 10 {
+                let win_rate = history.win_rate();
+                if win_rate > 0.6 {
+                    signals.push(
+                        Signal::new(
+                            SignalType::WalletHistory,
+                            0.2,
+                            0.7,
+                            format!(
+                                "Creator has {:.0}% win rate over {} trades",
+                                win_rate * 100.0,
+                                history.total_trades
+                            ),
+                        )
+                        .with_latency(start.elapsed())
+                        .with_cached(true),
+                    );
+                }
+            }
+        }
+
+        // Token holder distribution analysis
+        if let Some(holders) = self.cache.get_holders(&context.mint) {
+            if !holders.is_empty() {
+                // Check top holder concentration
+                let top_holder_pct = holders.first().map(|h| h.percentage).unwrap_or(0.0);
+                let top_5_pct: f64 = holders.iter().take(5).map(|h| h.percentage).sum();
+
+                if top_holder_pct > 50.0 {
+                    signals.push(
+                        Signal::new(
+                            SignalType::HolderConcentration,
+                            -0.6,
+                            0.9,
+                            format!("Highly concentrated: top holder has {:.1}%", top_holder_pct),
+                        )
+                        .with_latency(start.elapsed())
+                        .with_cached(true),
+                    );
+                } else if top_5_pct > 70.0 {
+                    signals.push(
+                        Signal::new(
+                            SignalType::HolderConcentration,
+                            -0.4,
+                            0.8,
+                            format!("Top 5 holders control {:.1}%", top_5_pct),
+                        )
+                        .with_latency(start.elapsed())
+                        .with_cached(true),
+                    );
+                } else if holders.len() > 10 && top_holder_pct < 20.0 {
+                    signals.push(
+                        Signal::new(
+                            SignalType::HolderConcentration,
+                            0.3,
+                            0.7,
+                            format!(
+                                "Good distribution: {} holders, top holder {:.1}%",
+                                holders.len(),
+                                top_holder_pct
+                            ),
+                        )
+                        .with_latency(start.elapsed())
+                        .with_cached(true),
+                    );
+                }
+            }
+        }
+
         signals
     }
 
@@ -408,9 +605,9 @@ impl AdaptiveFilter {
         let penalty = degraded.confidence_penalty();
         result.confidence *= penalty;
 
-        // Conservative score offset if known actors failed
+        // Minimal score offset if known actors failed (was -0.1, now -0.02)
         if degraded.known_actors_failed {
-            result.score -= 0.1;
+            result.score -= 0.02;
         }
 
         // Downgrade recommendations under low confidence

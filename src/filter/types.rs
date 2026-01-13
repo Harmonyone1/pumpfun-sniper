@@ -8,48 +8,66 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletHistory {
     pub address: String,
-    pub first_transaction: Option<DateTime<Utc>>,
-    pub total_transactions: u64,
-    pub pump_fun_transactions: u64,
+    pub first_seen: Option<DateTime<Utc>>,
+    pub total_trades: u32,
+    pub winning_trades: u32,
+    pub total_volume_sol: f64,
+    pub recent_trades: Vec<WalletTrade>,
 
-    // Trading statistics
+    // Extended stats (populated from deeper analysis)
+    #[serde(default)]
     pub tokens_deployed: u32,
+    #[serde(default)]
     pub tokens_traded: u32,
-    pub win_rate: f64, // 0.0 to 1.0
+    #[serde(default)]
     pub avg_holding_time_secs: u64,
+    #[serde(default)]
     pub avg_position_size_sol: f64,
 
     // Behavioral patterns
+    #[serde(default)]
     pub avg_time_to_first_buy_secs: Option<u64>, // After token launch
+    #[serde(default)]
     pub sells_within_10_min: u32,                // Sniper behavior indicator
-    pub avg_profit_on_win: f64,
-    pub avg_loss_on_loss: f64,
 
     // Risk indicators
+    #[serde(default)]
     pub deployed_rug_count: u32,          // Tokens that went to ~0
+    #[serde(default)]
     pub associated_wallets: Vec<String>,  // Funding relationships
+    #[serde(default)]
     pub cluster_id: Option<String>,       // If part of coordinated group
 
     // Cache metadata
     pub fetched_at: DateTime<Utc>,
 }
 
+/// A single trade from wallet history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletTrade {
+    pub signature: String,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub is_buy: bool,
+    pub sol_amount: f64,
+    pub token_mint: Option<String>,
+    pub profit_sol: Option<f64>,
+}
+
 impl Default for WalletHistory {
     fn default() -> Self {
         Self {
             address: String::new(),
-            first_transaction: None,
-            total_transactions: 0,
-            pump_fun_transactions: 0,
+            first_seen: None,
+            total_trades: 0,
+            winning_trades: 0,
+            total_volume_sol: 0.0,
+            recent_trades: Vec::new(),
             tokens_deployed: 0,
             tokens_traded: 0,
-            win_rate: 0.0,
             avg_holding_time_secs: 0,
             avg_position_size_sol: 0.0,
             avg_time_to_first_buy_secs: None,
             sells_within_10_min: 0,
-            avg_profit_on_win: 0.0,
-            avg_loss_on_loss: 0.0,
             deployed_rug_count: 0,
             associated_wallets: Vec::new(),
             cluster_id: None,
@@ -58,19 +76,35 @@ impl Default for WalletHistory {
     }
 }
 
+/// Token holder info from Helius API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenHolderInfo {
+    pub address: String,
+    pub amount: u64,
+    pub percentage: f64,
+}
+
 impl WalletHistory {
     /// Calculate wallet age in days
     pub fn age_days(&self) -> Option<f64> {
-        self.first_transaction.map(|first| {
+        self.first_seen.map(|first| {
             let duration = Utc::now() - first;
             duration.num_seconds() as f64 / 86400.0
         })
     }
 
+    /// Calculate win rate
+    pub fn win_rate(&self) -> f64 {
+        if self.total_trades == 0 {
+            return 0.0;
+        }
+        self.winning_trades as f64 / self.total_trades as f64
+    }
+
     /// Check if this looks like a sniper wallet
     pub fn is_likely_sniper(&self) -> bool {
-        // High number of pump.fun trades + quick sells
-        self.pump_fun_transactions > 50 && self.sells_within_10_min > 10
+        // High number of trades + quick sells
+        self.total_trades > 50 && self.sells_within_10_min > 10
     }
 
     /// Check if this looks like a deployer
@@ -81,6 +115,16 @@ impl WalletHistory {
     /// Check if this looks like a rug deployer
     pub fn is_likely_rug_deployer(&self) -> bool {
         self.deployed_rug_count > 0 && self.tokens_deployed > 0
+    }
+
+    /// Check if wallet is new (less than N days old)
+    pub fn is_new_wallet(&self, days: f64) -> bool {
+        self.age_days().map(|age| age < days).unwrap_or(true)
+    }
+
+    /// Check if wallet has significant trading history
+    pub fn has_history(&self) -> bool {
+        self.total_trades > 0 || self.total_volume_sol > 0.0
     }
 }
 
@@ -383,7 +427,7 @@ mod tests {
     #[test]
     fn test_wallet_history_age() {
         let mut history = WalletHistory::default();
-        history.first_transaction = Some(Utc::now() - chrono::Duration::days(30));
+        history.first_seen = Some(Utc::now() - chrono::Duration::days(30));
         let age = history.age_days().unwrap();
         assert!(age >= 29.9 && age <= 30.1);
     }
