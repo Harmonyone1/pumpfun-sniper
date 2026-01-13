@@ -100,14 +100,11 @@ impl EntryType {
     }
 
     /// Get the max hold time in seconds for this entry type
-    /// FASTER EXITS: Don't hold too long in volatile memecoins
+    /// DISABLED: Time-based exits were causing exits right before price spikes.
+    /// Let the trailing stop and take-profit do their job instead.
     pub fn max_hold_secs(&self) -> Option<u64> {
-        match self {
-            EntryType::StrongBuy => Some(180),   // Was None - now 3 min max
-            EntryType::Opportunity => Some(120), // Was 300 - now 2 min max
-            EntryType::Probe => Some(90),        // Was 60 - now 90 sec max
-            EntryType::Legacy => Some(120),      // Default 2 min
-        }
+        // Return None for all entry types - rely on trailing stop and TP/SL instead
+        None
     }
 
     /// Should use tiered exit strategy?

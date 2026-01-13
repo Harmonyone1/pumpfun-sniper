@@ -102,9 +102,10 @@ second_profit_pct = 8.0
 # Example: Buy 100 tokens, sell 50 at +4%, sell 25 at +8%, sell 25 at +12%
 
 # === NO-MOVEMENT EXIT ===
-# Exit if price moves less than this % after no_movement_secs
-no_movement_threshold_pct = 2.0
-no_movement_secs = 120
+# DISABLED: Was causing exits right before price spikes
+# Set to very high values to effectively disable
+no_movement_threshold_pct = 0.0
+no_movement_secs = 999999
 
 # === DYNAMIC TRAILING STOP ===
 # Trailing stop tightens as profit grows to prevent round-tripping
