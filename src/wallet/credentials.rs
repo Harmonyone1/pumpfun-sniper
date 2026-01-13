@@ -203,7 +203,7 @@ impl CredentialManager {
     ///
     /// Returns list of warnings for files with insecure permissions.
     pub fn validate_permissions(&self) -> Vec<String> {
-        let warnings = Vec::new();
+        let mut warnings = Vec::new();
 
         #[cfg(unix)]
         {
