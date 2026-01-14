@@ -212,16 +212,16 @@ pub struct HotScanConfig {
 impl Default for HotScanConfig {
     fn default() -> Self {
         Self {
-            min_m5_change: 10.0,         // 10% gain in 5 minutes
-            max_m5_change: 80.0,         // Don't buy after 80%+ pump (buying top)
-            min_h1_change: -30.0,        // Reject if H1 < -30% (dead cat bounce)
-            min_buy_sell_ratio: 1.3,     // 30% more buys than sells
-            max_buy_sell_ratio: 10.0,    // Cap at 10:1 (avoid manipulation)
-            min_buys_5m: 10,             // At least 10 buys in 5 min
-            min_liquidity_usd: 10_000.0, // $10k liquidity
-            min_market_cap: 20_000.0,    // $20k market cap minimum
-            max_market_cap: 500_000.0,   // $500k max (avoid late entries)
-            min_score: 50.0,             // Minimum score threshold
+            min_m5_change: 3.0,          // 3% gain in 5 min (lowered from 10% for earlier detection)
+            max_m5_change: 50.0,         // Don't buy after 50%+ pump (lowered from 80%)
+            min_h1_change: -20.0,        // Reject if H1 < -20% (tightened from -30%)
+            min_buy_sell_ratio: 1.2,     // 20% more buys than sells (lowered from 1.3)
+            max_buy_sell_ratio: 8.0,     // Cap at 8:1 (lowered from 10:1)
+            min_buys_5m: 5,              // At least 5 buys in 5 min (lowered from 10)
+            min_liquidity_usd: 5_000.0,  // $5k liquidity (lowered from $10k)
+            min_market_cap: 10_000.0,    // $10k market cap (lowered from $20k)
+            max_market_cap: 300_000.0,   // $300k max (lowered from $500k for earlier entries)
+            min_score: 30.0,             // Minimum score (lowered from 50)
             scan_profiles: true,
             scan_boosts: true,
             profile_limit: 30,
