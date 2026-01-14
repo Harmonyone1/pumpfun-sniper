@@ -76,30 +76,28 @@ blocked_patterns = ["(?i)scam", "(?i)rug", "(?i)honeypot"]
 # === ESTABLISHED TOKEN FILTERS ===
 # For targeting tokens with established market cap instead of new launches
 # Minimum market cap in SOL (0 = no minimum)
-min_market_cap_sol = 50.0
+min_market_cap_sol = 0.0
 # Minimum bonding curve progress % (0 = new tokens OK, 15-20 = established)
 # At 15%: ~$12k market cap, At 20%: ~$16k, At 30%: ~$24k
-min_bonding_curve_pct = 15.0
+min_bonding_curve_pct = 0.0
 # Maximum bonding curve progress % (tokens near graduation may be risky)
 max_bonding_curve_pct = 85.0
 
 [wallet_tracking]
 # Enable wallet copy-trading
 enabled = true
-# List of wallet addresses to track
-# These are known profitable pump.fun traders - add more as you discover them
-# Find profitable wallets on: solscan.io, birdeye.so, or track successful trades
+# Alpha wallets from Dune Analytics with proven track records
 wallets = [
-  # Example format - replace with real profitable wallets you find:
-  # "WALLET_ADDRESS_1",
-  # "WALLET_ADDRESS_2",
+  "4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t",
+  "8zFZHuSRuDpuAR7J6FzwyF3vKNx4CVW3DFHJerQhc7Zd",
+  "H72yLkhTnoBfhBTXXaj1RBXuirm8s8G5fcVh2XpQLggM",
 ]
 # Give tracked wallet events priority in queue
 priority_boost = true
 # Minimum SOL trade size to trigger alert (filter noise)
-min_trade_sol = 0.5
-# Auto-buy when tracked wallet buys (requires wallets list)
-auto_copy_trade = false
+min_trade_sol = 0.3
+# Auto-buy when tracked wallet buys
+auto_copy_trade = true
 
 [auto_sell]
 # Enable automatic take-profit and stop-loss
