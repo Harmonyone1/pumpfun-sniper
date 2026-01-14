@@ -170,6 +170,15 @@ vault_wallet = "vault-robinhood"
 # Credentials directory
 credentials_dir = "credentials"
 
+# Trading wallets - list of keypair paths for multi-wallet trading
+trading_wallets = [
+    "credentials/hot-trading/keypair.json",
+    "credentials/wallet-2/keypair.json",
+]
+
+# Wallet selection strategy: "round-robin", "lowest-balance", "highest-balance"
+selection_strategy = "round-robin"
+
 [wallet.safety]
 # Minimum SOL to keep in hot wallet (never drain below this)
 min_hot_balance_sol = 0.1

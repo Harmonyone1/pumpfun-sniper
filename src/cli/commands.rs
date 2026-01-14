@@ -2373,16 +2373,37 @@ pub async fn hot_scan(
         warn!("Note: Jito bundles provide MEV protection and faster confirmation, but require tip configuration in config.toml");
     }
 
-    // Load keypair
+    // Load wallets - support multi-wallet if configured
+    let multi_wallet = if !config.wallet.trading_wallets.is_empty() {
+        match crate::wallet::MultiWalletManager::new(
+            config.wallet.trading_wallets.clone(),
+            &config.wallet.selection_strategy,
+        ) {
+            Ok(mw) => {
+                info!("Multi-wallet mode ENABLED with {} wallets", mw.wallet_count());
+                Some(std::sync::Arc::new(mw))
+            }
+            Err(e) => {
+                warn!("Failed to initialize multi-wallet: {} - falling back to single wallet", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Fall back to single keypair if multi-wallet not configured
     let keypair_path = std::env::var("KEYPAIR_PATH")
         .unwrap_or_else(|_| format!("{}/hot-trading/keypair.json", config.wallet.credentials_dir));
     let keypair_data = std::fs::read_to_string(&keypair_path)?;
     let secret_key: Vec<u8> = serde_json::from_str(&keypair_data)?;
     let keypair = std::sync::Arc::new(solana_sdk::signature::Keypair::from_bytes(&secret_key)?);
-    info!(
-        "Signing wallet (for local API fallback): {}",
-        keypair.pubkey()
-    );
+
+    if multi_wallet.is_some() {
+        info!("Primary wallet (fallback): {}", keypair.pubkey());
+    } else {
+        info!("Signing wallet: {}", keypair.pubkey());
+    }
 
     // Initialize RPC
     let rpc_client = std::sync::Arc::new(solana_client::rpc_client::RpcClient::new_with_timeout(
@@ -3251,15 +3272,28 @@ pub async fn hot_scan(
                             let slippage = config.trading.slippage_bps / 100;
                             let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
 
+                            // Select wallet for this trade (multi-wallet or single)
+                            let (trading_keypair, wallet_name) = if let Some(ref mw) = multi_wallet {
+                                let selected = mw.select_wallet(&rpc_client);
+                                let name = selected.name.clone();
+                                let kp = std::sync::Arc::new(
+                                    solana_sdk::signature::Keypair::from_bytes(&selected.keypair.to_bytes()).unwrap()
+                                );
+                                (kp, name)
+                            } else {
+                                (keypair.clone(), "default".to_string())
+                            };
+
                             info!(
-                                "Buying {:.4} SOL of {} via {}",
+                                "Buying {:.4} SOL of {} via {} (wallet: {})",
                                 final_buy_amount,
                                 token.symbol,
                                 if use_local_api {
                                     "Local API"
                                 } else {
                                     "Lightning"
-                                }
+                                },
+                                wallet_name
                             );
 
                             let buy_result = if use_local_api {
@@ -3269,7 +3303,7 @@ pub async fn hot_scan(
                                         final_buy_amount,
                                         slippage,
                                         priority_fee,
-                                        &keypair,
+                                        &trading_keypair,
                                         &rpc_client,
                                     )
                                     .await
@@ -3321,11 +3355,11 @@ pub async fn hot_scan(
 
                                     // Determine which wallet to check based on API mode
                                     let check_wallet = if use_local_api {
-                                        keypair.pubkey()
+                                        trading_keypair.pubkey() // Use the selected trading wallet
                                     } else {
                                         // For Lightning API, use the lightning wallet
                                         Pubkey::from_str(&config.pumpportal.lightning_wallet)
-                                            .unwrap_or(keypair.pubkey())
+                                            .unwrap_or(trading_keypair.pubkey())
                                     };
 
                                     let actual_balance_raw = query_token_balance(

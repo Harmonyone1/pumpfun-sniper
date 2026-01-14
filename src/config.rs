@@ -366,6 +366,15 @@ pub struct WalletConfig {
     #[serde(default = "default_credentials_dir")]
     pub credentials_dir: String,
 
+    /// Trading wallets - list of keypair paths for multi-wallet trading
+    /// If empty, falls back to KEYPAIR_PATH env var or default hot-trading wallet
+    #[serde(default)]
+    pub trading_wallets: Vec<String>,
+
+    /// Wallet selection strategy: "round-robin", "lowest-balance", "highest-balance"
+    #[serde(default = "default_wallet_strategy")]
+    pub selection_strategy: String,
+
     /// Safety limits for wallet operations
     #[serde(default)]
     pub safety: WalletSafetyConfig,
@@ -381,6 +390,8 @@ impl Default for WalletConfig {
             hot_wallet: default_hot_wallet(),
             vault_wallet: default_vault_wallet(),
             credentials_dir: default_credentials_dir(),
+            trading_wallets: vec![],
+            selection_strategy: default_wallet_strategy(),
             safety: WalletSafetyConfig::default(),
             extraction: ExtractionConfig::default(),
         }
@@ -600,6 +611,10 @@ fn default_vault_wallet() -> String {
 
 fn default_credentials_dir() -> String {
     "credentials".to_string()
+}
+
+fn default_wallet_strategy() -> String {
+    "round-robin".to_string()
 }
 
 fn default_min_hot_balance() -> f64 {

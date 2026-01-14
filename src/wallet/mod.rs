@@ -28,12 +28,14 @@ pub mod advisor;
 pub mod credentials;
 pub mod extractor;
 pub mod manager;
+pub mod multi_wallet;
 pub mod safety;
 pub mod transfer;
 pub mod types;
 
 pub use credentials::CredentialManager;
 pub use manager::WalletManager;
+pub use multi_wallet::{MultiWalletManager, SelectionStrategy, TradingWallet};
 pub use safety::{SafetyEnforcer, SafetyViolation};
 pub use types::{
     AiProposal, DailyExtractionStats, InitiatedBy, ProposalStatus, ProposedAction, TransferHistory,
