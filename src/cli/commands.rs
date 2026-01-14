@@ -297,7 +297,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
-            info!("Features: Trailing Stop (5%), No-Movement Exit (120s), Quick Profit, LOCAL FALLBACK");
+            info!("Features: Trailing Stop (5%), Quick Profit, LOCAL FALLBACK (No-Movement Exit DISABLED)");
 
             // Track sell attempts for retry logic
             let mut sell_attempts: std::collections::HashMap<String, u32> =
@@ -355,11 +355,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                     let quick_profit_pct = position.entry_type.quick_profit_pct();
                     let max_hold = position.entry_type.max_hold_secs();
 
-                    // Trailing stop: 3% drop from peak (only if we're in profit)
+                    // Trailing stop: 5% drop from peak (only if we're in profit)
                     let trailing_stop_pct = 5.0;
-                    // No-movement exit: 60 seconds with less than 2% movement
-                    let no_movement_secs = 120;
-                    let no_movement_threshold = 2.0;
+                    // No-movement exit: DISABLED (was causing exits before pumps)
+                    let no_movement_secs = 999999u64;
+                    let no_movement_threshold = 0.0;
 
                     let mut should_sell = false;
                     let mut sell_pct = "100%";
