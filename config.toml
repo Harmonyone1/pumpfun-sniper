@@ -73,6 +73,16 @@ name_patterns = []
 # Block tokens matching these regex patterns
 blocked_patterns = ["(?i)scam", "(?i)rug", "(?i)honeypot"]
 
+# === ESTABLISHED TOKEN FILTERS ===
+# For targeting tokens with established market cap instead of new launches
+# Minimum market cap in SOL (0 = no minimum)
+min_market_cap_sol = 50.0
+# Minimum bonding curve progress % (0 = new tokens OK, 15-20 = established)
+# At 15%: ~$12k market cap, At 20%: ~$16k, At 30%: ~$24k
+min_bonding_curve_pct = 15.0
+# Maximum bonding curve progress % (tokens near graduation may be risky)
+max_bonding_curve_pct = 85.0
+
 [wallet_tracking]
 # Enable wallet copy-trading
 enabled = true

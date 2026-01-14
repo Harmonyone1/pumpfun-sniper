@@ -7,7 +7,7 @@ use solana_sdk::signature::{Keypair, Signer};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::filter::{
@@ -638,6 +638,49 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 );
                                 continue;
                             }
+
+                            // Check market cap minimum (for established tokens)
+                            if config.filters.min_market_cap_sol > 0.0 && token.market_cap_sol < config.filters.min_market_cap_sol {
+                                info!(
+                                    "Token {} filtered: market cap {:.2} SOL < min {:.2} SOL (too new)",
+                                    token.symbol, token.market_cap_sol, config.filters.min_market_cap_sol
+                                );
+                                continue;
+                            }
+
+                            // Check bonding curve progress (for established tokens)
+                            // Calculate bonding curve % from virtual reserves
+                            // v_sol_in_bonding_curve is in lamports (u64), convert to SOL
+                            // Initial: ~30 SOL virtual, At graduation: ~85 SOL in curve
+                            let v_sol = token.v_sol_in_bonding_curve as f64 / 1_000_000_000.0;
+                            let bonding_curve_pct = if v_sol > 0.0 {
+                                // Approximate: more SOL = more progress
+                                // Full curve is ~85 SOL (starting from ~30 virtual)
+                                ((v_sol - 30.0) / 55.0 * 100.0).clamp(0.0, 100.0)
+                            } else {
+                                0.0
+                            };
+
+                            if config.filters.min_bonding_curve_pct > 0.0 && bonding_curve_pct < config.filters.min_bonding_curve_pct {
+                                info!(
+                                    "Token {} filtered: bonding curve {:.1}% < min {:.1}% (too new)",
+                                    token.symbol, bonding_curve_pct, config.filters.min_bonding_curve_pct
+                                );
+                                continue;
+                            }
+
+                            if config.filters.max_bonding_curve_pct > 0.0 && bonding_curve_pct > config.filters.max_bonding_curve_pct {
+                                info!(
+                                    "Token {} filtered: bonding curve {:.1}% > max {:.1}% (near graduation)",
+                                    token.symbol, bonding_curve_pct, config.filters.max_bonding_curve_pct
+                                );
+                                continue;
+                            }
+
+                            info!(
+                                "Token {} passed all filters: mcap={:.2} SOL, bonding={:.1}%",
+                                token.symbol, token.market_cap_sol, bonding_curve_pct
+                            );
                         }
 
                         // Check daily loss limit

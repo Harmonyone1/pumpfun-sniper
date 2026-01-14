@@ -23,6 +23,12 @@ pub enum FilterReason {
     DevHoldingsExceeded(f64),
     /// Liquidity below minimum
     LiquidityBelowMinimum(f64),
+    /// Market cap below minimum
+    MarketCapBelowMinimum(f64),
+    /// Bonding curve below minimum (too new)
+    BondingCurveTooLow(f64),
+    /// Bonding curve above maximum (too close to graduation)
+    BondingCurveTooHigh(f64),
     /// Custom filter failed
     Custom(String),
 }
@@ -38,6 +44,15 @@ impl std::fmt::Display for FilterReason {
             FilterReason::DevHoldingsExceeded(pct) => write!(f, "dev holdings {}% exceed max", pct),
             FilterReason::LiquidityBelowMinimum(sol) => {
                 write!(f, "liquidity {} SOL below minimum", sol)
+            }
+            FilterReason::MarketCapBelowMinimum(sol) => {
+                write!(f, "market cap {:.2} SOL below minimum", sol)
+            }
+            FilterReason::BondingCurveTooLow(pct) => {
+                write!(f, "bonding curve {:.1}% below minimum (too new)", pct)
+            }
+            FilterReason::BondingCurveTooHigh(pct) => {
+                write!(f, "bonding curve {:.1}% above maximum (near graduation)", pct)
             }
             FilterReason::Custom(reason) => write!(f, "{}", reason),
         }
@@ -163,6 +178,38 @@ impl TokenFilter {
         FilterResult::Pass
     }
 
+    /// Check market cap (in SOL equivalent)
+    pub fn check_market_cap(&self, market_cap_sol: f64) -> FilterResult {
+        if !self.config.enabled {
+            return FilterResult::Pass;
+        }
+
+        if self.config.min_market_cap_sol > 0.0 && market_cap_sol < self.config.min_market_cap_sol {
+            return FilterResult::Filtered(FilterReason::MarketCapBelowMinimum(market_cap_sol));
+        }
+
+        FilterResult::Pass
+    }
+
+    /// Check bonding curve progress (0-100%)
+    pub fn check_bonding_curve(&self, bonding_curve_pct: f64) -> FilterResult {
+        if !self.config.enabled {
+            return FilterResult::Pass;
+        }
+
+        // Check minimum (filter too new tokens)
+        if self.config.min_bonding_curve_pct > 0.0 && bonding_curve_pct < self.config.min_bonding_curve_pct {
+            return FilterResult::Filtered(FilterReason::BondingCurveTooLow(bonding_curve_pct));
+        }
+
+        // Check maximum (filter tokens too close to graduation)
+        if self.config.max_bonding_curve_pct > 0.0 && bonding_curve_pct > self.config.max_bonding_curve_pct {
+            return FilterResult::Filtered(FilterReason::BondingCurveTooHigh(bonding_curve_pct));
+        }
+
+        FilterResult::Pass
+    }
+
     /// Check all on-chain criteria
     pub fn check_on_chain(&self, dev_holdings_pct: f64, liquidity_sol: f64) -> FilterResult {
         if let FilterResult::Filtered(reason) = self.check_dev_holdings(dev_holdings_pct) {
@@ -174,6 +221,46 @@ impl TokenFilter {
         }
 
         FilterResult::Pass
+    }
+
+    /// Check all on-chain criteria including market cap and bonding curve
+    pub fn check_on_chain_full(
+        &self,
+        dev_holdings_pct: f64,
+        liquidity_sol: f64,
+        market_cap_sol: Option<f64>,
+        bonding_curve_pct: Option<f64>,
+    ) -> FilterResult {
+        // Basic checks
+        if let FilterResult::Filtered(reason) = self.check_on_chain(dev_holdings_pct, liquidity_sol) {
+            return FilterResult::Filtered(reason);
+        }
+
+        // Market cap check (if provided)
+        if let Some(mcap) = market_cap_sol {
+            if let FilterResult::Filtered(reason) = self.check_market_cap(mcap) {
+                return FilterResult::Filtered(reason);
+            }
+        }
+
+        // Bonding curve check (if provided)
+        if let Some(bc_pct) = bonding_curve_pct {
+            if let FilterResult::Filtered(reason) = self.check_bonding_curve(bc_pct) {
+                return FilterResult::Filtered(reason);
+            }
+        }
+
+        FilterResult::Pass
+    }
+
+    /// Get minimum bonding curve requirement (for external use)
+    pub fn min_bonding_curve_pct(&self) -> f64 {
+        self.config.min_bonding_curve_pct
+    }
+
+    /// Get minimum market cap requirement (for external use)
+    pub fn min_market_cap_sol(&self) -> f64 {
+        self.config.min_market_cap_sol
     }
 
     /// Is filtering enabled?

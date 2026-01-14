@@ -164,6 +164,15 @@ pub struct FilterConfig {
     pub name_patterns: Vec<String>,
     #[serde(default)]
     pub blocked_patterns: Vec<String>,
+    /// Minimum market cap in SOL (0 = no minimum, use for established tokens)
+    #[serde(default)]
+    pub min_market_cap_sol: f64,
+    /// Minimum bonding curve progress % (0-100, 0 = new tokens, 20+ = established)
+    #[serde(default)]
+    pub min_bonding_curve_pct: f64,
+    /// Maximum bonding curve progress % (tokens too close to graduation may be risky)
+    #[serde(default = "default_filter_max_bonding_curve")]
+    pub max_bonding_curve_pct: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -545,6 +554,10 @@ fn default_max_dev_holdings() -> f64 {
     20.0
 }
 
+fn default_filter_max_bonding_curve() -> f64 {
+    85.0  // Max bonding curve % (too close to graduation = risky)
+}
+
 fn default_take_profit_pct() -> f64 {
     50.0
 }
@@ -840,6 +853,9 @@ impl Default for Config {
                 max_dev_holdings_pct: default_max_dev_holdings(),
                 name_patterns: vec![],
                 blocked_patterns: vec![],
+                min_market_cap_sol: 0.0,
+                min_bonding_curve_pct: 0.0,
+                max_bonding_curve_pct: default_filter_max_bonding_curve(),
             },
             wallet_tracking: WalletTrackingConfig {
                 enabled: false,
