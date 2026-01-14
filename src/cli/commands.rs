@@ -1333,10 +1333,10 @@ pub async fn sell(
                 // Wait for tx confirmation then query actual SOL received
                 tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                 let sol_after = rpc_client.get_balance(&balance_wallet).unwrap_or(0) as f64 / 1_000_000_000.0;
-                let actual_received = (sol_after - sol_before).max(0.0);
+                let raw_received = (sol_after - sol_before).max(0.0);
 
                 println!("Balance after sell: {:.4} SOL", sol_after);
-                println!("SOL received: {:.4} SOL", actual_received);
+                println!("SOL received (raw): {:.4} SOL", raw_received);
 
                 // Update position manager and stats
                 if let Some(ref pos) = position {
@@ -1349,6 +1349,19 @@ pub async fn sell(
                         amount_value as u64
                     };
 
+                    // Sanity check: received SOL shouldn't be more than 10x position cost
+                    // If it is, the balance query likely failed (sol_before was 0)
+                    let max_reasonable = pos.total_cost_sol * 10.0;
+                    let actual_received = if raw_received > max_reasonable {
+                        warn!(
+                            "Balance query anomaly: before={:.4}, after={:.4}, diff={:.4} (max reasonable: {:.4}) - using estimate",
+                            sol_before, sol_after, raw_received, max_reasonable
+                        );
+                        0.0 // Force fallback to estimate
+                    } else {
+                        raw_received
+                    };
+
                     // Use actual received SOL, fallback to estimate if balance query failed
                     let received = if actual_received > 0.0 {
                         actual_received
@@ -1356,7 +1369,7 @@ pub async fn sell(
                         // Estimate based on position price (use current_price if available, else entry_price)
                         let price = if pos.current_price > 0.0 { pos.current_price } else { pos.entry_price };
                         let estimated = (tokens_sold as f64 * price) * 0.98;
-                        warn!("Balance query returned 0, using estimated received: {:.4} SOL", estimated);
+                        warn!("Balance query returned 0 or anomaly detected, using estimated received: {:.4} SOL", estimated);
                         estimated
                     };
 
@@ -3193,24 +3206,27 @@ pub async fn hot_scan(
 
                                     // Wait for tx confirmation, then query actual token balance
                                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                    let actual_balance = query_token_balance(
+                                    let actual_balance_raw = query_token_balance(
                                         &rpc_client,
                                         &keypair.pubkey(),
                                         &token.mint,
                                     );
+                                    // Normalize balance: pump.fun tokens have 6 decimals
+                                    // query_token_balance returns raw units, we need normalized tokens
+                                    let actual_balance = actual_balance_raw / 1_000_000;
                                     if actual_balance > 0 && actual_balance != estimated_tokens {
                                         info!(
-                                            "Actual token balance: {} (estimated: {})",
-                                            actual_balance, estimated_tokens
+                                            "Actual token balance: {} (raw: {}, estimated: {})",
+                                            actual_balance, actual_balance_raw, estimated_tokens
                                         );
-                                        // Update position with actual balance
+                                        // Update position with NORMALIZED balance (not raw units)
                                         if let Err(e) = position_manager
                                             .update_token_amount(&token.mint, actual_balance)
                                             .await
                                         {
                                             warn!("Failed to update token amount: {}", e);
                                         }
-                                    } else if actual_balance == 0 {
+                                    } else if actual_balance_raw == 0 {
                                         warn!("Token balance query returned 0 - tx may not have confirmed yet");
                                     }
 

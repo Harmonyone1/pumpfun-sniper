@@ -33,6 +33,8 @@ pub struct Config {
     pub strategy: StrategyEngineConfig,
     #[serde(default)]
     pub smart_money: SmartMoneyConfig,
+    #[serde(default)]
+    pub early_detection: EarlyDetectionConfig,
 }
 
 /// Smart money detection and kill-switch configuration
@@ -172,6 +174,92 @@ pub struct WalletTrackingConfig {
     pub wallets: Vec<String>,
     #[serde(default = "default_true")]
     pub priority_boost: bool,
+    /// Minimum SOL trade size to trigger alert
+    #[serde(default = "default_min_trade_sol")]
+    pub min_trade_sol: f64,
+    /// Auto-buy when tracked wallet buys
+    #[serde(default)]
+    pub auto_copy_trade: bool,
+}
+
+fn default_min_trade_sol() -> f64 { 0.5 }
+
+/// Early detection configuration for pre-pump signals
+#[derive(Debug, Clone, Deserialize)]
+pub struct EarlyDetectionConfig {
+    /// Enable early detection features
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    // Volume spike detection
+    #[serde(default = "default_true")]
+    pub volume_spike_enabled: bool,
+    /// Volume increase ratio to trigger signal (3.0 = 3x normal)
+    #[serde(default = "default_volume_spike_ratio")]
+    pub volume_spike_ratio: f64,
+    /// Time window for volume measurement (seconds)
+    #[serde(default = "default_volume_window_secs")]
+    pub volume_window_secs: u64,
+
+    // Accumulation pattern detection
+    #[serde(default = "default_true")]
+    pub accumulation_enabled: bool,
+    /// Buy/sell ratio threshold for accumulation signal
+    #[serde(default = "default_accumulation_ratio")]
+    pub accumulation_buy_ratio: f64,
+    /// Minimum unique buyers for accumulation signal
+    #[serde(default = "default_min_unique_buyers")]
+    pub min_unique_buyers: u32,
+
+    // First trades analysis
+    #[serde(default = "default_true")]
+    pub first_trades_enabled: bool,
+    /// Number of first trades to analyze
+    #[serde(default = "default_first_trades_count")]
+    pub first_trades_count: u32,
+    /// Whale buy threshold in SOL
+    #[serde(default = "default_whale_buy_threshold")]
+    pub whale_buy_threshold_sol: f64,
+    /// Track if creator is buying back
+    #[serde(default = "default_true")]
+    pub creator_buying_back: bool,
+
+    // Bonding curve position
+    /// Maximum bonding curve % to consider for entry
+    #[serde(default = "default_max_bonding_curve")]
+    pub max_bonding_curve_pct: f64,
+    /// Bonus score for very early entries
+    #[serde(default = "default_early_entry_bonus")]
+    pub early_entry_bonus: f64,
+}
+
+fn default_volume_spike_ratio() -> f64 { 3.0 }
+fn default_volume_window_secs() -> u64 { 60 }
+fn default_accumulation_ratio() -> f64 { 4.0 }
+fn default_min_unique_buyers() -> u32 { 5 }
+fn default_first_trades_count() -> u32 { 10 }
+fn default_whale_buy_threshold() -> f64 { 1.0 }
+fn default_max_bonding_curve() -> f64 { 30.0 }
+fn default_early_entry_bonus() -> f64 { 0.2 }
+
+impl Default for EarlyDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            volume_spike_enabled: true,
+            volume_spike_ratio: 3.0,
+            volume_window_secs: 60,
+            accumulation_enabled: true,
+            accumulation_buy_ratio: 4.0,
+            min_unique_buyers: 5,
+            first_trades_enabled: true,
+            first_trades_count: 10,
+            whale_buy_threshold_sol: 1.0,
+            creator_buying_back: true,
+            max_bonding_curve_pct: 30.0,
+            early_entry_bonus: 0.2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -757,6 +845,8 @@ impl Default for Config {
                 enabled: false,
                 wallets: vec![],
                 priority_boost: true,
+                min_trade_sol: default_min_trade_sol(),
+                auto_copy_trade: false,
             },
             auto_sell: AutoSellConfig {
                 enabled: true,
@@ -786,6 +876,7 @@ impl Default for Config {
             adaptive_filter: AdaptiveFilterConfig::default(),
             strategy: StrategyEngineConfig::default(),
             smart_money: SmartMoneyConfig::default(),
+            early_detection: EarlyDetectionConfig::default(),
         }
     }
 }

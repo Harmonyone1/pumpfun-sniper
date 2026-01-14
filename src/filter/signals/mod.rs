@@ -14,6 +14,7 @@ use crate::filter::types::{PositionSignalContext, SignalContext, TradeSignalCont
 pub mod metadata;
 pub mod smart_money;
 pub mod wallet_behavior;
+pub mod early_momentum;
 // pub mod distribution;
 // pub mod order_flow;
 // pub mod wallet_profile;
@@ -23,6 +24,7 @@ pub mod wallet_behavior;
 pub use metadata::MetadataSignalProvider;
 pub use smart_money::SmartMoneySignalProvider;
 pub use wallet_behavior::WalletBehaviorSignalProvider;
+pub use early_momentum::EarlyMomentumSignalProvider;
 
 /// Signal value range: -1.0 (extreme risk) to +1.0 (extreme opportunity)
 pub type SignalValue = f64;
@@ -101,6 +103,18 @@ pub enum SignalType {
     // === Holder Distribution Signals ===
     /// Token holder concentration analysis
     HolderConcentration,
+
+    // === Early Detection Signals (Pre-Pump) ===
+    /// Volume spike detection (sudden increase before price move)
+    VolumeSpike,
+    /// Accumulation pattern (many buys, few sells)
+    AccumulationPattern,
+    /// First trades analysis (whale buys at launch)
+    FirstTradesQuality,
+    /// Bonding curve position (earlier = better)
+    BondingCurvePosition,
+    /// Creator buying back their own token
+    CreatorBuyback,
 }
 
 impl SignalType {
@@ -119,6 +133,11 @@ impl SignalType {
                 | SignalType::FreezeAuthority   // If cached from Helius
                 | SignalType::HolderConcentration // If cached from Helius
                 | SignalType::WalletHistory // If cached from Helius
+                | SignalType::BondingCurvePosition // From token creation event
+                | SignalType::AccumulationPattern  // From trade stream
+                | SignalType::VolumeSpike         // From trade stream
+                | SignalType::FirstTradesQuality  // From trade stream
+                | SignalType::CreatorBuyback      // From trade stream
         )
     }
 
@@ -160,6 +179,13 @@ impl SignalType {
 
             // Holder distribution signals
             SignalType::HolderConcentration => 1.5,
+
+            // Early detection signals - HIGH weight for pre-pump advantage
+            SignalType::VolumeSpike => 1.8,          // Strong early indicator
+            SignalType::AccumulationPattern => 1.6,  // Smart money accumulating
+            SignalType::FirstTradesQuality => 1.5,   // Whale buys at launch
+            SignalType::BondingCurvePosition => 1.3, // Earlier entry bonus
+            SignalType::CreatorBuyback => 1.4,       // Creator confidence
         }
     }
 
@@ -201,6 +227,13 @@ impl SignalType {
             }
 
             SignalType::HolderConcentration => SignalCategory::Distribution,
+
+            // Early detection signals
+            SignalType::VolumeSpike
+            | SignalType::AccumulationPattern
+            | SignalType::FirstTradesQuality
+            | SignalType::BondingCurvePosition
+            | SignalType::CreatorBuyback => SignalCategory::EarlyDetection,
         }
     }
 }
@@ -221,6 +254,7 @@ pub enum SignalCategory {
     WalletProfile,
     PumpfunSpecific,
     Metadata,
+    EarlyDetection,
 }
 
 /// A computed signal with metadata

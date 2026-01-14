@@ -75,11 +75,21 @@ blocked_patterns = ["(?i)scam", "(?i)rug", "(?i)honeypot"]
 
 [wallet_tracking]
 # Enable wallet copy-trading
-enabled = false
+enabled = true
 # List of wallet addresses to track
-wallets = []
+# These are known profitable pump.fun traders - add more as you discover them
+# Find profitable wallets on: solscan.io, birdeye.so, or track successful trades
+wallets = [
+  # Example format - replace with real profitable wallets you find:
+  # "WALLET_ADDRESS_1",
+  # "WALLET_ADDRESS_2",
+]
 # Give tracked wallet events priority in queue
 priority_boost = true
+# Minimum SOL trade size to trigger alert (filter noise)
+min_trade_sol = 0.5
+# Auto-buy when tracked wallet buys (requires wallets list)
+auto_copy_trade = false
 
 [auto_sell]
 # Enable automatic take-profit and stop-loss
@@ -198,6 +208,42 @@ min_extraction_interval_secs = 3600
 #   - Withdraw from vault (vault is receive-only)
 #   - Override emergency locks
 #   - Execute large transfers without user approval
+
+[early_detection]
+# Pre-pump detection signals for earlier entries
+enabled = true
+
+# === VOLUME SPIKE DETECTION ===
+# Detect sudden volume increases before price moves
+volume_spike_enabled = true
+# Minimum volume increase ratio vs baseline (3.0 = 3x normal volume)
+volume_spike_ratio = 3.0
+# Time window for measuring volume spike (seconds)
+volume_window_secs = 60
+
+# === ACCUMULATION PATTERN ===
+# Detect when smart money is accumulating (many buys, few sells)
+accumulation_enabled = true
+# Minimum buy/sell ratio to trigger accumulation signal
+accumulation_buy_ratio = 4.0
+# Minimum number of unique buyers
+min_unique_buyers = 5
+
+# === FIRST TRADES ANALYSIS ===
+# Analyze first N trades after token creation
+first_trades_enabled = true
+# Number of first trades to analyze
+first_trades_count = 10
+# If first trades are whale buys (> this SOL), positive signal
+whale_buy_threshold_sol = 1.0
+# If creator is among first buyers, positive signal (confidence)
+creator_buying_back = true
+
+# === BONDING CURVE PROGRESS ===
+# Enter earlier when bonding curve is still low
+max_bonding_curve_pct = 30.0
+# Bonus score for very early entries (< 10% bonding curve)
+early_entry_bonus = 0.2
 
 [smart_money]
 # Enable smart money detection features

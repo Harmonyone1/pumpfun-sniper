@@ -318,6 +318,10 @@ pub struct SignalContext {
     pub market_cap_sol: f64,
     pub timestamp: DateTime<Utc>,
 
+    // Early detection data
+    /// Bonding curve progress percentage (0-100%)
+    pub bonding_curve_pct: Option<f64>,
+
     // Enriched data (may be None in hot path)
     pub creator_history: Option<WalletHistory>,
     pub token_distribution: Option<TokenDistribution>,
@@ -339,6 +343,11 @@ impl SignalContext {
         v_sol_in_bonding_curve: u64,
         market_cap_sol: f64,
     ) -> Self {
+        // Calculate bonding curve percentage
+        // pump.fun bonding curve completes at ~85 SOL, starts at ~30 SOL virtual
+        // Progress = (current_sol - 30) / (85 - 30) * 100
+        let bc_pct = Self::calculate_bonding_curve_pct(v_sol_in_bonding_curve);
+
         Self {
             mint,
             name,
@@ -351,11 +360,24 @@ impl SignalContext {
             v_sol_in_bonding_curve,
             market_cap_sol,
             timestamp: Utc::now(),
+            bonding_curve_pct: Some(bc_pct),
             creator_history: None,
             token_distribution: None,
             recent_trades: None,
             order_flow: None,
         }
+    }
+
+    /// Calculate bonding curve progress percentage
+    /// pump.fun bonding curve: starts at ~30 SOL virtual, completes at ~85 SOL
+    pub fn calculate_bonding_curve_pct(v_sol_in_bonding_curve: u64) -> f64 {
+        const INITIAL_VIRTUAL_SOL: f64 = 30.0;
+        const COMPLETION_SOL: f64 = 85.0;
+        const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+
+        let current_sol = v_sol_in_bonding_curve as f64 / LAMPORTS_PER_SOL;
+        let progress = ((current_sol - INITIAL_VIRTUAL_SOL) / (COMPLETION_SOL - INITIAL_VIRTUAL_SOL)) * 100.0;
+        progress.clamp(0.0, 100.0)
     }
 
     /// Calculate estimated token price from bonding curve
