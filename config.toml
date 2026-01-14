@@ -41,6 +41,9 @@ api_key = "618ppm9rf8r3cru29h56jgk4f9anerkj5d44yh3q8dvm4vbd9mtq4uvra9gmmy1re9m38
 lightning_wallet = "9EwatauCtiQSK4ArSPvuQZFqtF6mvogM8qurL6av24mo"
 # Use PumpPortal for trading (true) or Jito bundles (false)
 use_for_trading = true
+# CRITICAL: Force Local API even with API key set (0.5% fee vs 1% Lightning)
+# This saves 0.5% per trade = 1% round-trip savings
+force_local_api = true
 
 [backpressure]
 # Max events in processing queue
@@ -103,7 +106,8 @@ auto_copy_trade = true
 # Enable automatic take-profit and stop-loss
 enabled = true
 # Final take-profit: exit remaining position at this level
-take_profit_pct = 12.0
+# NOTE: Must account for ~3-4% round-trip fees (Local API 0.5% + pump.fun ~1%)
+take_profit_pct = 25.0
 # Stop loss: exit if drops this % from entry
 stop_loss_pct = 15.0
 # Enable partial take-profit (sell portion at TP, hold rest)
@@ -111,13 +115,14 @@ partial_take_profit = false
 # Price polling interval in milliseconds (200ms for faster crash detection)
 price_poll_interval_ms = 200
 
-# === LAYERED EXITS ===
-# Layer 1: Sell 50% at quick_profit_pct to lock in early gains
-quick_profit_pct = 4.0
-# Layer 2: Sell 25% at second_profit_pct for additional profit capture
-second_profit_pct = 8.0
-# Layer 3: Sell remaining at take_profit_pct (above)
-# Example: Buy 100 tokens, sell 50 at +4%, sell 25 at +8%, sell 25 at +12%
+# === LAYERED EXITS (FEE-ADJUSTED) ===
+# With ~3% round-trip fees, must target higher % to net profit
+# Layer 1: Sell 50% at quick_profit_pct (net ~5% after fees)
+quick_profit_pct = 8.0
+# Layer 2: Sell 25% at second_profit_pct (net ~12% after fees)
+second_profit_pct = 15.0
+# Layer 3: Sell remaining at take_profit_pct (net ~22% after fees)
+# Example: Buy 100 tokens, sell 50 at +8%, sell 25 at +15%, sell 25 at +25%
 
 # === NO-MOVEMENT EXIT ===
 # DISABLED: Was causing exits right before price spikes

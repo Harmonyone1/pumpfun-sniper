@@ -234,7 +234,9 @@ impl Recommendation {
         match self {
             Recommendation::StrongBuy => 1.5,
             Recommendation::Opportunity => 1.0,
-            Recommendation::Probe => 0.05, // 5% probe position
+            // FIXED: 5% probe was too small and got eaten by fees
+            // Increased to 50% to make trades meaningful after fees
+            Recommendation::Probe => 0.5, // 50% position (was 5%, losing to fees)
             Recommendation::Observe => 0.0,
             Recommendation::Avoid => 0.0,
         }
@@ -662,7 +664,7 @@ mod tests {
         // Opportunity = normal
         assert_eq!(Recommendation::Opportunity.position_multiplier(), 1.0);
         // Probe = small (5%)
-        assert_eq!(Recommendation::Probe.position_multiplier(), 0.05);
+        assert_eq!(Recommendation::Probe.position_multiplier(), 0.5);
         // Observe = no trading
         assert_eq!(Recommendation::Observe.position_multiplier(), 0.0);
         // Avoid = no trading

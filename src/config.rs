@@ -122,6 +122,9 @@ pub struct PumpPortalConfig {
     /// Lightning wallet address (the wallet tied to the API key)
     #[serde(default)]
     pub lightning_wallet: String,
+    /// Force Local API even if api_key is present (0.5% fee vs 1%)
+    #[serde(default)]
+    pub force_local_api: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -836,6 +839,7 @@ impl Default for Config {
                 api_key: String::new(),
                 use_for_trading: true,
                 lightning_wallet: String::new(),
+                force_local_api: false,
             },
             backpressure: BackpressureConfig {
                 channel_capacity: default_channel_capacity(),

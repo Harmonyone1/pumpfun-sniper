@@ -142,14 +142,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     info!("Loaded keypair: {}", keypair.pubkey());
 
     // Initialize trader based on configuration
-    let use_local_api = config.pumpportal.api_key.is_empty();
+    // Force Local API if configured (0.5% fee vs 1% for Lightning)
+    let use_local_api = config.pumpportal.api_key.is_empty() || config.pumpportal.force_local_api;
     let pumpportal_trader = if config.pumpportal.use_for_trading {
         info!("Using PumpPortal API for trading");
         if use_local_api {
-            info!("No API key configured - using Local API (sign + send locally)");
+            if config.pumpportal.force_local_api {
+                info!("Force Local API enabled - using Local API (0.5% fee, saving 0.5% per trade)");
+            } else {
+                info!("No API key configured - using Local API (sign + send locally)");
+            }
             Some(PumpPortalTrader::local())
         } else {
-            info!("Using Lightning API (0.5% fee)");
+            info!("Using Lightning API (1% fee) - consider force_local_api=true to save 0.5%");
             Some(PumpPortalTrader::lightning(
                 config.pumpportal.api_key.clone(),
             ))
@@ -932,14 +937,40 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         info!("Buy successful! Signature: {}", signature);
                                         info!("View on Solscan: https://solscan.io/tx/{}", signature);
 
-                                        // Record position (estimate token amount from bonding curve data)
+                                        // CRITICAL: Verify tokens were actually received before recording position
+                                        // Wait for transaction to confirm
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                                        // Determine which wallet to check based on API mode
+                                        let check_wallet = if use_local_api {
+                                            keypair.pubkey()
+                                        } else {
+                                            // For Lightning API, use the lightning wallet
+                                            Pubkey::from_str(&config.pumpportal.lightning_wallet)
+                                                .unwrap_or(keypair.pubkey())
+                                        };
+
+                                        let actual_tokens = query_token_balance(&rpc_client, &check_wallet, mint);
+
+                                        if actual_tokens == 0 {
+                                            // Transaction may have failed - DON'T record position
+                                            error!(
+                                                "BUY VERIFICATION FAILED: No tokens received for {} ({}) after 2s wait. TX may have failed silently. NOT recording position.",
+                                                token.symbol, mint
+                                            );
+                                            error!("Check transaction on Solscan: https://solscan.io/tx/{}", signature);
+                                            // Skip position recording and kill-switch setup
+                                            continue;
+                                        }
+
+                                        info!("BUY VERIFIED: Received {} tokens for {}", actual_tokens, token.symbol);
+
+                                        // Record position with ACTUAL token amount (not estimate)
                                         let estimated_price = if token.v_tokens_in_bonding_curve > 0 {
                                             token.v_sol_in_bonding_curve as f64 / token.v_tokens_in_bonding_curve as f64
                                         } else {
                                             0.000001 // fallback
                                         };
-
-                                        let estimated_tokens = (final_amount_sol / estimated_price) as u64;
 
                                         // Convert recommendation to EntryType for context-aware exits
                                         let entry_type = match entry_recommendation {
@@ -954,7 +985,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             name: token.name.clone(),
                                             symbol: token.symbol.clone(),
                                             bonding_curve: token.bonding_curve_key.clone(),
-                                            token_amount: estimated_tokens,
+                                            token_amount: actual_tokens, // Use ACTUAL tokens, not estimate
                                             entry_price: estimated_price,
                                             total_cost_sol: final_amount_sol,
                                             entry_time: chrono::Utc::now(),
@@ -992,7 +1023,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 entry_price: estimated_price,
                                                 entry_time: chrono::Utc::now(),
                                                 size_sol: final_amount_sol,
-                                                tokens_held: estimated_tokens,
+                                                tokens_held: actual_tokens,
                                                 strategy: config.strategy.default_strategy.clone(),
                                                 exit_style: crate::strategy::types::ExitStyle::default(),
                                                 highest_price: estimated_price,
@@ -2359,17 +2390,21 @@ pub async fn hot_scan(
         std::time::Duration::from_millis(config.rpc.timeout_ms),
     ));
 
-    // Initialize trader
-    let use_local_api = config.pumpportal.api_key.is_empty();
+    // Initialize trader - Force Local API if configured (0.5% fee vs 1% for Lightning)
+    let use_local_api = config.pumpportal.api_key.is_empty() || config.pumpportal.force_local_api;
     let trader = if config.pumpportal.use_for_trading {
         if use_local_api {
-            info!("Using Local API (sign + send locally)");
+            if config.pumpportal.force_local_api {
+                info!("Force Local API enabled - using Local API (0.5% fee)");
+            } else {
+                info!("Using Local API (sign + send locally)");
+            }
             info!("Trading wallet: {}", keypair.pubkey());
             Some(std::sync::Arc::new(
                 crate::trading::pumpportal_api::PumpPortalTrader::local(),
             ))
         } else {
-            info!("Using Lightning API (0.5% fee)");
+            info!("Using Lightning API (1% fee) - consider force_local_api=true to save 0.5%");
             if !config.pumpportal.lightning_wallet.is_empty() {
                 info!(
                     "Lightning wallet (for trading & balance): {}",
@@ -3281,19 +3316,46 @@ pub async fn hot_scan(
                                         continue;
                                     }
 
-                                    // Wait for tx confirmation, then query actual token balance
+                                    // CRITICAL: Wait for tx confirmation, then verify tokens received
                                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                                    // Determine which wallet to check based on API mode
+                                    let check_wallet = if use_local_api {
+                                        keypair.pubkey()
+                                    } else {
+                                        // For Lightning API, use the lightning wallet
+                                        Pubkey::from_str(&config.pumpportal.lightning_wallet)
+                                            .unwrap_or(keypair.pubkey())
+                                    };
+
                                     let actual_balance_raw = query_token_balance(
                                         &rpc_client,
-                                        &keypair.pubkey(),
+                                        &check_wallet,
                                         &token.mint,
                                     );
                                     // Normalize balance: pump.fun tokens have 6 decimals
                                     // query_token_balance returns raw units, we need normalized tokens
                                     let actual_balance = actual_balance_raw / 1_000_000;
-                                    if actual_balance > 0 && actual_balance != estimated_tokens {
+
+                                    if actual_balance_raw == 0 {
+                                        // CRITICAL: TX failed silently - REMOVE the position we just recorded
+                                        error!(
+                                            "BUY VERIFICATION FAILED: No tokens received for {} after 3s wait. Removing failed position.",
+                                            token.symbol
+                                        );
+                                        if let Err(e) = position_manager.abandon_position(&token.mint).await {
+                                            error!("Failed to abandon failed position: {}", e);
+                                        }
+                                        bought.remove(&token.mint);
+                                        persist_bought_mints(&*bought_mints_path, &*bought);
+                                        continue; // Skip kill-switch setup for failed buy
+                                    }
+
+                                    info!("BUY VERIFIED: Received {} tokens for {}", actual_balance, token.symbol);
+
+                                    if actual_balance != estimated_tokens {
                                         info!(
-                                            "Actual token balance: {} (raw: {}, estimated: {})",
+                                            "Updating position with actual balance: {} (raw: {}, estimated: {})",
                                             actual_balance, actual_balance_raw, estimated_tokens
                                         );
                                         // Update position with NORMALIZED balance (not raw units)
@@ -3303,8 +3365,6 @@ pub async fn hot_scan(
                                         {
                                             warn!("Failed to update token amount: {}", e);
                                         }
-                                    } else if actual_balance_raw == 0 {
-                                        warn!("Token balance query returned 0 - tx may not have confirmed yet");
                                     }
 
                                     // === SET UP KILL-SWITCH MONITORING ===
