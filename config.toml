@@ -171,9 +171,10 @@ vault_wallet = "vault-robinhood"
 credentials_dir = "credentials"
 
 # Trading wallets - list of keypair paths for multi-wallet trading
+# Wallet-2 disabled until multi-wallet bug fix is deployed
 trading_wallets = [
     "credentials/hot-trading/keypair.json",
-    "credentials/wallet-2/keypair.json",
+    # "credentials/wallet-2/keypair.json",
 ]
 
 # Wallet selection strategy: "round-robin", "lowest-balance", "highest-balance"
