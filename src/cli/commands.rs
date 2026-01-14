@@ -11,9 +11,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::filter::{
-    AdaptiveFilter, KillSwitchDecision, KillSwitchEvaluator, MetadataSignalProvider, Recommendation,
-    SignalContext, WalletBehaviorSignalProvider,
+    AdaptiveFilter, HeliusClient, KillSwitchDecision, KillSwitchEvaluator, MetadataSignalProvider,
+    Recommendation, SignalContext, SmartMoneySignalProvider, WalletBehaviorSignalProvider,
+    WalletProfiler, WalletProfilerConfig,
 };
+use crate::filter::signals::EarlyMomentumSignalProvider;
 use crate::strategy::engine::StrategyEngine;
 use crate::strategy::types::TradingAction;
 use crate::stream::pumpportal::{PumpPortalClient, PumpPortalEvent};
@@ -224,6 +226,24 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let token_filter = crate::filter::token_filter::TokenFilter::new(config.filters.clone())
         .map_err(|e| anyhow::anyhow!("Failed to create token filter: {}", e))?;
 
+    // Initialize Helius client and WalletProfiler for smart money signals
+    let (helius_client, wallet_profiler) = if config.smart_money.enabled {
+        if let Some(helius) = HeliusClient::from_rpc_url(&config.rpc.endpoint) {
+            info!("Smart money signals ENABLED - Helius client initialized");
+            let helius_arc = Arc::new(helius);
+            let profiler = Arc::new(WalletProfiler::new(
+                helius_arc.clone(),
+                WalletProfilerConfig::default(),
+            ));
+            (Some(helius_arc), Some(profiler))
+        } else {
+            warn!("Smart money enabled but Helius API key not found in RPC URL");
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     // Initialize adaptive filter if enabled
     let adaptive_filter = if config.adaptive_filter.enabled {
         info!("Initializing adaptive filter...");
@@ -238,10 +258,24 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let wallet_provider = Arc::new(WalletBehaviorSignalProvider::new(filter.cache().clone()));
         filter.register_provider(wallet_provider);
 
+        // Register early momentum signal provider
+        let early_momentum = Arc::new(EarlyMomentumSignalProvider::new(
+            config.early_detection.clone(),
+        ));
+        filter.register_provider(early_momentum);
+
+        // Register smart money signal provider if profiler available
+        if let Some(ref profiler) = wallet_profiler {
+            let smart_money = Arc::new(SmartMoneySignalProvider::new(profiler.clone()));
+            filter.register_provider(smart_money);
+            info!("Smart money signal provider registered");
+        }
+
+        let provider_count = if wallet_profiler.is_some() { 4 } else { 3 };
         if filter.is_degraded().await {
             warn!("Adaptive filter running in degraded mode - some signals may be unavailable");
         } else {
-            info!("Adaptive filter initialized with {} providers", 2);
+            info!("Adaptive filter initialized with {} providers", provider_count);
         }
 
         Some(filter)
