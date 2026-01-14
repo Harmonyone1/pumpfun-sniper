@@ -997,6 +997,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             current_price: estimated_price,
                                             kill_switch_triggered: false,
                                             kill_switch_reason: None,
+                                            wallet_pubkey: keypair.pubkey().to_string(),
                                         };
 
                                         if let Err(e) = position_manager.open_position(position).await {
@@ -1264,6 +1265,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 current_price: estimated_price,
                                                 kill_switch_triggered: false,
                                                 kill_switch_reason: None,
+                                                wallet_pubkey: keypair.pubkey().to_string(),
                                             };
                                             if let Err(e) = position_manager.open_position(position).await {
                                                 error!("Failed to record position: {}", e);
@@ -2573,6 +2575,7 @@ pub async fn hot_scan(
         let monitor_kill_switch = kill_switch_evaluator.clone();
         let monitor_helius = helius_client.clone();
         let monitor_use_local_api = use_local_api;
+        let monitor_multi_wallet = multi_wallet.clone();
         // Determine which wallet to query for token balances
         let monitor_wallet = if use_local_api {
             keypair.pubkey()
@@ -2695,9 +2698,14 @@ pub async fn hot_scan(
                         }
 
                         // After 5 seconds: check if we have tokens
-                        // Use monitor_wallet (Lightning wallet or local wallet based on API mode)
+                        // Use position's wallet_pubkey if available (multi-wallet), fallback to monitor_wallet
+                        let check_wallet = if !position.wallet_pubkey.is_empty() {
+                            Pubkey::from_str(&position.wallet_pubkey).unwrap_or(monitor_wallet)
+                        } else {
+                            monitor_wallet
+                        };
                         let token_balance =
-                            query_token_balance(&monitor_rpc, &monitor_wallet, &position.mint);
+                            query_token_balance(&monitor_rpc, &check_wallet, &position.mint);
 
                         if token_balance > 0 {
                             info!(
@@ -2913,14 +2921,56 @@ pub async fn hot_scan(
                             }
 
                             // Query SOL balance BEFORE sell for real P&L tracking
+                            // Use position's wallet if available (multi-wallet), fallback to monitor_wallet
+                            let position_wallet = if !position.wallet_pubkey.is_empty() {
+                                Pubkey::from_str(&position.wallet_pubkey).unwrap_or(monitor_wallet)
+                            } else {
+                                monitor_wallet
+                            };
                             let sol_before = monitor_rpc
-                                .get_balance(&monitor_wallet)
+                                .get_balance(&position_wallet)
                                 .unwrap_or(0) as f64
                                 / 1_000_000_000.0;
 
-                            // Try Lightning API first (attempts 1-3), then local (attempts 4-5)
+                            // Determine the correct keypair for this position
+                            // For multi-wallet, look up keypair by position's wallet_pubkey
+                            let sell_keypair: std::sync::Arc<solana_sdk::signature::Keypair> = if !position.wallet_pubkey.is_empty() {
+                                if let Some(ref mw) = monitor_multi_wallet {
+                                    // Find wallet matching position's pubkey
+                                    if let Some(wallet) = mw.find_by_address(&position.wallet_pubkey) {
+                                        std::sync::Arc::new(
+                                            solana_sdk::signature::Keypair::from_bytes(&wallet.keypair.to_bytes()).unwrap()
+                                        )
+                                    } else {
+                                        warn!("[{}] Position wallet {} not found in multi-wallet, using primary",
+                                              position.symbol, &position.wallet_pubkey[..8]);
+                                        monitor_keypair.clone()
+                                    }
+                                } else {
+                                    monitor_keypair.clone()
+                                }
+                            } else {
+                                monitor_keypair.clone()
+                            };
+
+                            // For Local API mode, use local signing directly
+                            // For Lightning mode, try Lightning first then fall back to local
                             let sell_result: std::result::Result<String, crate::error::Error> =
-                                if *attempts <= 3 {
+                                if monitor_use_local_api {
+                                    // Local API mode: use local signing with correct wallet
+                                    info!("Attempting Local API sell (attempt {}, wallet: {})",
+                                          attempts, &sell_keypair.pubkey().to_string()[..8]);
+                                    trader
+                                        .sell_local(
+                                            &position.mint,
+                                            sell_pct,
+                                            slippage,
+                                            priority_fee,
+                                            &sell_keypair,
+                                            &monitor_rpc,
+                                        )
+                                        .await
+                                } else if *attempts <= 3 {
                                     info!("Attempting Lightning API sell (attempt {})", attempts);
                                     trader
                                         .sell(&position.mint, sell_pct, slippage, priority_fee)
@@ -2933,7 +2983,7 @@ pub async fn hot_scan(
                                             sell_pct,
                                             slippage,
                                             priority_fee,
-                                            &monitor_keypair,
+                                            &sell_keypair,
                                             &monitor_rpc,
                                         )
                                         .await
@@ -2947,7 +2997,7 @@ pub async fn hot_scan(
                                     // Wait for tx confirmation then query actual SOL received
                                     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                                     let sol_after = monitor_rpc
-                                        .get_balance(&monitor_wallet)
+                                        .get_balance(&position_wallet)
                                         .unwrap_or(0) as f64
                                         / 1_000_000_000.0;
                                     let raw_received = (sol_after - sol_before).max(0.0);
@@ -3341,6 +3391,7 @@ pub async fn hot_scan(
                                         current_price: token.price_native,
                                         kill_switch_triggered: false,
                                         kill_switch_reason: None,
+                                        wallet_pubkey: trading_keypair.pubkey().to_string(),
                                     };
 
                                     if let Err(e) = position_manager.open_position(position).await {

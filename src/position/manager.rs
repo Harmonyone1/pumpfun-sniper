@@ -155,6 +155,9 @@ pub struct Position {
     /// Kill-switch reason (if triggered)
     #[serde(default)]
     pub kill_switch_reason: Option<String>,
+    /// Wallet pubkey that holds this position (for multi-wallet support)
+    #[serde(default)]
+    pub wallet_pubkey: String,
 }
 
 impl Position {
