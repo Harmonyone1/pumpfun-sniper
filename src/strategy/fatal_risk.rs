@@ -9,6 +9,19 @@ use std::sync::Arc;
 
 use crate::filter::FilterCache;
 
+/// Explicit availability of an on-chain authority fact.
+///
+/// Missing data must NEVER be modeled as a safe `false`. A cache miss means
+/// `Unavailable`, not "renounced".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityStatus {
+    #[default]
+    Unavailable,
+    Renounced,
+    Active,
+}
+
 /// Fatal risk flags that trigger immediate rejection
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +77,10 @@ pub enum FatalRisk {
 
     /// Token blacklisted
     TokenBlacklisted { reason: String },
+
+    /// A critical risk input required for a safety decision was unavailable.
+    /// This is a fail-closed veto, not a weighted warning.
+    CriticalDataUnavailable { field: String },
 }
 
 impl FatalRisk {
@@ -139,6 +156,9 @@ impl FatalRisk {
             }
             FatalRisk::TokenBlacklisted { reason } => {
                 format!("Token blacklisted: {}", reason)
+            }
+            FatalRisk::CriticalDataUnavailable { field } => {
+                format!("Critical risk data unavailable: {}", field)
             }
         }
     }
@@ -277,14 +297,59 @@ impl FatalRiskEngine {
             }
         }
 
-        // Check mint authority
-        if self.config.check_mint_authority && context.mint_authority_active {
-            return Some(FatalRisk::MintAuthorityActive);
+        // Authority resolution (fail-closed). Context values are authoritative;
+        // a shared FilterCache MintInfo (populated by Helius enrichment) may fill
+        // fields left Unavailable, but must NOT overwrite an explicitly-supplied
+        // Active/Renounced context value. One cache lookup serves both fields.
+        let mut mint_status = context.mint_authority;
+        let mut freeze_status = context.freeze_authority;
+        if mint_status == AuthorityStatus::Unavailable
+            || freeze_status == AuthorityStatus::Unavailable
+        {
+            if let Some(cache) = &self.cache {
+                if let Some(mint_info) = cache.get_mint_info(&context.mint) {
+                    if mint_status == AuthorityStatus::Unavailable {
+                        mint_status = if mint_info.has_mint_authority() {
+                            AuthorityStatus::Active
+                        } else {
+                            AuthorityStatus::Renounced
+                        };
+                    }
+                    if freeze_status == AuthorityStatus::Unavailable {
+                        freeze_status = if mint_info.has_freeze_authority() {
+                            AuthorityStatus::Active
+                        } else {
+                            AuthorityStatus::Renounced
+                        };
+                    }
+                }
+            }
         }
 
-        // Check freeze authority
-        if self.config.check_freeze_authority && context.freeze_authority_active {
-            return Some(FatalRisk::FreezeAuthorityActive);
+        // Check mint authority (fail-closed: Unavailable is a veto)
+        if self.config.check_mint_authority {
+            match mint_status {
+                AuthorityStatus::Active => return Some(FatalRisk::MintAuthorityActive),
+                AuthorityStatus::Renounced => {}
+                AuthorityStatus::Unavailable => {
+                    return Some(FatalRisk::CriticalDataUnavailable {
+                        field: "mint_authority".to_string(),
+                    })
+                }
+            }
+        }
+
+        // Check freeze authority (fail-closed: Unavailable is a veto)
+        if self.config.check_freeze_authority {
+            match freeze_status {
+                AuthorityStatus::Active => return Some(FatalRisk::FreezeAuthorityActive),
+                AuthorityStatus::Renounced => {}
+                AuthorityStatus::Unavailable => {
+                    return Some(FatalRisk::CriticalDataUnavailable {
+                        field: "freeze_authority".to_string(),
+                    })
+                }
+            }
         }
 
         // Check creator dump
@@ -383,9 +448,10 @@ pub struct FatalRiskContext {
     pub mint: String,
     pub creator: String,
 
-    // Authority flags
-    pub mint_authority_active: bool,
-    pub freeze_authority_active: bool,
+    // Authority status (defaults to Unavailable; missing data is fail-closed,
+    // never a safe `false`)
+    pub mint_authority: AuthorityStatus,
+    pub freeze_authority: AuthorityStatus,
 
     // Creator behavior
     /// (pct_sold, within_secs) if creator has sold
@@ -416,10 +482,10 @@ impl FatalRiskContext {
         }
     }
 
-    /// Set authority flags
-    pub fn with_authorities(mut self, mint_active: bool, freeze_active: bool) -> Self {
-        self.mint_authority_active = mint_active;
-        self.freeze_authority_active = freeze_active;
+    /// Set explicit authority statuses.
+    pub fn with_authorities(mut self, mint: AuthorityStatus, freeze: AuthorityStatus) -> Self {
+        self.mint_authority = mint;
+        self.freeze_authority = freeze;
         self
     }
 
@@ -446,7 +512,7 @@ mod tests {
         let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
 
         let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
-            .with_authorities(true, false);
+            .with_authorities(AuthorityStatus::Active, AuthorityStatus::Renounced);
 
         let result = engine.check(&context).await;
         assert!(matches!(result, Some(FatalRisk::MintAuthorityActive)));
@@ -458,7 +524,7 @@ mod tests {
         let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
 
         let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
-            .with_authorities(false, true);
+            .with_authorities(AuthorityStatus::Renounced, AuthorityStatus::Active);
 
         let result = engine.check(&context).await;
         assert!(matches!(result, Some(FatalRisk::FreezeAuthorityActive)));
@@ -483,6 +549,7 @@ mod tests {
         let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
 
         let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
+            .with_authorities(AuthorityStatus::Renounced, AuthorityStatus::Renounced)
             .with_liquidity(0.01, 5.0, 0.1); // Only 0.01 SOL liquidity
 
         let result = engine.check(&context).await;
@@ -498,6 +565,7 @@ mod tests {
         let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
 
         let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
+            .with_authorities(AuthorityStatus::Renounced, AuthorityStatus::Renounced)
             .with_liquidity(1.0, 60.0, 0.1); // 60% slippage
 
         let result = engine.check(&context).await;
@@ -510,6 +578,7 @@ mod tests {
         let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
 
         let mut context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
+            .with_authorities(AuthorityStatus::Renounced, AuthorityStatus::Renounced)
             .with_liquidity(1.0, 5.0, 0.1);
         context.wash_trading_score = 0.85;
 
@@ -526,7 +595,7 @@ mod tests {
         let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
 
         let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
-            .with_authorities(false, false)
+            .with_authorities(AuthorityStatus::Renounced, AuthorityStatus::Renounced)
             .with_liquidity(1.0, 5.0, 0.1);
 
         let result = engine.check(&context).await;
@@ -558,5 +627,84 @@ mod tests {
         };
         assert!(!risk.is_creator_risk());
         assert!(risk.is_liquidity_risk());
+    }
+
+    fn mint_info(
+        mint_auth: Option<&str>,
+        freeze_auth: Option<&str>,
+    ) -> crate::filter::helius::MintInfo {
+        crate::filter::helius::MintInfo {
+            mint: "mint".to_string(),
+            mint_authority: mint_auth.map(|s| s.to_string()),
+            freeze_authority: freeze_auth.map(|s| s.to_string()),
+            supply: 1_000_000,
+            decimals: 6,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authority_cache_miss_is_fatal_unavailable() {
+        let cache = make_cache();
+        let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
+
+        // No MintInfo in cache; context authorities default to Unavailable.
+        let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
+            .with_liquidity(1.0, 5.0, 0.1);
+
+        let result = engine.check(&context).await;
+        match result {
+            Some(FatalRisk::CriticalDataUnavailable { field }) => {
+                assert_eq!(field, "mint_authority");
+            }
+            other => panic!("expected CriticalDataUnavailable(mint_authority), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authority_cache_hit_renounced_is_not_authority_fatal() {
+        let cache = make_cache();
+        cache.set_mint_info("mint", mint_info(None, None));
+        let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
+
+        let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
+            .with_liquidity(1.0, 5.0, 0.1);
+
+        let result = engine.check(&context).await;
+        assert!(
+            !matches!(
+                result,
+                Some(FatalRisk::MintAuthorityActive)
+                    | Some(FatalRisk::FreezeAuthorityActive)
+                    | Some(FatalRisk::CriticalDataUnavailable { .. })
+            ),
+            "renounced authority via cache must not be authority-fatal, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authority_cache_hit_active_mint_is_fatal() {
+        let cache = make_cache();
+        cache.set_mint_info("mint", mint_info(Some("TestMintAuthorityPubkey"), None));
+        let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
+
+        let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
+            .with_liquidity(1.0, 5.0, 0.1);
+
+        let result = engine.check(&context).await;
+        assert!(matches!(result, Some(FatalRisk::MintAuthorityActive)));
+    }
+
+    #[tokio::test]
+    async fn test_authority_cache_hit_active_freeze_is_fatal() {
+        let cache = make_cache();
+        cache.set_mint_info("mint", mint_info(None, Some("TestFreezeAuthorityPubkey")));
+        let engine = FatalRiskEngine::with_cache(FatalRiskConfig::default(), cache);
+
+        let context = FatalRiskContext::new("mint".to_string(), "creator".to_string())
+            .with_liquidity(1.0, 5.0, 0.1);
+
+        let result = engine.check(&context).await;
+        assert!(matches!(result, Some(FatalRisk::FreezeAuthorityActive)));
     }
 }

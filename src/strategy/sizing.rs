@@ -93,22 +93,26 @@ impl PositionSizer {
         // 4. Execution quality factor
         size *= ctx.execution_size_factor;
 
-        // 5. Liquidity constraint - don't exceed 80% of safe exit capacity
-        if ctx.liquidity.exit_feasible {
-            let max_safe = ctx.liquidity.max_safe_exit_sol * 0.8;
-            size = size.min(max_safe);
-        } else {
-            // If exit isn't feasible, use minimum size
-            size = self.config.min_size_sol;
+        // 5. Liquidity/portfolio capacity gate — the sizer must NEVER manufacture
+        //    capacity. If exit isn't feasible, or the binding capacity ceiling
+        //    (80% of safe exit AND remaining portfolio) can't cover the minimum
+        //    executable position, return 0 (no trade). The old code forced
+        //    min_size_sol on exit-infeasible and later clamped capacity back UP to
+        //    the minimum, producing positions larger than real capacity.
+        if !ctx.liquidity.exit_feasible {
+            return 0.0;
         }
 
-        // 6. Portfolio constraint
-        size = size.min(ctx.portfolio_remaining_sol);
+        let liquidity_ceiling = ctx.liquidity.max_safe_exit_sol * 0.8;
+        let capacity_ceiling = liquidity_ceiling.min(ctx.portfolio_remaining_sol);
 
-        // 7. Clamp to configured limits
-        size = size.clamp(self.config.min_size_sol, self.config.max_size_sol);
+        if capacity_ceiling < self.config.min_size_sol {
+            return 0.0;
+        }
 
-        size
+        // 6. Cap by real capacity, then clamp — min is now proven to fit capacity.
+        size = size.min(capacity_ceiling);
+        size.clamp(self.config.min_size_sol, self.config.max_size_sol)
     }
 
     /// Calculate size with simple inputs
@@ -340,6 +344,93 @@ mod tests {
 
         let size = sizer.calculate_size(&ctx);
         assert!(size <= 0.3);
+    }
+
+    #[test]
+    fn test_capacity_below_min_returns_zero() {
+        // Portfolio capacity below the minimum executable position -> no trade.
+        let sizer = PositionSizer::new(PositionSizingConfig {
+            base_size_sol: 0.1,
+            min_size_sol: 0.01,
+            max_size_sol: 0.5,
+            confidence_scaling: false,
+        });
+
+        let mut liquidity = LiquidityAnalysis::default();
+        liquidity.exit_feasible = true;
+        liquidity.max_safe_exit_sol = 10.0; // liquidity capacity > portfolio capacity
+
+        let ctx = SizingContext {
+            confidence: 0.5,
+            regime: TokenRegime::OrganicPump {
+                confidence: 0.8,
+                expected_duration_secs: 60,
+            },
+            liquidity,
+            portfolio_remaining_sol: 0.002, // below min_size_sol
+            chain_size_factor: 1.0,
+            execution_size_factor: 1.0,
+        };
+
+        assert_eq!(sizer.calculate_size(&ctx), 0.0);
+    }
+
+    #[test]
+    fn test_liquidity_below_min_returns_zero() {
+        // Exit capacity too thin to place even a minimum position -> no trade.
+        let sizer = PositionSizer::new(PositionSizingConfig {
+            base_size_sol: 0.1,
+            min_size_sol: 0.01,
+            max_size_sol: 0.5,
+            confidence_scaling: false,
+        });
+
+        let mut liquidity = LiquidityAnalysis::default();
+        liquidity.exit_feasible = true;
+        liquidity.max_safe_exit_sol = 0.005; // 0.8 * 0.005 = 0.004 < min 0.01
+
+        let ctx = SizingContext {
+            confidence: 0.5,
+            regime: TokenRegime::OrganicPump {
+                confidence: 0.8,
+                expected_duration_secs: 60,
+            },
+            liquidity,
+            portfolio_remaining_sol: 10.0,
+            chain_size_factor: 1.0,
+            execution_size_factor: 1.0,
+        };
+
+        assert_eq!(sizer.calculate_size(&ctx), 0.0);
+    }
+
+    #[test]
+    fn test_exit_infeasible_returns_zero() {
+        // Exit not feasible -> no trade, regardless of ample portfolio capacity.
+        let sizer = PositionSizer::new(PositionSizingConfig {
+            base_size_sol: 0.1,
+            min_size_sol: 0.01,
+            max_size_sol: 0.5,
+            confidence_scaling: false,
+        });
+
+        let mut liquidity = LiquidityAnalysis::default();
+        liquidity.exit_feasible = false;
+        liquidity.max_safe_exit_sol = 10.0;
+
+        let ctx = SizingContext {
+            confidence: 0.5,
+            regime: TokenRegime::OrganicPump {
+                confidence: 0.8,
+                expected_duration_secs: 60,
+            },
+            liquidity,
+            portfolio_remaining_sol: 10.0,
+            chain_size_factor: 1.0,
+            execution_size_factor: 1.0,
+        };
+
+        assert_eq!(sizer.calculate_size(&ctx), 0.0);
     }
 
     #[test]

@@ -723,7 +723,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                         // Apply adaptive filter scoring if enabled
                         // Track both position multiplier AND recommendation for context-aware exits
-                        let (position_multiplier, entry_recommendation) = if let Some(ref filter) = adaptive_filter {
+                        let (position_multiplier, entry_recommendation, entry_confidence) = if let Some(ref filter) = adaptive_filter {
                             // Create signal context from token event
                             let signal_context = SignalContext::from_new_token(
                                 token.mint.clone(),
@@ -800,9 +800,12 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 }
                             }
 
-                            (result.position_size_multiplier, result.recommendation)
+                            // Pass the REAL calibrated confidence [0,1] separately from the
+                            // position-size multiplier. Never reuse the multiplier as confidence.
+                            (result.position_size_multiplier, result.recommendation, result.confidence)
                         } else {
-                            (1.0, Recommendation::Opportunity) // Default if adaptive filter disabled
+                            // Default if adaptive filter disabled: neutral confidence, not a multiplier.
+                            (1.0, Recommendation::Opportunity, 0.5)
                         };
 
                         // Strategy engine evaluation (if enabled)
@@ -822,9 +825,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             };
                             let token_reserves = token.v_tokens_in_bonding_curve as f64;
 
-                            // Create order flow analysis from available data
+                            // PLACEHOLDER order flow. A brand-new token event has no real
+                            // trade history, so these are NOT measured values. organic_score
+                            // must not derive from position_multiplier (that was circular).
+                            // market_data_ready=false below ensures these placeholders cannot
+                            // authorize an Enter.
                             let order_flow = crate::strategy::regime::OrderFlowAnalysis {
-                                organic_score: position_multiplier.max(0.5),
+                                organic_score: 0.5, // neutral placeholder, not measured
                                 wash_trading_score: 0.0,
                                 buy_sell_ratio: 1.0,
                                 early_sell_pressure: 0.0,
@@ -856,43 +863,47 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             // Evaluate entry using strategy engine
                             let analysis_ctx = crate::strategy::engine::TokenAnalysisContext {
                                 mint: token.mint.clone(),
+                                creator: token.trader_public_key.clone(),
                                 order_flow,
                                 distribution,
                                 creator_behavior,
                                 price_action,
                                 sol_reserves: liquidity_sol,
                                 token_reserves,
-                                confidence_score: position_multiplier,
+                                confidence_score: entry_confidence,
+                                // Placeholder order-flow/distribution/creator inputs above are
+                                // NOT measured market data, so the strategy may not Enter on them.
+                                market_data_ready: false,
                             };
 
                             let eval = engine_guard.evaluate_entry(&analysis_ctx).await;
 
-                            // Check the decision
-                            match &eval.decision.action {
-                                TradingAction::Enter { mint: _, size_sol, strategy } => {
+                            // Only an explicit Enter authorizes a buy. Hold and every other
+                            // action are abstentions — they must NOT fall through to a buy.
+                            match strategy_entry_size(&eval.decision.action) {
+                                Some(size_sol) => {
                                     info!(
-                                        "Strategy engine: ENTER {} using {} strategy, size: {:.4} SOL",
-                                        token.symbol, strategy, size_sol
+                                        "Strategy engine: ENTER {} size: {:.4} SOL",
+                                        token.symbol, size_sol
                                     );
-                                    (true, *size_sol)
+                                    (true, size_sol)
                                 }
-                                TradingAction::FatalReject { reason } => {
-                                    warn!(
-                                        "Strategy engine: FATAL REJECT for {}: {}",
-                                        token.symbol, reason
-                                    );
+                                None => {
+                                    match &eval.decision.action {
+                                        TradingAction::FatalReject { reason } => warn!(
+                                            "Strategy engine: FATAL REJECT for {}: {}",
+                                            token.symbol, reason
+                                        ),
+                                        TradingAction::Skip { reason } => info!(
+                                            "Strategy engine: SKIP {}: {}",
+                                            token.symbol, reason
+                                        ),
+                                        other => info!(
+                                            "Strategy engine: abstain (no entry) for {}: {:?}",
+                                            token.symbol, other
+                                        ),
+                                    }
                                     (false, 0.0)
-                                }
-                                TradingAction::Skip { reason } => {
-                                    info!(
-                                        "Strategy engine: SKIP {}: {}",
-                                        token.symbol, reason
-                                    );
-                                    (false, 0.0)
-                                }
-                                _ => {
-                                    // Hold or other action - fall through to adaptive filter decision
-                                    (true, config.trading.buy_amount_sol * position_multiplier)
                                 }
                             }
                         } else {
@@ -3566,4 +3577,55 @@ pub async fn hot_scan(
     }
 
     Ok(())
+}
+
+/// Strategy entry policy in one place: ONLY an explicit `Enter` authorizes a buy.
+/// Every other `TradingAction` (Hold, Skip, FatalReject, Exit, Pause) is an
+/// abstention and returns `None`.
+fn strategy_entry_size(action: &TradingAction) -> Option<f64> {
+    match action {
+        TradingAction::Enter { size_sol, .. } => Some(*size_sol),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::types::{TradingAction, TradingStrategy};
+
+    #[test]
+    fn test_strategy_entry_size_enter_returns_size() {
+        let action = TradingAction::Enter {
+            mint: "m".to_string(),
+            size_sol: 0.1,
+            strategy: TradingStrategy::MomentumSurfing,
+        };
+        assert_eq!(strategy_entry_size(&action), Some(0.1));
+    }
+
+    #[test]
+    fn test_strategy_entry_size_hold_is_none() {
+        assert_eq!(strategy_entry_size(&TradingAction::Hold), None);
+    }
+
+    #[test]
+    fn test_strategy_entry_size_skip_is_none() {
+        assert_eq!(
+            strategy_entry_size(&TradingAction::Skip {
+                reason: "x".to_string()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn test_strategy_entry_size_fatal_reject_is_none() {
+        assert_eq!(
+            strategy_entry_size(&TradingAction::FatalReject {
+                reason: "x".to_string()
+            }),
+            None
+        );
+    }
 }

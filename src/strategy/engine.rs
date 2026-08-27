@@ -77,6 +77,8 @@ impl Default for StrategyEngineConfig {
 #[derive(Debug, Clone)]
 pub struct TokenAnalysisContext {
     pub mint: String,
+    /// Token creator/deployer address (used for the known-rug-deployer fatal check).
+    pub creator: String,
     pub order_flow: OrderFlowAnalysis,
     pub distribution: TokenDistribution,
     pub creator_behavior: CreatorBehavior,
@@ -84,6 +86,10 @@ pub struct TokenAnalysisContext {
     pub sol_reserves: f64,
     pub token_reserves: f64,
     pub confidence_score: f64,
+    /// True only when order-flow/distribution/creator-behavior inputs are
+    /// MEASURED, not placeholders. This is NOT adaptive-filter confidence.
+    /// A false value forbids the strategy from creating an entry signal.
+    pub market_data_ready: bool,
 }
 
 /// Entry evaluation result
@@ -172,9 +178,11 @@ impl StrategyEngine {
 
         let fatal_context = FatalRiskContext {
             mint: ctx.mint.clone(),
-            creator: String::new(),       // Would come from token data
-            mint_authority_active: false, // Would come from RPC
-            freeze_authority_active: false,
+            creator: ctx.creator.clone(), // real deployer address (enables rug-deployer check)
+            // Authority is left Unavailable here; the FatalRiskEngine resolves the
+            // real state from the shared FilterCache and fails closed if unknown.
+            mint_authority: super::fatal_risk::AuthorityStatus::Unavailable,
+            freeze_authority: super::fatal_risk::AuthorityStatus::Unavailable,
             creator_sell_info,
             effective_liquidity_sol: ctx.sol_reserves,
             exit_slippage_pct: 0.0, // Would calculate from liquidity
@@ -241,8 +249,15 @@ impl StrategyEngine {
         let _portfolio_state = portfolio.get_state();
         drop(portfolio);
 
-        // 5. Create entry signal if conditions are met
-        let strategy_signal = if regime.should_enter && ctx.confidence_score > 0.5 {
+        // 5. Create entry signal if conditions are met.
+        //    market_data_ready gates on MEASURED inputs: synthetic/placeholder
+        //    order-flow may not authorize an entry. position_size > 0 ensures the
+        //    sizer did not veto on capacity.
+        let strategy_signal = if ctx.market_data_ready
+            && regime.should_enter
+            && ctx.confidence_score > 0.5
+            && position_size > 0.0
+        {
             Some(EntrySignal {
                 mint: ctx.mint.clone(),
                 strategy: self.config.default_strategy.clone(),
@@ -815,6 +830,7 @@ mod tests {
 
         let ctx = TokenAnalysisContext {
             mint: "wash_mint".to_string(),
+            creator: "wash_creator".to_string(),
             order_flow: OrderFlowAnalysis {
                 wash_trading_score: 0.9, // High wash trading
                 organic_score: 0.1,
@@ -826,6 +842,7 @@ mod tests {
             sol_reserves: 100.0,
             token_reserves: 1_000_000.0,
             confidence_score: 0.8,
+            market_data_ready: true,
         };
 
         let evaluation = engine.evaluate_entry(&ctx).await;
@@ -836,5 +853,50 @@ mod tests {
             TokenRegime::WashTrade { .. }
         ));
         assert!(!evaluation.regime.should_enter);
+    }
+
+    #[tokio::test]
+    async fn test_unready_market_data_cannot_create_entry() {
+        let mut engine = StrategyEngine::default();
+
+        // Known-safe (renounced) authority via cache so the ONLY thing preventing
+        // an entry is market_data_ready == false.
+        let cache = std::sync::Arc::new(crate::filter::cache::FilterCache::new());
+        cache.set_mint_info(
+            "ready_mint",
+            crate::filter::helius::MintInfo {
+                mint: "ready_mint".to_string(),
+                mint_authority: None,
+                freeze_authority: None,
+                supply: 1_000_000,
+                decimals: 6,
+            },
+        );
+        engine.set_filter_cache(cache);
+
+        let ctx = TokenAnalysisContext {
+            mint: "ready_mint".to_string(),
+            creator: "creator".to_string(),
+            order_flow: OrderFlowAnalysis {
+                organic_score: 0.9,
+                wash_trading_score: 0.0,
+                buy_sell_ratio: 2.0,
+                ..Default::default()
+            },
+            distribution: TokenDistribution::default(),
+            creator_behavior: CreatorBehavior::default(),
+            price_action: PriceAction::default(),
+            sol_reserves: 100.0,
+            token_reserves: 1_000_000.0,
+            confidence_score: 0.8,
+            market_data_ready: false,
+        };
+
+        let evaluation = engine.evaluate_entry(&ctx).await;
+        assert!(
+            !matches!(evaluation.decision.action, TradingAction::Enter { .. }),
+            "unready market data must not produce Enter, got {:?}",
+            evaluation.decision.action
+        );
     }
 }
