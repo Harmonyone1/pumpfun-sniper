@@ -2859,14 +2859,15 @@ pub async fn hot_scan(
                             *attempts += 1;
 
                             if *attempts > 5 {
-                                error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
-                                let _ = monitor_positions.abandon_position(&position.mint).await;
-                                let _ = remove_bought_mint(
-                                    &monitor_bought_mints,
-                                    &monitor_bought_mints_path,
-                                    &position.mint,
-                                )
-                                .await;
+                                // INV-POS-002: a failed sell must never make a wallet-owned
+                                // position disappear from tracking. Do NOT abandon the position
+                                // or drop it from bought-mints. Leave it OPEN/TRACKED, reset the
+                                // retry counter, and let a later cycle retry. Reconciliation is a
+                                // later packet.
+                                error!(
+                                    "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
+                                    position.symbol
+                                );
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
