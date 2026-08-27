@@ -390,6 +390,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
         let monitor_use_local_api = use_local_api;
+        let monitor_engine = strategy_engine.clone();
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
@@ -577,6 +578,10 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 let _ = monitor_positions
                                     .close_position(&position.mint, position.token_amount, 0.0)
                                     .await;
+                                // Keep the strategy governor's exposure/P&L in sync: a give-up is a full loss.
+                                if let Some(ref engine) = monitor_engine {
+                                    engine.write().await.record_exit(&position.mint, -position.total_cost_sol).await;
+                                }
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
@@ -629,6 +634,10 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 estimated_received,
                                             )
                                             .await;
+                                        // NOTE: no governor record_exit here — this is a PARTIAL sell
+                                        // and the strategy governor tracks positions whole (no partial
+                                        // reduction). The remaining position is closed in the full-exit
+                                        // branch, which records the exit then.
                                         let _ = monitor_positions
                                             .mark_quick_profit_taken(&position.mint)
                                             .await;
@@ -656,6 +665,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 estimated_received,
                                             )
                                             .await;
+                                        // Full exit: sync the strategy governor (exposure, daily/hourly
+                                        // P&L, consecutive-loss). No-op if this engine never entered it.
+                                        if let Some(ref engine) = monitor_engine {
+                                            engine.write().await.record_exit(&position.mint, pnl_sol).await;
+                                        }
                                         info!("=== TRADE CLOSED (Full) ===");
                                         info!(
                                             "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
@@ -1213,6 +1227,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                             if let Some(position) = our_position {
                                 let position_token_amount = position.token_amount;
+                                let position_total_cost_sol = position.total_cost_sol;
 
                                 if let Some(ref evaluator) = kill_switch_evaluator {
                                     let decision = evaluator.evaluate_sell(
@@ -1266,6 +1281,12 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         let estimated_proceeds = position_token_amount as f64 * trade.market_cap_sol / 1_000_000_000.0;
                                                         if let Err(e) = position_manager.close_position(&trade.mint, position_token_amount, estimated_proceeds).await {
                                                             error!("Failed to close position after kill-switch: {}", e);
+                                                        }
+
+                                                        // Sync strategy governor: kill-switch exit is a full close.
+                                                        if let Some(ref engine) = strategy_engine {
+                                                            let pnl_sol = estimated_proceeds - position_total_cost_sol;
+                                                            engine.write().await.record_exit(&trade.mint, pnl_sol).await;
                                                         }
 
                                                         // Stop monitoring this position

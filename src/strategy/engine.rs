@@ -392,11 +392,18 @@ impl StrategyEngine {
         portfolio.open_position(position);
     }
 
-    /// Record a successful exit
+    /// Record a successful exit.
+    ///
+    /// Safe to call for any mint: portfolio P&L/consecutive-loss stats are only
+    /// updated when this engine actually opened the position (via record_entry),
+    /// so exits for positions entered outside the governor won't corrupt its
+    /// exposure or loss-streak accounting. Tracker cleanup runs unconditionally.
     pub async fn record_exit(&mut self, mint: &str, pnl_sol: f64) {
-        // Update portfolio
+        // Update portfolio only if it tracked this position
         let mut portfolio = self.portfolio_risk.write().await;
-        portfolio.close_position(mint, pnl_sol);
+        if portfolio.get_position(mint).is_some() {
+            portfolio.close_position(mint, pnl_sol);
+        }
         drop(portfolio);
 
         // Clear exit manager tracking
