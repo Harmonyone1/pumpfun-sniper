@@ -333,6 +333,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let monitor_trader = trader_arc.clone();
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
+        let monitor_use_local_api = use_local_api;
+        let monitor_engine = strategy_engine.clone();
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
@@ -478,18 +480,36 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             *attempts += 1;
 
                             if *attempts > 5 {
-                                error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
-                                // Estimate received SOL as 0 since sell failed
-                                let _ = monitor_positions
-                                    .close_position(&position.mint, position.token_amount, 0.0)
-                                    .await;
+                                // The sell is unresolved but the tokens may still be in the
+                                // wallet. NEVER close/remove the position on retry exhaustion
+                                // (that would delete wallet-owned risk from tracking). Leave it
+                                // OPEN/TRACKED, reset the retry counter, and let a later monitor
+                                // cycle try again. Proper reconciliation is a later packet.
+                                error!(
+                                    "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
+                                    position.symbol
+                                );
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
 
-                            // Try Lightning API first (attempts 1-3)
-                            let sell_result: Result<String, crate::error::Error> = if *attempts <= 3
-                            {
+                            // Local mode signs its own transactions: go DIRECTLY to sell_local
+                            // instead of wasting 3 Lightning attempts. Otherwise preserve the
+                            // existing Lightning (1-3) -> local (4-5) fallback.
+                            let sell_start = std::time::Instant::now();
+                            let sell_result: Result<String, crate::error::Error> = if monitor_use_local_api {
+                                info!("Attempting LOCAL API sell (attempt {})", attempts);
+                                trader
+                                    .sell_local(
+                                        &position.mint,
+                                        sell_pct,
+                                        slippage,
+                                        priority_fee,
+                                        &monitor_keypair,
+                                        &monitor_rpc,
+                                    )
+                                    .await
+                            } else if *attempts <= 3 {
                                 info!("Attempting Lightning API sell (attempt {})", attempts);
                                 trader
                                     .sell(&position.mint, sell_pct, slippage, priority_fee)
@@ -580,6 +600,15 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         "AUTO-SELL FAILED for {} (attempt {}): {}",
                                         position.symbol, attempts, e
                                     );
+                                    // Measurement: failed sells are an exit-risk/honeypot signal.
+                                    // Size is only a quote-size proxy, not exact filled size.
+                                    if let Some(ref engine) = monitor_engine {
+                                        let latency_ms = sell_start.elapsed().as_millis() as u64;
+                                        engine.write().await.record_tx_failure(
+                                            &position.mint, false, position.total_cost_sol,
+                                            latency_ms, &e.to_string(),
+                                        ).await;
+                                    }
                                 }
                             }
                         }
