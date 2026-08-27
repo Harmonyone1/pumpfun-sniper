@@ -11,6 +11,7 @@ Cargo.lock
 
 # Environment and secrets
 .env
+/config.toml
 
 # Keypairs - NEVER commit these
 keypair*.json

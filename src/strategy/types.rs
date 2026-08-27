@@ -424,9 +424,11 @@ pub struct ExecutionRecord {
     pub side: Side,
     pub requested_size_sol: f64,
     pub filled_size_sol: f64,
-    pub expected_price: f64,
-    pub actual_price: f64,
-    pub slippage_pct: f64,
+    /// Prices/slippage are None when the real fill price is unknown. A missing
+    /// fill price must NEVER be recorded as 0% slippage.
+    pub expected_price: Option<f64>,
+    pub actual_price: Option<f64>,
+    pub slippage_pct: Option<f64>,
     pub latency_ms: u64,
     pub success: bool,
     pub failure_reason: Option<String>,
@@ -434,7 +436,7 @@ pub struct ExecutionRecord {
 }
 
 impl ExecutionRecord {
-    /// Create a successful execution record
+    /// Create a successful execution record with KNOWN fill prices.
     pub fn success(
         mint: String,
         side: Side,
@@ -445,10 +447,11 @@ impl ExecutionRecord {
         latency_ms: u64,
         tx_signature: String,
     ) -> Self {
+        // Only compute slippage when the reference price is known and valid.
         let slippage_pct = if expected_price != 0.0 {
-            ((actual_price - expected_price) / expected_price) * 100.0
+            Some(((actual_price - expected_price) / expected_price) * 100.0)
         } else {
-            0.0
+            None
         };
 
         Self {
@@ -457,8 +460,8 @@ impl ExecutionRecord {
             side,
             requested_size_sol,
             filled_size_sol,
-            expected_price,
-            actual_price,
+            expected_price: Some(expected_price),
+            actual_price: Some(actual_price),
             slippage_pct,
             latency_ms,
             success: true,
@@ -467,12 +470,39 @@ impl ExecutionRecord {
         }
     }
 
-    /// Create a failed execution record
+    /// Create a successful execution record when the real fill price is UNKNOWN.
+    /// Records success + latency but no price/slippage sample.
+    pub fn success_unpriced(
+        mint: String,
+        side: Side,
+        requested_size_sol: f64,
+        filled_size_sol: f64,
+        latency_ms: u64,
+        tx_signature: String,
+    ) -> Self {
+        Self {
+            timestamp: chrono::Utc::now(),
+            mint,
+            side,
+            requested_size_sol,
+            filled_size_sol,
+            expected_price: None,
+            actual_price: None,
+            slippage_pct: None,
+            latency_ms,
+            success: true,
+            failure_reason: None,
+            tx_signature: Some(tx_signature),
+        }
+    }
+
+    /// Create a failed execution record. A failure is NOT a zero-slippage fill:
+    /// price/slippage are all None.
     pub fn failure(
         mint: String,
         side: Side,
         requested_size_sol: f64,
-        expected_price: f64,
+        _expected_price: f64,
         latency_ms: u64,
         reason: String,
     ) -> Self {
@@ -482,9 +512,9 @@ impl ExecutionRecord {
             side,
             requested_size_sol,
             filled_size_sol: 0.0,
-            expected_price,
-            actual_price: 0.0,
-            slippage_pct: 0.0,
+            expected_price: None,
+            actual_price: None,
+            slippage_pct: None,
             latency_ms,
             success: false,
             failure_reason: Some(reason),
@@ -530,8 +560,8 @@ pub struct DecisionExplanation {
     pub chain_congestion: CongestionLevel,
     pub chain_action_taken: ChainAction,
 
-    // Execution quality
-    pub recent_slippage_avg: f64,
+    // Execution quality (None when no priced slippage samples exist)
+    pub recent_slippage_avg: Option<f64>,
     pub confidence_adjustment: f64,
 
     // Randomization applied
@@ -563,7 +593,7 @@ impl Default for DecisionExplanation {
             portfolio_block_reason: None,
             chain_congestion: CongestionLevel::default(),
             chain_action_taken: ChainAction::default(),
-            recent_slippage_avg: 0.0,
+            recent_slippage_avg: None,
             confidence_adjustment: 0.0,
             entry_delay_applied_ms: 0,
             size_jitter_applied_pct: 0.0,

@@ -316,10 +316,6 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let tracked_wallets: std::collections::HashSet<String> =
         config.wallet_tracking.wallets.iter().cloned().collect();
 
-    // Track tokens we've already evaluated from trade events (to avoid re-evaluating)
-    let seen_trade_tokens: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
-
     info!("Starting price feed...");
     // Wrap trader in Arc for sharing across tasks
     let trader_arc: Option<std::sync::Arc<PumpPortalTrader>> =
@@ -333,6 +329,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let monitor_trader = trader_arc.clone();
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
+        let monitor_use_local_api = use_local_api;
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
@@ -478,18 +475,36 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             *attempts += 1;
 
                             if *attempts > 5 {
-                                error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
-                                // Estimate received SOL as 0 since sell failed
-                                let _ = monitor_positions
-                                    .close_position(&position.mint, position.token_amount, 0.0)
-                                    .await;
+                                // The sell is unresolved but the tokens may still be in the
+                                // wallet. NEVER close/remove the position on retry exhaustion
+                                // (that would delete wallet-owned risk from tracking). Leave it
+                                // OPEN/TRACKED, reset the retry counter, and let a later monitor
+                                // cycle try again. Proper reconciliation is a later packet.
+                                error!(
+                                    "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
+                                    position.symbol
+                                );
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
 
-                            // Try Lightning API first (attempts 1-3)
-                            let sell_result: Result<String, crate::error::Error> = if *attempts <= 3
-                            {
+                            // Local mode signs its own transactions: go DIRECTLY to sell_local
+                            // instead of wasting 3 Lightning attempts. Otherwise preserve the
+                            // existing Lightning (1-3) -> local (4-5) fallback.
+                            let sell_start = std::time::Instant::now();
+                            let sell_result: Result<String, crate::error::Error> = if monitor_use_local_api {
+                                info!("Attempting LOCAL API sell (attempt {})", attempts);
+                                trader
+                                    .sell_local(
+                                        &position.mint,
+                                        sell_pct,
+                                        slippage,
+                                        priority_fee,
+                                        &monitor_keypair,
+                                        &monitor_rpc,
+                                    )
+                                    .await
+                            } else if *attempts <= 3 {
                                 info!("Attempting Lightning API sell (attempt {})", attempts);
                                 trader
                                     .sell(&position.mint, sell_pct, slippage, priority_fee)
@@ -576,10 +591,15 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     }
                                 }
                                 Err(e) => {
+                                    let sell_latency_ms = sell_start.elapsed().as_millis() as u64;
                                     error!(
-                                        "AUTO-SELL FAILED for {} (attempt {}): {}",
-                                        position.symbol, attempts, e
+                                        "AUTO-SELL FAILED for {} (attempt {}): {} ({}ms)",
+                                        position.symbol, attempts, e, sell_latency_ms
                                     );
+                                    // Sell failure is logged but intentionally not fed into global execution
+                                    // feedback yet. Successful sells cannot be authoritatively reconciled today;
+                                    // failure-only samples would corrupt fill-rate/chain-health controls.
+                                    // Transaction reconciliation will wire both sides symmetrically.
                                 }
                             }
                         }
@@ -723,7 +743,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                         // Apply adaptive filter scoring if enabled
                         // Track both position multiplier AND recommendation for context-aware exits
-                        let (position_multiplier, entry_recommendation) = if let Some(ref filter) = adaptive_filter {
+                        let (position_multiplier, entry_recommendation, entry_confidence) = if let Some(ref filter) = adaptive_filter {
                             // Create signal context from token event
                             let signal_context = SignalContext::from_new_token(
                                 token.mint.clone(),
@@ -800,9 +820,12 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 }
                             }
 
-                            (result.position_size_multiplier, result.recommendation)
+                            // Pass the REAL calibrated confidence [0,1] separately from the
+                            // position-size multiplier. Never reuse the multiplier as confidence.
+                            (result.position_size_multiplier, result.recommendation, result.confidence)
                         } else {
-                            (1.0, Recommendation::Opportunity) // Default if adaptive filter disabled
+                            // Default if adaptive filter disabled: neutral confidence, not a multiplier.
+                            (1.0, Recommendation::Opportunity, 0.5)
                         };
 
                         // Strategy engine evaluation (if enabled)
@@ -822,9 +845,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             };
                             let token_reserves = token.v_tokens_in_bonding_curve as f64;
 
-                            // Create order flow analysis from available data
+                            // PLACEHOLDER order flow. A brand-new token event has no real
+                            // trade history, so these are NOT measured values. organic_score
+                            // must not derive from position_multiplier (that was circular).
+                            // market_data_ready=false below ensures these placeholders cannot
+                            // authorize an Enter.
                             let order_flow = crate::strategy::regime::OrderFlowAnalysis {
-                                organic_score: position_multiplier.max(0.5),
+                                organic_score: 0.5, // neutral placeholder, not measured
                                 wash_trading_score: 0.0,
                                 buy_sell_ratio: 1.0,
                                 early_sell_pressure: 0.0,
@@ -856,43 +883,47 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             // Evaluate entry using strategy engine
                             let analysis_ctx = crate::strategy::engine::TokenAnalysisContext {
                                 mint: token.mint.clone(),
+                                creator: token.trader_public_key.clone(),
                                 order_flow,
                                 distribution,
                                 creator_behavior,
                                 price_action,
                                 sol_reserves: liquidity_sol,
                                 token_reserves,
-                                confidence_score: position_multiplier,
+                                confidence_score: entry_confidence,
+                                // Placeholder order-flow/distribution/creator inputs above are
+                                // NOT measured market data, so the strategy may not Enter on them.
+                                market_data_ready: false,
                             };
 
                             let eval = engine_guard.evaluate_entry(&analysis_ctx).await;
 
-                            // Check the decision
-                            match &eval.decision.action {
-                                TradingAction::Enter { mint: _, size_sol, strategy } => {
+                            // Only an explicit Enter authorizes a buy. Hold and every other
+                            // action are abstentions — they must NOT fall through to a buy.
+                            match strategy_entry_size(&eval.decision.action) {
+                                Some(size_sol) => {
                                     info!(
-                                        "Strategy engine: ENTER {} using {} strategy, size: {:.4} SOL",
-                                        token.symbol, strategy, size_sol
+                                        "Strategy engine: ENTER {} size: {:.4} SOL",
+                                        token.symbol, size_sol
                                     );
-                                    (true, *size_sol)
+                                    (true, size_sol)
                                 }
-                                TradingAction::FatalReject { reason } => {
-                                    warn!(
-                                        "Strategy engine: FATAL REJECT for {}: {}",
-                                        token.symbol, reason
-                                    );
+                                None => {
+                                    match &eval.decision.action {
+                                        TradingAction::FatalReject { reason } => warn!(
+                                            "Strategy engine: FATAL REJECT for {}: {}",
+                                            token.symbol, reason
+                                        ),
+                                        TradingAction::Skip { reason } => info!(
+                                            "Strategy engine: SKIP {}: {}",
+                                            token.symbol, reason
+                                        ),
+                                        other => info!(
+                                            "Strategy engine: abstain (no entry) for {}: {:?}",
+                                            token.symbol, other
+                                        ),
+                                    }
                                     (false, 0.0)
-                                }
-                                TradingAction::Skip { reason } => {
-                                    info!(
-                                        "Strategy engine: SKIP {}: {}",
-                                        token.symbol, reason
-                                    );
-                                    (false, 0.0)
-                                }
-                                _ => {
-                                    // Hold or other action - fall through to adaptive filter decision
-                                    (true, config.trading.buy_amount_sol * position_multiplier)
                                 }
                             }
                         } else {
@@ -926,11 +957,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 info!("Buying {} SOL of {} ({})...", final_amount_sol, token.symbol, mint);
 
                                 // Use buy_local for Local API, buy for Lightning API
+                                let buy_start = std::time::Instant::now();
                                 let buy_result = if use_local_api {
                                     trader.buy_local(mint, final_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client).await
                                 } else {
                                     trader.buy(mint, final_amount_sol, slippage_pct, priority_fee).await
                                 };
+                                // Provider submission/response latency (NOT chain-finality latency).
+                                let buy_latency_ms = buy_start.elapsed().as_millis() as u64;
 
                                 match buy_result {
                                     Ok(signature) => {
@@ -959,6 +993,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 token.symbol, mint
                                             );
                                             error!("Check transaction on Solscan: https://solscan.io/tx/{}", signature);
+                                            // Measurement: confirmed-but-no-tokens is a real execution failure.
+                                            if let Some(ref engine) = strategy_engine {
+                                                engine.write().await.record_tx_failure(
+                                                    mint, true, final_amount_sol, buy_latency_ms,
+                                                    "buy verification: zero token balance after existing verification wait",
+                                                ).await;
+                                            }
                                             // Skip position recording and kill-switch setup
                                             continue;
                                         }
@@ -1032,10 +1073,21 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 exit_levels_hit: vec![],
                                             };
                                             engine.write().await.record_entry(strategy_position).await;
+                                            // Measurement: verified fill. Unpriced — the bot does not
+                                            // parse real fill prices, so NO slippage sample is created.
+                                            engine.write().await.record_verified_execution_unpriced(
+                                                &token.mint, true, final_amount_sol, buy_latency_ms, &signature,
+                                            ).await;
                                         }
                                     }
                                     Err(e) => {
                                         error!("Buy failed for {}: {}", token.symbol, e);
+                                        // Measurement: real provider submission failure.
+                                        if let Some(ref engine) = strategy_engine {
+                                            engine.write().await.record_tx_failure(
+                                                mint, true, final_amount_sol, buy_latency_ms, &e.to_string(),
+                                            ).await;
+                                        }
                                     }
                                 }
                             }
@@ -1047,15 +1099,16 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         }
                     }
                     PumpPortalEvent::Trade(trade) => {
-                        // Calculate SOL amount for logging
-                        let sol_amount = trade.sol_amount as f64 / 1e9;
+                        // PumpPortal TradeEvent.sol_amount is ALREADY in SOL (see
+                        // stream::pumpportal). Do NOT divide by 1e9.
+                        let sol_amount_sol = trade.sol_amount;
 
                         // Log all trades for visibility
                         info!(
                             "Trade: {} {} {:.6} SOL on {} (mcap: {:.2})",
                             &trade.trader_public_key[..8],
                             trade.tx_type,
-                            sol_amount,
+                            sol_amount_sol,
                             &trade.mint[..12],
                             trade.market_cap_sol
                         );
@@ -1074,7 +1127,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         &trade.mint,
                                         &trade.trader_public_key,
                                         trade.token_amount as u64,
-                                        sol_amount,
+                                        sol_amount_sol,
                                         &trade.signature,
                                     );
 
@@ -1145,142 +1198,35 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             }
                         }
 
-                        // Check for tracked wallet trades (copy trading)
+                        // Check for tracked wallet trades (copy trading).
                         if config.wallet_tracking.enabled && tracked_wallets.contains(&trade.trader_public_key) {
                             info!(
                                 "Tracked wallet {} {} {:.4} SOL of {}",
                                 trade.trader_public_key,
                                 if trade.tx_type == "buy" { "bought" } else { "sold" },
-                                sol_amount,
+                                sol_amount_sol,
                                 trade.mint
                             );
 
-                            // Copy the trade if it's a buy
-                            if trade.tx_type == "buy" && !dry_run {
-                                if let Some(ref trader) = trader_arc {
-                                    let slippage_pct = config.trading.slippage_bps / 100;
-                                    let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
-
-                                    info!("Copy trading: buying {} SOL of {}", config.trading.buy_amount_sol, trade.mint);
-                                    let copy_result = if use_local_api {
-                                        trader.buy_local(&trade.mint, config.trading.buy_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client).await
-                                    } else {
-                                        trader.buy(&trade.mint, config.trading.buy_amount_sol, slippage_pct, priority_fee).await
-                                    };
-                                    match copy_result {
-                                        Ok(sig) => info!("Copy trade executed: {}", sig),
-                                        Err(e) => error!("Copy trade failed: {}", e),
-                                    }
-                                }
-                            }
-                        }
-
-                        // Evaluate tokens with significant buy volume that we haven't seen before
-                        if trade.tx_type == "buy" && sol_amount >= 0.05 {
-                            let mut seen = seen_trade_tokens.lock().await;
-
-                            // Skip if we've already evaluated this token
-                            if seen.contains(&trade.mint) {
-                                continue;
-                            }
-
-                            // Check if we already have a position in this token
-                            let positions = position_manager.get_all_positions().await;
-                            if positions.iter().any(|p| p.mint == trade.mint) {
-                                seen.insert(trade.mint.clone());
-                                continue;
-                            }
-
-                            // Mark as seen
-                            seen.insert(trade.mint.clone());
-                            drop(seen); // Release lock before async operations
-
-                            info!(
-                                "Trade detected: {} bought {:.4} SOL of {} (mcap: {:.2} SOL) - evaluating...",
-                                &trade.trader_public_key[..8],
-                                sol_amount,
-                                trade.mint,
-                                trade.market_cap_sol
-                            );
-
-                            // Calculate liquidity from bonding curve
-                            // Note: PumpPortal sends values in SOL, not lamports
-                            let liquidity_sol = if trade.v_sol_in_bonding_curve < 1000.0 {
-                                trade.v_sol_in_bonding_curve as f64
-                            } else {
-                                trade.v_sol_in_bonding_curve as f64 / 1e9
-                            };
-
-                            // Quick liquidity check
-                            if liquidity_sol < 0.05 {
-                                info!("Token {} rejected: liquidity {:.4} SOL too low", trade.mint, liquidity_sol);
-                                continue;
-                            }
-
-                            // Use configured buy amount for trade-based entries
-                            let final_amount_sol = config.trading.buy_amount_sol;
-
-                            info!(
-                                "Trade signal: BUY {:.4} SOL of {} (liquidity: {:.4} SOL)",
-                                final_amount_sol, trade.mint, liquidity_sol
-                            );
-
-                            if !dry_run {
-                                if let Some(ref trader) = trader_arc {
-                                    let slippage_pct = config.trading.slippage_bps / 100;
-                                    let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
-
-                                    let buy_result = if use_local_api {
-                                        trader.buy_local(&trade.mint, final_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client).await
-                                    } else {
-                                        trader.buy(&trade.mint, final_amount_sol, slippage_pct, priority_fee).await
-                                    };
-                                    match buy_result {
-                                        Ok(sig) => {
-                                            info!("Trade buy executed: {}", sig);
-                                            // Estimate tokens from market cap
-                                            let estimated_price = if trade.market_cap_sol > 0.0 {
-                                                trade.market_cap_sol / 1_000_000_000.0
-                                            } else {
-                                                0.000001
-                                            };
-                                            let estimated_tokens = (final_amount_sol / estimated_price) as u64;
-
-                                            // Record position - trade event entries are treated as Probe
-                                            // since we have less information than new token events
-                                            let position = crate::position::manager::Position {
-                                                mint: trade.mint.clone(),
-                                                name: format!("Trade-{}", &trade.mint[..8]),
-                                                symbol: "???".to_string(),
-                                                bonding_curve: trade.bonding_curve_key.clone(),
-                                                token_amount: estimated_tokens,
-                                                entry_price: estimated_price,
-                                                total_cost_sol: final_amount_sol,
-                                                entry_time: chrono::Utc::now(),
-                                                entry_signature: sig.clone(),
-                                                entry_type: crate::position::manager::EntryType::Probe, // Conservative for trade-based entries
-                                                quick_profit_taken: false,
-                                                second_profit_taken: false,
-                                                peak_price: estimated_price,
-                                                current_price: estimated_price,
-                                                kill_switch_triggered: false,
-                                                kill_switch_reason: None,
-                                                wallet_pubkey: keypair.pubkey().to_string(),
-                                            };
-                                            if let Err(e) = position_manager.open_position(position).await {
-                                                error!("Failed to record position: {}", e);
-                                            }
-                                        }
-                                        Err(e) => error!("Trade buy failed: {}", e),
-                                    }
-                                }
-                            } else {
+                            // Automatic copy execution is DISABLED by P0: the old path could
+                            // acquire wallet tokens without creating a fully reconciled managed
+                            // position. Tracked-wallet signals are still observed/logged; they
+                            // must go through the canonical entry + reconciliation pipeline
+                            // before any automatic buy is re-enabled. auto_copy_trade config is
+                            // left unchanged; this is a runtime safety gate.
+                            if config.wallet_tracking.auto_copy_trade && trade.tx_type == "buy" {
                                 info!(
-                                    "DRY-RUN: Would buy {:.4} SOL of {} based on trade activity",
-                                    final_amount_sol, trade.mint
+                                    "Tracked-wallet buy observed; automatic copy execution is disabled by P0 \
+                                     until it passes canonical entry + reconciliation."
                                 );
                             }
                         }
+
+                        // NOTE: the previous "one significant buy => auto-buy" bypass has been
+                        // removed. It sent a buy after a single trade with only a minimal
+                        // liquidity check and an estimated token quantity, bypassing the
+                        // canonical decision gate. A trade event may update/log state, but this
+                        // packet does not contain the canonical observation engine.
                     }
                     PumpPortalEvent::Connected => {
                         info!("Connected to token detection source");
@@ -2908,14 +2854,15 @@ pub async fn hot_scan(
                             *attempts += 1;
 
                             if *attempts > 5 {
-                                error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
-                                let _ = monitor_positions.abandon_position(&position.mint).await;
-                                let _ = remove_bought_mint(
-                                    &monitor_bought_mints,
-                                    &monitor_bought_mints_path,
-                                    &position.mint,
-                                )
-                                .await;
+                                // INV-POS-002: a failed sell must never make a wallet-owned
+                                // position disappear from tracking. Do NOT abandon the position
+                                // or drop it from bought-mints. Leave it OPEN/TRACKED, reset the
+                                // retry counter, and let a later cycle retry. Reconciliation is a
+                                // later packet.
+                                error!(
+                                    "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
+                                    position.symbol
+                                );
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
@@ -3566,4 +3513,55 @@ pub async fn hot_scan(
     }
 
     Ok(())
+}
+
+/// Strategy entry policy in one place: ONLY an explicit `Enter` authorizes a buy.
+/// Every other `TradingAction` (Hold, Skip, FatalReject, Exit, Pause) is an
+/// abstention and returns `None`.
+fn strategy_entry_size(action: &TradingAction) -> Option<f64> {
+    match action {
+        TradingAction::Enter { size_sol, .. } => Some(*size_sol),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::types::{TradingAction, TradingStrategy};
+
+    #[test]
+    fn test_strategy_entry_size_enter_returns_size() {
+        let action = TradingAction::Enter {
+            mint: "m".to_string(),
+            size_sol: 0.1,
+            strategy: TradingStrategy::MomentumSurfing,
+        };
+        assert_eq!(strategy_entry_size(&action), Some(0.1));
+    }
+
+    #[test]
+    fn test_strategy_entry_size_hold_is_none() {
+        assert_eq!(strategy_entry_size(&TradingAction::Hold), None);
+    }
+
+    #[test]
+    fn test_strategy_entry_size_skip_is_none() {
+        assert_eq!(
+            strategy_entry_size(&TradingAction::Skip {
+                reason: "x".to_string()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn test_strategy_entry_size_fatal_reject_is_none() {
+        assert_eq!(
+            strategy_entry_size(&TradingAction::FatalReject {
+                reason: "x".to_string()
+            }),
+            None
+        );
+    }
 }
