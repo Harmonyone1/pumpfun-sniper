@@ -56,9 +56,12 @@ drop_policy = "oldest_non_priority"
 
 [trading]
 # Amount of SOL to spend per snipe (increased from 0.05 to overcome fees)
-buy_amount_sol = 0.15
-# Slippage tolerance in basis points (2500 = 25%)
-slippage_bps = 2500
+buy_amount_sol = 0.05
+# Buy slippage in basis points (3500 = 35%). Higher floor to avoid Custom:1 failures.
+# buy_local_with_retry starts here and escalates to 75% on retries.
+slippage_bps = 3500
+# Sell slippage in basis points (1200 = 12%). Tight to reduce exit drift on SL/TP.
+sell_slippage_bps = 1200
 # Priority fee for non-Jito transactions
 priority_fee_lamports = 100000
 # Simulate before sending (adds ~50ms latency)
@@ -105,40 +108,34 @@ auto_copy_trade = true
 [auto_sell]
 # Enable automatic take-profit and stop-loss
 enabled = true
-# Final take-profit: exit remaining position at this level
-# NOTE: Must account for ~3-4% round-trip fees (Local API 0.5% + pump.fun ~1%)
-take_profit_pct = 25.0
-# Stop loss: exit if drops this % from entry
-stop_loss_pct = 15.0
-# Enable partial take-profit (sell portion at TP, hold rest)
+# LIVE-VALIDATED: SL-22% / TP-40%
+# Live MFE: median winner peaks +45%, only 4.5% hit +100%. TP-40% captures most winners before reversal.
+take_profit_pct = 40.0
+stop_loss_pct = 22.0
+# Price polling interval in milliseconds
+# 2000ms prevents DexScreener rate limiting (200ms caused 99%+ failures)
+price_poll_interval_ms = 2000
+# Catastrophe floor is hardcoded at -35% (not configurable)
+
+# Legacy fields (no longer used by exit logic, kept for config compat)
 partial_take_profit = false
-# Price polling interval in milliseconds (200ms for faster crash detection)
-price_poll_interval_ms = 200
-
-# === LAYERED EXITS (FEE-ADJUSTED) ===
-# With ~3% round-trip fees, must target higher % to net profit
-# Layer 1: Sell 50% at quick_profit_pct (net ~5% after fees)
 quick_profit_pct = 8.0
-# Layer 2: Sell 25% at second_profit_pct (net ~12% after fees)
 second_profit_pct = 15.0
-# Layer 3: Sell remaining at take_profit_pct (net ~22% after fees)
-# Example: Buy 100 tokens, sell 50 at +8%, sell 25 at +15%, sell 25 at +25%
-
-# === NO-MOVEMENT EXIT ===
-# DISABLED: Was causing exits right before price spikes
-# Set to very high values to effectively disable
 no_movement_threshold_pct = 0.0
 no_movement_secs = 999999
 
-# === DYNAMIC TRAILING STOP ===
-# Trailing stop tightens as profit grows to prevent round-tripping
-dynamic_trailing_enabled = true
-# Base trailing (P&L < 15%): exit if drops 5% from peak
-trailing_stop_base_pct = 5.0
-# Medium trailing (P&L 15-25%): exit if drops 4% from peak
-trailing_stop_medium_pct = 4.0
-# Tight trailing (P&L > 25%): exit if drops 3% from peak
-trailing_stop_tight_pct = 3.0
+# === TRAILING STOP (profit lock-in) ===
+# Activates after position reaches activation threshold, then trails below peak
+# Live data: PETAH peaked +36.6% but 25% trail only locked +2.5%. Tightened.
+trailing_stop_enabled = true
+trailing_stop_activation_pct = 20.0   # Start trailing after +20% from entry
+trailing_stop_distance_pct = 12.0     # Trail 12% below peak price (locks +5.6% at +20% peak)
+
+# Dynamic trailing disabled (using simple trailing stop above)
+dynamic_trailing_enabled = false
+trailing_stop_base_pct = 15.0
+trailing_stop_medium_pct = 12.0
+trailing_stop_tight_pct = 10.0
 
 [safety]
 # Require confirmation for manual sells

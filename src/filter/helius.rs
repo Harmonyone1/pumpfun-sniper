@@ -454,15 +454,21 @@ impl HeliusClient {
         }
 
         // Now fetch the transaction to get fee payer (creator)
+        // Helius parsed transactions API requires POST with signatures in body
         let sig = &signatures[0].signature;
         let url = format!(
-            "{}/v0/transactions/?api-key={}&transactions={}",
-            self.rest_base_url, self.api_key, sig
+            "{}/v0/transactions?api-key={}",
+            self.rest_base_url, self.api_key
         );
+
+        let request_body = serde_json::json!({
+            "transactions": [sig]
+        });
 
         let response = self
             .client
-            .get(&url)
+            .post(&url)
+            .json(&request_body)
             .timeout(self.timeout)
             .send()
             .await

@@ -87,9 +87,9 @@ impl AutoSeller {
                     None => continue, // No position, skip
                 };
 
-                // Update price in position manager
+                // Update price in position manager (always fresh from direct API)
                 position_manager
-                    .update_price(&update.mint.to_string(), update.price)
+                    .update_price(&update.mint.to_string(), update.price, true)
                     .await;
 
                 // Check for triggers

@@ -149,6 +149,9 @@ pub struct TradingConfig {
     pub buy_amount_sol: f64,
     #[serde(default = "default_slippage_bps")]
     pub slippage_bps: u32,
+    /// Sell slippage in basis points (1200 = 12%). Tighter than buy slippage to reduce exit drift.
+    #[serde(default = "default_sell_slippage_bps")]
+    pub sell_slippage_bps: u32,
     #[serde(default = "default_priority_fee")]
     pub priority_fee_lamports: u64,
     #[serde(default)]
@@ -325,19 +328,19 @@ pub struct AutoSellConfig {
     pub trailing_stop_tight_pct: f64,
 }
 
-fn default_quick_profit_pct() -> f64 { 4.0 }
-fn default_second_profit_pct() -> f64 { 8.0 }
+fn default_quick_profit_pct() -> f64 { 8.0 }   // First layer at 8%
+fn default_second_profit_pct() -> f64 { 15.0 } // Second layer at 15%
 fn default_no_movement_threshold() -> f64 { 2.0 }
 fn default_no_movement_secs() -> u64 { 120 }
-fn default_trailing_base() -> f64 { 5.0 }
-fn default_trailing_medium() -> f64 { 4.0 }
-fn default_trailing_tight() -> f64 { 3.0 }
+fn default_trailing_base() -> f64 { 15.0 }     // Wide trail at base (let runners run)
+fn default_trailing_medium() -> f64 { 12.0 }   // Tighten at 25%+ profit
+fn default_trailing_tight() -> f64 { 10.0 }    // Tighten at 50%+ profit
 
 fn default_trailing_activation() -> f64 {
-    10.0
+    20.0  // Start trailing after +20% profit
 }
 fn default_trailing_distance() -> f64 {
-    15.0
+    12.0  // Trail 12% below peak (locks +5.6% at +20%, +23.4% at +40%)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -557,7 +560,11 @@ fn default_buy_amount_sol() -> f64 {
 }
 
 fn default_slippage_bps() -> u32 {
-    2500
+    3500
+}
+
+fn default_sell_slippage_bps() -> u32 {
+    1200
 }
 
 fn default_priority_fee() -> u64 {
@@ -573,11 +580,11 @@ fn default_filter_max_bonding_curve() -> f64 {
 }
 
 fn default_take_profit_pct() -> f64 {
-    50.0
+    40.0  // Live MFE data: median winner peaks at +45%, only 4.5% hit +100%. TP-40% captures most winners.
 }
 
 fn default_stop_loss_pct() -> f64 {
-    30.0
+    22.0 // Backtest-validated: SL-22% with TP-100% gives 43% WR, +27% expectancy
 }
 
 fn default_price_poll_interval_ms() -> u64 {
@@ -863,6 +870,7 @@ impl Default for Config {
             trading: TradingConfig {
                 buy_amount_sol: default_buy_amount_sol(),
                 slippage_bps: default_slippage_bps(),
+                sell_slippage_bps: default_sell_slippage_bps(),
                 priority_fee_lamports: default_priority_fee(),
                 simulate_before_send: false,
             },

@@ -50,67 +50,9 @@ impl EntryType {
         }
     }
 
-    /// Get adjusted stop loss for elite wallet entries
-    /// Elite wallets tend to re-enter quickly, so use tighter stops
-    pub fn stop_loss_pct_for_elite(&self, is_elite: bool) -> f64 {
-        if is_elite {
-            // Tighter stops for elite entries - they'll re-enter if needed
-            match self {
-                EntryType::StrongBuy => 10.0,  // Was 15% - now 10% for elite
-                EntryType::Opportunity => 12.0, // Was 15% - now 12%
-                EntryType::Probe => 8.0,        // Was 12% - now 8%
-                EntryType::Legacy => 12.0,
-            }
-        } else {
-            self.stop_loss_pct()
-        }
-    }
-
-    /// Get the take profit target for this entry type
-    /// DATA-DRIVEN: Lowered for realistic 2-minute holds
-    pub fn take_profit_pct(&self) -> f64 {
-        match self {
-            EntryType::StrongBuy => 15.0,   // Was 100% - now 15% realistic
-            EntryType::Opportunity => 10.0, // Was 50% - now 10% for quick profit
-            EntryType::Probe => 8.0,        // Was 25% - now 8% quick scalp
-            EntryType::Legacy => 10.0,      // Default
-        }
-    }
-
-    /// Get the QUICK profit level - exit 50% of position at this level
-    /// This secures profits early before potential dump
-    pub fn quick_profit_pct(&self) -> f64 {
-        match self {
-            EntryType::StrongBuy => 8.0,   // Take 50% off at 8% profit
-            EntryType::Opportunity => 5.0, // Take 50% off at 5% profit
-            EntryType::Probe => 4.0,       // Take 50% off at 4% profit (very quick)
-            EntryType::Legacy => 5.0,      // Default
-        }
-    }
-
-    /// Get the stop loss threshold for this entry type
-    /// WIDENED: Give trades more room to breathe
-    pub fn stop_loss_pct(&self) -> f64 {
-        match self {
-            EntryType::StrongBuy => 15.0,   // Widened from 10% to 15%
-            EntryType::Opportunity => 15.0, // Widened from 12% to 15%
-            EntryType::Probe => 12.0,       // Widened from 10% to 12%
-            EntryType::Legacy => 15.0,      // Widened from 12% to 15%
-        }
-    }
-
-    /// Get the max hold time in seconds for this entry type
-    /// DISABLED: Time-based exits were causing exits right before price spikes.
-    /// Let the trailing stop and take-profit do their job instead.
-    pub fn max_hold_secs(&self) -> Option<u64> {
-        // Return None for all entry types - rely on trailing stop and TP/SL instead
-        None
-    }
-
-    /// Should use tiered exit strategy?
-    pub fn use_tiered_exit(&self) -> bool {
-        matches!(self, EntryType::StrongBuy)
-    }
+    // V1 entry-type-based TP/SL/trailing methods removed.
+    // Exit strategy is now config-driven (SL-22%/TP-100%), computed at entry time
+    // and stored on Position as tp_price/sl_price.
 }
 
 /// A single position in a token
@@ -149,6 +91,9 @@ pub struct Position {
     /// Current price (updated by price feed)
     #[serde(skip)]
     pub current_price: f64,
+    /// Timestamp of last price update (for staleness detection)
+    #[serde(skip)]
+    pub price_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Kill-switch triggered - exit immediately
     #[serde(default)]
     pub kill_switch_triggered: bool,
@@ -158,6 +103,15 @@ pub struct Position {
     /// Wallet pubkey that holds this position (for multi-wallet support)
     #[serde(default)]
     pub wallet_pubkey: String,
+    /// Take-profit price (set once at entry: entry_price * (1 + tp_pct/100))
+    #[serde(default)]
+    pub tp_price: f64,
+    /// Stop-loss price (set once at entry: entry_price * (1 - sl_pct/100))
+    #[serde(default)]
+    pub sl_price: f64,
+    /// Exit reason (filled when position is closed)
+    #[serde(default)]
+    pub exit_reason: Option<String>,
 }
 
 impl Position {
@@ -210,6 +164,16 @@ impl DailyStats {
     }
 
     pub fn record_trade(&mut self, pnl_sol: f64) {
+        // NaN/Inf guard: reject corrupt P&L data instead of propagating
+        if !pnl_sol.is_finite() {
+            tracing::error!(
+                "NaN/Inf P&L detected in record_trade ({}) - recording as 0.0 loss to prevent corruption",
+                pnl_sol
+            );
+            self.total_trades += 1;
+            self.losing_trades += 1;
+            return;
+        }
         self.total_trades += 1;
         if pnl_sol >= 0.0 {
             self.winning_trades += 1;
@@ -335,10 +299,22 @@ impl PositionManager {
             .get_mut(mint)
             .ok_or_else(|| Error::PositionNotFound(mint.to_string()))?;
 
-        // Calculate P&L for sold portion
-        let sold_ratio = sold_amount as f64 / position.token_amount as f64;
+        // Calculate P&L for sold portion (NaN-safe)
+        let sold_ratio = if position.token_amount > 0 {
+            sold_amount as f64 / position.token_amount as f64
+        } else {
+            1.0 // Closing full position
+        };
         let cost_basis = position.total_cost_sol * sold_ratio;
+        let received_sol = if received_sol.is_finite() { received_sol } else {
+            tracing::error!("NaN/Inf received_sol in close_position for {} - treating as 0.0", mint);
+            0.0
+        };
         let pnl = received_sol - cost_basis;
+        let pnl = if pnl.is_finite() { pnl } else {
+            tracing::error!("NaN/Inf P&L in close_position for {} - treating as total loss", mint);
+            -cost_basis
+        };
 
         // Update position
         position.token_amount -= sold_amount;
@@ -379,14 +355,41 @@ impl PositionManager {
         Ok(())
     }
 
-    /// Update current price for a position and track peak price
-    pub async fn update_price(&self, mint: &str, price: f64) {
+    /// Update current price for a position and track peak price.
+    /// Only updates price_updated_at when `fresh` is true (price came from API, not fallback).
+    /// Stale fallback prices still update current_price for display but don't reset the staleness clock.
+    pub async fn update_price(&self, mint: &str, price: f64, fresh: bool) {
         let mut positions = self.positions.write().await;
         if let Some(position) = positions.get_mut(mint) {
             position.current_price = price;
-            // Track peak price for trailing stop
-            if price > position.peak_price {
+            if fresh {
+                position.price_updated_at = Some(chrono::Utc::now());
+            }
+            // Track peak price for trailing stop (only on fresh prices)
+            if fresh && price > position.peak_price {
                 position.peak_price = price;
+            }
+        }
+    }
+
+    /// Check if a position's price is stale (older than max_age_secs)
+    pub async fn get_price_age_secs(&self, mint: &str) -> Option<i64> {
+        let positions = self.positions.read().await;
+        if let Some(position) = positions.get(mint) {
+            if let Some(updated_at) = position.price_updated_at {
+                return Some((chrono::Utc::now() - updated_at).num_seconds());
+            }
+        }
+        None
+    }
+
+    /// Update bonding curve address for a position (backfill for legacy positions)
+    pub async fn update_bonding_curve(&self, mint: &str, bonding_curve: &str) {
+        let mut positions = self.positions.write().await;
+        if let Some(position) = positions.get_mut(mint) {
+            if position.bonding_curve.is_empty() {
+                position.bonding_curve = bonding_curve.to_string();
+                info!("Backfilled bonding curve for {}: {}", mint, &bonding_curve[..8]);
             }
         }
     }
@@ -454,6 +457,67 @@ impl PositionManager {
                 "Updated {} token amount: {} -> {} (entry price preserved at {:.10})",
                 mint, old_amount, actual_amount, position.entry_price
             );
+        }
+        drop(positions);
+        self.save().await
+    }
+
+    /// Update position with verified on-chain data including corrected entry price
+    /// This calculates the true fill price from total_cost_sol / actual_tokens
+    /// which is more accurate than the DexScreener quote used at position creation
+    pub async fn update_position_verified(
+        &self,
+        mint: &str,
+        actual_tokens: u64,
+        total_cost_sol: f64,
+    ) -> Result<()> {
+        let mut positions = self.positions.write().await;
+        if let Some(position) = positions.get_mut(mint) {
+            let old_amount = position.token_amount;
+            let old_price = position.entry_price;
+
+            position.token_amount = actual_tokens;
+
+            // Calculate actual entry price from fill (total_cost / tokens)
+            // This is more accurate than the DexScreener quote
+            if actual_tokens > 0 && total_cost_sol > 0.0 {
+                let actual_entry_price = total_cost_sol / (actual_tokens as f64);
+                let price_diff_pct = if old_price > 0.0 {
+                    ((actual_entry_price - old_price) / old_price).abs() * 100.0
+                } else {
+                    0.0
+                };
+
+                // Only update if there's a meaningful difference (>0.5%)
+                if price_diff_pct > 0.5 {
+                    position.entry_price = actual_entry_price;
+                    // Reset peak to actual entry
+                    position.peak_price = actual_entry_price;
+                    // Recompute TP/SL prices from corrected entry
+                    if position.tp_price > 0.0 {
+                        let tp_ratio = position.tp_price / old_price;
+                        position.tp_price = actual_entry_price * tp_ratio;
+                    }
+                    if position.sl_price > 0.0 {
+                        let sl_ratio = position.sl_price / old_price;
+                        position.sl_price = actual_entry_price * sl_ratio;
+                    }
+                    info!(
+                        "Verified position {}: tokens {} -> {}, entry price {:.10} -> {:.10} ({:.1}% diff from quote)",
+                        mint, old_amount, actual_tokens, old_price, actual_entry_price, price_diff_pct
+                    );
+                } else {
+                    info!(
+                        "Verified position {}: tokens {} -> {} (entry price unchanged, <0.5% diff)",
+                        mint, old_amount, actual_tokens
+                    );
+                }
+            } else {
+                info!(
+                    "Verified position {}: tokens {} -> {} (entry price preserved)",
+                    mint, old_amount, actual_tokens
+                );
+            }
         }
         drop(positions);
         self.save().await

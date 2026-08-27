@@ -8,6 +8,7 @@
 //! Fee: 0.5% per trade
 //! Rate limits apply - don't spam requests
 
+use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
@@ -15,6 +16,7 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{Error, Result};
@@ -47,6 +49,35 @@ pub enum PoolType {
 impl Default for PoolType {
     fn default() -> Self {
         Self::Pump
+    }
+}
+
+/// Cache for pool readiness checks with TTL
+struct PoolReadinessCache {
+    cache: DashMap<String, (bool, Instant)>,
+    ttl: Duration,
+}
+
+impl PoolReadinessCache {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            cache: DashMap::new(),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    fn get(&self, mint: &str) -> Option<bool> {
+        self.cache.get(mint).and_then(|entry| {
+            if entry.1.elapsed() < self.ttl {
+                Some(entry.0)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn set(&self, mint: &str, ready: bool) {
+        self.cache.insert(mint.to_string(), (ready, Instant::now()));
     }
 }
 
@@ -121,6 +152,8 @@ pub struct PumpPortalTrader {
     api_key: Option<String>,
     #[allow(dead_code)]
     use_local_api: bool,
+    /// Cache for pool readiness checks (60 second TTL)
+    pool_cache: PoolReadinessCache,
 }
 
 impl PumpPortalTrader {
@@ -134,6 +167,7 @@ impl PumpPortalTrader {
             client: Client::new(),
             api_key,
             use_local_api,
+            pool_cache: PoolReadinessCache::new(60), // 60 second TTL
         }
     }
 
@@ -1021,6 +1055,7 @@ impl PumpPortalTrader {
 
     /// Check if a pump.fun token is tradeable (pool exists and is active)
     /// Returns true if the token can be traded via PumpPortal
+    /// Results are cached for 60 seconds to avoid redundant API calls
     pub async fn check_pool_ready(&self, mint: &str) -> bool {
         // Verify token ends with "pump" (pump.fun convention)
         if !mint.ends_with("pump") {
@@ -1029,6 +1064,12 @@ impl PumpPortalTrader {
                 mint
             );
             return false;
+        }
+
+        // Check cache first
+        if let Some(cached) = self.pool_cache.get(mint) {
+            debug!("Pool readiness cache hit for {}: {}", mint, cached);
+            return cached;
         }
 
         // Try to get a quote by making a minimal trade request to local API
@@ -1051,7 +1092,7 @@ impl PumpPortalTrader {
             .send()
             .await;
 
-        match response {
+        let ready = match response {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -1073,7 +1114,11 @@ impl PumpPortalTrader {
                 warn!("Pool check failed for {}: {} - assuming not ready", mint, e);
                 false
             }
-        }
+        };
+
+        // Cache the result
+        self.pool_cache.set(mint, ready);
+        ready
     }
 }
 

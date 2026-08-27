@@ -4,10 +4,11 @@ use anyhow::Result;
 use dialoguer::Confirm;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::filter::{
@@ -88,6 +89,56 @@ fn query_token_balance(
     }
 
     0
+}
+
+/// Async wrapper for query_token_balance using spawn_blocking
+/// Prevents blocking the tokio runtime when called from async context
+async fn query_token_balance_async(
+    rpc_client: Arc<solana_client::rpc_client::RpcClient>,
+    wallet: Pubkey,
+    mint: String,
+) -> u64 {
+    tokio::task::spawn_blocking(move || {
+        query_token_balance(&rpc_client, &wallet, &mint)
+    })
+    .await
+    .unwrap_or(0)
+}
+
+/// Fetch bonding curve price from on-chain account data
+/// Returns (price_in_sol, is_graduated) or None if fetch fails
+/// Uses spawn_blocking since RpcClient is synchronous
+async fn fetch_bonding_curve_price(
+    rpc_client: Arc<solana_client::rpc_client::RpcClient>,
+    bonding_curve_str: String,
+) -> Option<(f64, bool)> {
+    let bc_pubkey = match Pubkey::from_str(&bonding_curve_str) {
+        Ok(pk) => pk,
+        Err(_) => return None,
+    };
+    // 5s timeout prevents hung RPC calls from blocking the entire monitor loop
+    match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::task::spawn_blocking(move || {
+        match rpc_client.get_account(&bc_pubkey) {
+            Ok(account) => {
+                match crate::pump::accounts::BondingCurve::try_from_slice(&account.data) {
+                    Ok(curve) => {
+                        match curve.get_price() {
+                            Ok(price) if price > 0.0 => Some((price, curve.complete)),
+                            _ => None,
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    })).await {
+        Ok(result) => result.unwrap_or(None),
+        Err(_) => {
+            warn!("Bonding curve RPC timed out after 5s for {}", &bonding_curve_str[..8.min(bonding_curve_str.len())]);
+            None
+        }
+    }
 }
 
 fn persist_bought_mints(path: &str, map: &std::collections::HashMap<String, i64>) {
@@ -320,23 +371,30 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let seen_trade_tokens: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
+    // Banlist: mints that failed buy verification (mint -> timestamp)
+    // Prevents infinite rebuy loops on tokens where tx fails silently
+    let failed_verification_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     info!("Starting price feed...");
     // Wrap trader in Arc for sharing across tasks
     let trader_arc: Option<std::sync::Arc<PumpPortalTrader>> =
         pumpportal_trader.map(std::sync::Arc::new);
 
-    // === IMPROVED POSITION MONITOR WITH LOCAL FALLBACK ===
-    // Features: Trailing stop, no-movement exit, quick profit, retry with local fallback
+    // === POSITION MONITOR WITH BACKTEST-VALIDATED EXIT STRATEGY ===
+    // SL/TP from config, catastrophe floor, price staleness, local API fallback
     if config.auto_sell.enabled && !dry_run {
         let monitor_config = config.clone();
         let monitor_positions = position_manager.clone();
         let monitor_trader = trader_arc.clone();
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
+        let monitor_use_local_api = use_local_api;
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
-            info!("Features: Trailing Stop (5%), Quick Profit, LOCAL FALLBACK (No-Movement Exit DISABLED)");
+            info!("Exit strategy: SL-{:.0}% / TP-{:.0}% (backtest-validated)",
+                  monitor_config.auto_sell.stop_loss_pct, monitor_config.auto_sell.take_profit_pct);
 
             // Track sell attempts for retry logic
             let mut sell_attempts: std::collections::HashMap<String, u32> =
@@ -365,99 +423,135 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         continue; // Too new, wait for confirmation
                     }
 
-                    // Calculate P&L from entry
+                    // === PRICE STALENESS GUARD (tiered) ===
+                    let price_age_secs = if let Some(updated_at) = position.price_updated_at {
+                        (chrono::Utc::now() - updated_at).num_seconds().max(0)
+                    } else {
+                        999 // No price update ever = extremely stale
+                    };
+
+                    if price_age_secs >= 30 {
+                        // Log staleness but DON'T force-sell winners
+                        // DexScreener rate-limits cause all prices to go stale simultaneously
+                        // Selling profitable positions on staleness destroys the TP-100% edge
+                        let tentative_pnl = if position.entry_price > 0.0 {
+                            ((current_price - position.entry_price) / position.entry_price) * 100.0
+                        } else { -100.0 };
+                        if tentative_pnl >= 0.0 {
+                            warn!(
+                                "STALE PRICE ({}s) but {} is in PROFIT ({:+.1}%) - holding (winners ride through outages)",
+                                price_age_secs, position.symbol, tentative_pnl
+                            );
+                        } else {
+                            warn!(
+                                "STALE PRICE ({}s) + {} in loss ({:.1}%) - monitoring",
+                                price_age_secs, position.symbol, tentative_pnl
+                            );
+                        }
+                    }
+                    // 10s stale: new entries are paused (checked at buy time, not here)
+
+                    // Calculate P&L from entry (NaN-safe: treat NaN/Inf as -100%)
                     let pnl_pct = if position.entry_price > 0.0 {
-                        ((current_price - position.entry_price) / position.entry_price) * 100.0
+                        let raw = ((current_price - position.entry_price) / position.entry_price) * 100.0;
+                        if raw.is_finite() { raw } else {
+                            error!("NaN/Inf detected in P&L for {} - treating as -100%", position.symbol);
+                            -100.0
+                        }
                     } else {
-                        0.0
+                        -100.0 // No entry price = assume total loss
                     };
 
-                    // Calculate drop from peak (for trailing stop)
-                    let peak_price = if position.peak_price > 0.0 {
-                        position.peak_price
+                    // === EXIT STRATEGY: catastrophe > stale > TP > trailing/SL ===
+                    let sl_pct = monitor_config.auto_sell.stop_loss_pct;
+                    let tp_pct = monitor_config.auto_sell.take_profit_pct;
+                    let catastrophe_floor_pct = 35.0;
+                    let price_is_fresh = price_age_secs < 30;
+
+                    // For legacy positions without tp_price/sl_price, compute from config
+                    let tp_price = if position.tp_price > 0.0 {
+                        position.tp_price
                     } else {
-                        position.entry_price
+                        position.entry_price * (1.0 + tp_pct / 100.0)
                     };
-                    let drop_from_peak_pct = if peak_price > 0.0 {
-                        ((peak_price - current_price) / peak_price) * 100.0
+                    let sl_price = if position.sl_price > 0.0 {
+                        position.sl_price
                     } else {
-                        0.0
+                        position.entry_price * (1.0 - sl_pct / 100.0)
                     };
 
-                    let hold_time_secs = (chrono::Utc::now() - position.entry_time)
-                        .num_seconds()
-                        .max(0) as u64;
+                    // Trailing stop: lock in profits after significant gains
+                    let mut effective_sl = sl_price;
+                    let mut trailing_active = false;
+                    if monitor_config.auto_sell.trailing_stop_enabled && position.peak_price > 0.0 && position.entry_price > 0.0 {
+                        let peak_gain_pct = ((position.peak_price - position.entry_price) / position.entry_price) * 100.0;
+                        let activation = monitor_config.auto_sell.trailing_stop_activation_pct;
+                        let distance = monitor_config.auto_sell.trailing_stop_distance_pct;
 
-                    // Get entry-type-specific thresholds
-                    let tp_pct = position.entry_type.take_profit_pct();
-                    let sl_pct = position.entry_type.stop_loss_pct();
-                    let quick_profit_pct = position.entry_type.quick_profit_pct();
-                    let max_hold = position.entry_type.max_hold_secs();
-
-                    // Trailing stop: 5% drop from peak (only if we're in profit)
-                    let trailing_stop_pct = 5.0;
-                    // No-movement exit: DISABLED (was causing exits before pumps)
-                    let no_movement_secs = 999999u64;
-                    let no_movement_threshold = 0.0;
+                        if peak_gain_pct >= activation {
+                            let trailing_sl = position.peak_price * (1.0 - distance / 100.0);
+                            let breakeven_floor = position.entry_price * 0.985;
+                            let trailing_sl = trailing_sl.max(breakeven_floor);
+                            if trailing_sl > effective_sl {
+                                effective_sl = trailing_sl;
+                                trailing_active = true;
+                            }
+                        }
+                    }
 
                     let mut should_sell = false;
-                    let mut sell_pct = "100%";
+                    let sell_pct = "100%"; // Always full exit (no more partial sells)
                     let mut reason = String::new();
 
-                    // 1. Check stop loss FIRST (cut losses quickly)
-                    if pnl_pct <= -sl_pct {
-                        should_sell = true;
-                        reason = format!("STOP LOSS at {:.1}% (limit: -{:.0}%)", pnl_pct, sl_pct);
-                    }
-
-                    // 2. Check trailing stop (only if in profit and dropped from peak)
-                    if !should_sell && pnl_pct > 0.0 && drop_from_peak_pct >= trailing_stop_pct {
+                    // 0. CATASTROPHE FLOOR — fires even on stale prices
+                    if pnl_pct <= -catastrophe_floor_pct {
                         should_sell = true;
                         reason = format!(
-                            "TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%)",
-                            drop_from_peak_pct, pnl_pct
+                            "CATASTROPHE FLOOR at {:.1}% (limit: -{:.0}%) - EMERGENCY EXIT",
+                            pnl_pct, catastrophe_floor_pct
                         );
                     }
 
-                    // 3. Check take profit
-                    if !should_sell && pnl_pct >= tp_pct {
-                        should_sell = true;
-                        reason = format!("TAKE PROFIT at {:.1}% (target: {:.0}%)", pnl_pct, tp_pct);
-                    }
-
-                    // 4. Check quick profit (partial exit)
-                    if !should_sell
-                        && !position.quick_profit_taken
-                        && pnl_pct >= quick_profit_pct
-                        && pnl_pct < tp_pct
-                    {
-                        should_sell = true;
-                        sell_pct = "50%";
-                        reason = format!("QUICK PROFIT at {:.1}% - selling 50%", pnl_pct);
-                    }
-
-                    // 5. Check no-movement exit (60s with <2% move either way)
-                    if !should_sell
-                        && hold_time_secs >= no_movement_secs
-                        && pnl_pct.abs() < no_movement_threshold
-                    {
+                    // 0b. STALE PRICE FORCE-SELL (conservative: never sell winners on staleness)
+                    if !should_sell && price_age_secs >= 180 && pnl_pct < 0.0 {
                         should_sell = true;
                         reason = format!(
-                            "NO MOVEMENT: {:.1}% after {}s - exiting stale position",
-                            pnl_pct, hold_time_secs
+                            "STALE PRICE ({}s) + LOSS ({:.1}%): No data for 3min+ while underwater - emergency exit",
+                            price_age_secs, pnl_pct
+                        );
+                    }
+                    if !should_sell && price_age_secs >= 90 && pnl_pct < -10.0 {
+                        should_sell = true;
+                        reason = format!(
+                            "STALE PRICE ({}s) + DEEP LOSS ({:.1}%): Exiting to prevent further bleed",
+                            price_age_secs, pnl_pct
                         );
                     }
 
-                    // 6. Check max hold time last (safety net)
-                    if !should_sell {
-                        if let Some(max_secs) = max_hold {
-                            if hold_time_secs >= max_secs {
-                                should_sell = true;
-                                reason = format!(
-                                    "MAX HOLD TIME ({} secs) P&L: {:.1}%",
-                                    max_secs, pnl_pct
-                                );
-                            }
+                    // 1. TAKE PROFIT — checked BEFORE SL so TP wins on same-tick edge case
+                    if !should_sell && current_price >= tp_price && tp_price > 0.0 {
+                        should_sell = true;
+                        reason = format!(
+                            "TAKE PROFIT at {:.1}% (price {:.10} >= TP {:.10})",
+                            pnl_pct, current_price, tp_price
+                        );
+                    }
+
+                    // 2. STOP LOSS / TRAILING STOP — only on FRESH prices
+                    if !should_sell && price_is_fresh && current_price <= effective_sl && effective_sl > 0.0 {
+                        should_sell = true;
+                        if trailing_active {
+                            let locked_pct = ((effective_sl - position.entry_price) / position.entry_price) * 100.0;
+                            let peak_pct = ((position.peak_price - position.entry_price) / position.entry_price) * 100.0;
+                            reason = format!(
+                                "TRAILING STOP at {:.1}% (peak was {:+.1}%, locked {:+.1}% profit, price {:.10} <= trail {:.10})",
+                                pnl_pct, peak_pct, locked_pct, current_price, effective_sl
+                            );
+                        } else {
+                            reason = format!(
+                                "STOP LOSS at {:.1}% (price {:.10} <= SL {:.10})",
+                                pnl_pct, current_price, sl_price
+                            );
                         }
                     }
 
@@ -473,13 +567,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             let priority_fee =
                                 monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
-                            // Retry logic: try up to 3 times with Lightning, then try local fallback
+                            // Retry logic: up to 3 attempts
+                            // When force_local_api=true, go DIRECTLY to local sell (skip Lightning)
                             let attempts = sell_attempts.entry(position.mint.clone()).or_insert(0);
                             *attempts += 1;
 
-                            if *attempts > 5 {
-                                error!("AUTO-SELL GAVE UP for {} after 5 attempts - removing from tracking", position.symbol);
-                                // Estimate received SOL as 0 since sell failed
+                            if *attempts > 3 {
+                                error!("AUTO-SELL GAVE UP for {} after 3 attempts - recording as total loss", position.symbol);
                                 let _ = monitor_positions
                                     .close_position(&position.mint, position.token_amount, 0.0)
                                     .await;
@@ -487,16 +581,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 continue;
                             }
 
-                            // Try Lightning API first (attempts 1-3)
-                            let sell_result: Result<String, crate::error::Error> = if *attempts <= 3
-                            {
-                                info!("Attempting Lightning API sell (attempt {})", attempts);
-                                trader
-                                    .sell(&position.mint, sell_pct, slippage, priority_fee)
-                                    .await
-                            } else {
-                                // Attempts 4-5: Try local signing fallback
-                                warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
+                            let sell_result: Result<String, crate::error::Error> = if monitor_use_local_api {
+                                // Local API mode: always use sell_local (no wasted Lightning attempts)
+                                info!("Attempting LOCAL API sell (attempt {})", attempts);
                                 trader
                                     .sell_local(
                                         &position.mint,
@@ -506,6 +593,12 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         &monitor_keypair,
                                         &monitor_rpc,
                                     )
+                                    .await
+                            } else {
+                                // Lightning mode: use Lightning API
+                                info!("Attempting Lightning API sell (attempt {})", attempts);
+                                trader
+                                    .sell(&position.mint, sell_pct, slippage, priority_fee)
                                     .await
                             };
 
@@ -911,6 +1004,23 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         if !dry_run {
                             if let Some(ref trader) = trader_arc {
                                 let mint = &token.mint;
+
+                                // CHECK BANLIST: Skip mints that failed verification recently
+                                {
+                                    let guard = failed_verification_mints.lock().await;
+                                    if let Some(&ban_time) = guard.get(mint as &str) {
+                                        let ban_age_secs = chrono::Utc::now().timestamp() - ban_time;
+                                        if ban_age_secs < 300 { // 5-minute ban
+                                            warn!(
+                                                "BANLIST: Skipping {} ({}) - failed verification {}s ago",
+                                                token.symbol, &mint[..12], ban_age_secs
+                                            );
+                                            continue;
+                                        }
+                                        // Ban expired - will be cleaned up naturally
+                                    }
+                                }
+
                                 let slippage_pct = config.trading.slippage_bps / 100;
                                 let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
 
@@ -938,32 +1048,49 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         info!("View on Solscan: https://solscan.io/tx/{}", signature);
 
                                         // CRITICAL: Verify tokens were actually received before recording position
-                                        // Wait for transaction to confirm
-                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-                                        // Determine which wallet to check based on API mode
+                                        // Poll every 2s for up to 15s (was: single check after 2s)
                                         let check_wallet = if use_local_api {
                                             keypair.pubkey()
                                         } else {
-                                            // For Lightning API, use the lightning wallet
                                             Pubkey::from_str(&config.pumpportal.lightning_wallet)
                                                 .unwrap_or(keypair.pubkey())
                                         };
 
-                                        let actual_tokens = query_token_balance(&rpc_client, &check_wallet, mint);
-
-                                        if actual_tokens == 0 {
-                                            // Transaction may have failed - DON'T record position
-                                            error!(
-                                                "BUY VERIFICATION FAILED: No tokens received for {} ({}) after 2s wait. TX may have failed silently. NOT recording position.",
-                                                token.symbol, mint
-                                            );
-                                            error!("Check transaction on Solscan: https://solscan.io/tx/{}", signature);
-                                            // Skip position recording and kill-switch setup
-                                            continue;
+                                        let mut actual_tokens = 0u64;
+                                        let max_verification_attempts = 7; // 7 attempts × 2s = 14s max
+                                        for attempt in 1..=max_verification_attempts {
+                                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                            actual_tokens = query_token_balance(&rpc_client, &check_wallet, mint);
+                                            if actual_tokens > 0 {
+                                                info!(
+                                                    "BUY VERIFIED on attempt {}/{}: {} tokens for {}",
+                                                    attempt, max_verification_attempts, actual_tokens, token.symbol
+                                                );
+                                                break;
+                                            }
+                                            if attempt < max_verification_attempts {
+                                                warn!(
+                                                    "Buy verification attempt {}/{}: no tokens yet for {} - retrying...",
+                                                    attempt, max_verification_attempts, token.symbol
+                                                );
+                                            }
                                         }
 
-                                        info!("BUY VERIFIED: Received {} tokens for {}", actual_tokens, token.symbol);
+                                        if actual_tokens == 0 {
+                                            // All attempts exhausted - add to failed verification banlist
+                                            error!(
+                                                "BUY VERIFICATION FAILED: No tokens received for {} ({}) after {}s polling. Adding to banlist.",
+                                                token.symbol, mint, max_verification_attempts * 2
+                                            );
+                                            error!("Check transaction on Solscan: https://solscan.io/tx/{}", signature);
+                                            // Add to banlist to prevent re-buying this mint
+                                            {
+                                                let mut guard = failed_verification_mints.lock().await;
+                                                guard.insert(mint.to_string(), chrono::Utc::now().timestamp());
+                                                info!("Banlist: added {} ({} mints banned)", mint, guard.len());
+                                            }
+                                            continue;
+                                        }
 
                                         // Record position with ACTUAL token amount (not estimate)
                                         let estimated_price = if token.v_tokens_in_bonding_curve > 0 {
@@ -980,6 +1107,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             _ => crate::position::manager::EntryType::Legacy,
                                         };
 
+                                        let tp_pct = config.auto_sell.take_profit_pct;
+                                        let sl_pct = config.auto_sell.stop_loss_pct;
                                         let position = crate::position::manager::Position {
                                             mint: token.mint.clone(),
                                             name: token.name.clone(),
@@ -995,9 +1124,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             second_profit_taken: false,
                                             peak_price: estimated_price,
                                             current_price: estimated_price,
+                                            price_updated_at: None,
                                             kill_switch_triggered: false,
                                             kill_switch_reason: None,
                                             wallet_pubkey: keypair.pubkey().to_string(),
+                                            tp_price: estimated_price * (1.0 + tp_pct / 100.0),
+                                            sl_price: estimated_price * (1.0 - sl_pct / 100.0),
+                                            exit_reason: None,
                                         };
 
                                         if let Err(e) = position_manager.open_position(position).await {
@@ -1248,6 +1381,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                                             // Record position - trade event entries are treated as Probe
                                             // since we have less information than new token events
+                                            let tp_pct = config.auto_sell.take_profit_pct;
+                                            let sl_pct = config.auto_sell.stop_loss_pct;
                                             let position = crate::position::manager::Position {
                                                 mint: trade.mint.clone(),
                                                 name: format!("Trade-{}", &trade.mint[..8]),
@@ -1258,14 +1393,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 total_cost_sol: final_amount_sol,
                                                 entry_time: chrono::Utc::now(),
                                                 entry_signature: sig.clone(),
-                                                entry_type: crate::position::manager::EntryType::Probe, // Conservative for trade-based entries
+                                                entry_type: crate::position::manager::EntryType::Probe,
                                                 quick_profit_taken: false,
                                                 second_profit_taken: false,
                                                 peak_price: estimated_price,
                                                 current_price: estimated_price,
+                                                price_updated_at: None,
                                                 kill_switch_triggered: false,
                                                 kill_switch_reason: None,
                                                 wallet_pubkey: keypair.pubkey().to_string(),
+                                                tp_price: estimated_price * (1.0 + tp_pct / 100.0),
+                                                sl_price: estimated_price * (1.0 - sl_pct / 100.0),
+                                                exit_reason: None,
                                             };
                                             if let Err(e) = position_manager.open_position(position).await {
                                                 error!("Failed to record position: {}", e);
@@ -2281,7 +2420,7 @@ pub async fn scan(
     };
 
     loop {
-        let tokens = client.scan_hot_tokens(&scan_config).await?;
+        let tokens = client.scan_hot_tokens_parallel(&scan_config).await?;
         let tokens: Vec<_> = tokens.into_iter().take(limit).collect();
 
         if format == "json" {
@@ -2520,16 +2659,23 @@ pub async fn hot_scan(
     };
     let bought_mints_path = std::sync::Arc::new(bought_mints_path);
 
-    // Track recently sold mints with cooldown (5 minutes before re-entry allowed)
-    // This prevents buying back at the top immediately after selling
-    const SOLD_MINTS_COOLDOWN_SECS: i64 = 300; // 5 minutes
+    // Track recently sold mints with cooldown
+    // Live data: PIKACHU won +43.6% then re-entered 5min later and lost -25.6% (gave back 41% of win)
+    const SOLD_MINTS_COOLDOWN_WIN_SECS: i64 = 1800;  // 30 min after TP (prevent chasing re-entry)
+    const SOLD_MINTS_COOLDOWN_LOSS_SECS: i64 = 1800; // 30 min after SL/catastrophe (loser gets parked)
     let sold_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Track failed mints (buys that didn't land tokens) with longer cooldown
     // This prevents repeatedly trying to buy tokens that consistently fail
-    const FAILED_MINTS_COOLDOWN_SECS: i64 = 1800; // 30 minutes
+    const FAILED_MINTS_COOLDOWN_SECS: i64 = 900; // 15 minutes (reduced from 30 - CLWD/FOOM pumped while banned)
     let failed_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Track per-mint failure count — after 1 failure (trade loss OR verification failure), block for session
+    // Live data: NYAN bought 7x (6 verification failures + 1 SL loss), JESUS 18 failed buys
+    const MAX_LOSSES_PER_MINT: u32 = 1;
+    let mint_loss_count: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Initialize kill-switch evaluator for smart money exits
@@ -2572,6 +2718,7 @@ pub async fn hot_scan(
         let monitor_bought_mints_path = bought_mints_path.clone();
         let monitor_sold_mints = sold_mints.clone();
         let monitor_failed_mints = failed_mints.clone();
+        let monitor_mint_loss_count = mint_loss_count.clone();
         let monitor_kill_switch = kill_switch_evaluator.clone();
         let monitor_helius = helius_client.clone();
         let monitor_use_local_api = use_local_api;
@@ -2589,11 +2736,8 @@ pub async fn hot_scan(
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
             let poll_interval_ms = monitor_config.auto_sell.price_poll_interval_ms;
-            info!("Features: Dynamic Trailing ({}%-{}%), Layered Exits ({}%/{}%/{}%), Kill-Switch, LOCAL FALLBACK",
-                monitor_config.auto_sell.trailing_stop_base_pct,
-                monitor_config.auto_sell.trailing_stop_tight_pct,
-                monitor_config.auto_sell.quick_profit_pct,
-                monitor_config.auto_sell.second_profit_pct,
+            info!("Exit strategy: SL-{:.0}% / TP-{:.0}% (backtest-validated), Kill-Switch, LOCAL FALLBACK",
+                monitor_config.auto_sell.stop_loss_pct,
                 monitor_config.auto_sell.take_profit_pct
             );
             info!("Poll interval: {}ms", poll_interval_ms);
@@ -2609,6 +2753,9 @@ pub async fn hot_scan(
             // Track confirmed positions (tx landed and ATA exists)
             let mut confirmed_positions: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // Track graduated tokens (bonding curve complete → use DexScreener)
+            let mut graduated_mints: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
@@ -2618,67 +2765,151 @@ pub async fn hot_scan(
                     continue;
                 }
 
-                // Fetch current prices from DexScreener with fallback handling
-                for position in positions {
-                    // Get current price from DexScreener with retry
-                    let price_result = monitor_dex.get_token_info(&position.mint).await;
+                // === PRICE FETCHING: Bonding Curve (primary) → DexScreener (fallback) ===
+                // On-chain bonding curve gives real-time price with no lag.
+                // DexScreener used only for graduated tokens or missing BC address.
+                let mut price_map: HashMap<String, (f64, bool)> = HashMap::new();
 
-                    let current_price = match price_result {
-                        Ok(Some(token_info)) => {
-                            if token_info.price_native > 0.0 {
-                                token_info.price_native
-                            } else {
-                                // Zero price from API - use last known price if available
-                                if position.current_price > 0.0 {
-                                    warn!("[{}] DexScreener returned 0 price, using last known: {:.10}",
-                                          position.symbol, position.current_price);
-                                    position.current_price
+                for position in &positions {
+                    let mint = &position.mint;
+                    let symbol = &position.symbol;
+                    let last_price = position.current_price;
+
+                    // Derive bonding curve PDA for legacy positions that don't have it
+                    let bc_address = if position.bonding_curve.is_empty() {
+                        match Pubkey::from_str(mint) {
+                            Ok(mint_pk) => {
+                                match crate::trading::transaction::derive_bonding_curve(&mint_pk) {
+                                    Ok((bc, _)) => {
+                                        let bc_str = bc.to_string();
+                                        // Update position in manager so it persists
+                                        monitor_positions.update_bonding_curve(mint, &bc_str).await;
+                                        bc_str
+                                    }
+                                    Err(_) => String::new(),
+                                }
+                            }
+                            Err(_) => String::new(),
+                        }
+                    } else {
+                        position.bonding_curve.clone()
+                    };
+
+                    // Try bonding curve first (unless already known graduated)
+                    let has_bc = !bc_address.is_empty();
+                    let is_graduated = graduated_mints.contains(mint);
+
+                    if has_bc && !is_graduated {
+                        // PRIMARY: Fetch price from on-chain bonding curve (real-time, no lag)
+                        let bc_result = fetch_bonding_curve_price(
+                            monitor_rpc.clone(),
+                            bc_address.clone(),
+                        ).await;
+
+                        match bc_result {
+                            Some((price, graduated)) => {
+                                if graduated {
+                                    info!("[{}] Token graduated! Switching to DexScreener pricing", symbol);
+                                    graduated_mints.insert(mint.clone());
+                                    // Graduated: fall through to DexScreener below
                                 } else {
+                                    // Good bonding curve price
+                                    price_map.insert(mint.clone(), (price, true));
                                     continue;
                                 }
                             }
+                            None => {
+                                debug!("[{}] Bonding curve fetch failed, falling back to DexScreener", symbol);
+                            }
+                        }
+                    }
+
+                    // FALLBACK: DexScreener (for graduated tokens, missing BC, or BC fetch failure)
+                    let dex = monitor_dex.clone();
+                    let price_result = dex.get_token_info(mint).await;
+                    let price_info: Option<(f64, bool)> = match price_result {
+                        Ok(Some(token_info)) if token_info.price_native > 0.0 => {
+                            Some((token_info.price_native, true))
+                        }
+                        Ok(Some(_)) => {
+                            if last_price > 0.0 {
+                                warn!("[{}] DexScreener returned 0 price, using last known: {:.10}",
+                                      symbol, last_price);
+                                Some((last_price, false))
+                            } else {
+                                None
+                            }
                         }
                         Ok(None) => {
-                            // Token not found on DexScreener - use last known price
-                            if position.current_price > 0.0 {
-                                warn!(
-                                    "[{}] Not found on DexScreener, using last known price: {:.10}",
-                                    position.symbol, position.current_price
-                                );
-                                position.current_price
+                            if last_price > 0.0 {
+                                warn!("[{}] Not found on DexScreener, using last known: {:.10}",
+                                      symbol, last_price);
+                                Some((last_price, false))
                             } else {
-                                warn!(
-                                    "[{}] Not found on DexScreener and no last price - skipping",
-                                    position.symbol
-                                );
-                                continue;
+                                warn!("[{}] Not found and no last price - skipping", symbol);
+                                None
                             }
                         }
                         Err(e) => {
-                            // API error - use last known price as fallback
-                            if position.current_price > 0.0 {
-                                warn!(
-                                    "[{}] DexScreener error: {} - using last known price: {:.10}",
-                                    position.symbol, e, position.current_price
-                                );
-                                position.current_price
+                            if last_price > 0.0 {
+                                warn!("[{}] DexScreener error: {} - using last known: {:.10}",
+                                      symbol, e, last_price);
+                                Some((last_price, false))
                             } else {
-                                error!(
-                                    "[{}] DexScreener error and no fallback price: {}",
-                                    position.symbol, e
-                                );
-                                continue;
+                                error!("[{}] DexScreener error and no fallback: {}", symbol, e);
+                                None
                             }
                         }
                     };
+                    if let Some((p, fresh)) = price_info {
+                        price_map.insert(mint.clone(), (p, fresh));
+                    }
+                }
 
-                    // Update position price
+                debug!("Fetched {} prices for {} positions (BC primary, DexScreener fallback)",
+                       price_map.len(), positions.len());
+
+                // === PROCESS POSITIONS WITH FETCHED PRICES ===
+                for position in positions {
+                    // Get price from pre-fetched map
+                    let (current_price, is_fresh) = match price_map.get(&position.mint) {
+                        Some(&(p, fresh)) => (p, fresh),
+                        None => continue, // Skip positions without valid price
+                    };
+
+                    // Update position price. Only updates price_updated_at when fresh
+                    // (from API). Fallback prices update display but don't reset staleness clock.
                     monitor_positions
-                        .update_price(&position.mint, current_price)
+                        .update_price(&position.mint, current_price, is_fresh)
                         .await;
 
-                    // Small delay between API calls to avoid rate limiting
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    // Check for stale prices and log warnings
+                    if let Some(price_age) = monitor_positions.get_price_age_secs(&position.mint).await {
+                        if price_age > 120 {
+                            // Very stale price - critical warning
+                            let pnl_pct = if position.entry_price > 0.0 {
+                                ((current_price - position.entry_price) / position.entry_price) * 100.0
+                            } else {
+                                0.0
+                            };
+                            if pnl_pct > 5.0 {
+                                warn!(
+                                    "[{}] CRITICAL: Price stale for {}s while +{:.1}% profit - consider manual review",
+                                    position.symbol, price_age, pnl_pct
+                                );
+                            } else {
+                                warn!(
+                                    "[{}] Price stale for {}s - monitor may be delayed",
+                                    position.symbol, price_age
+                                );
+                            }
+                        } else if price_age > 60 {
+                            debug!(
+                                "[{}] Price age: {}s (using cached price)",
+                                position.symbol, price_age
+                            );
+                        }
+                    }
 
                     // Get updated position with peak_price tracked
                     let position = match monitor_positions.get_position(&position.mint).await {
@@ -2726,11 +2957,11 @@ pub async fn hot_scan(
                                 &position.mint,
                             )
                             .await;
-                            // Add to failed_mints with 30 minute cooldown to prevent repeated failures
+                            // Add to failed_mints with 15 minute cooldown to prevent repeated failures
                             {
                                 let mut failed = monitor_failed_mints.lock().await;
                                 failed.insert(position.mint.clone(), chrono::Utc::now().timestamp());
-                                info!("[{}] Added to failed_mints blacklist (30min cooldown)", position.symbol);
+                                info!("[{}] Added to failed_mints blacklist (15min cooldown)", position.symbol);
                             }
                             continue;
                         } else {
@@ -2739,82 +2970,128 @@ pub async fn hot_scan(
                         }
                     }
 
-                    // Calculate P&L from entry
-                    let pnl_pct = if position.entry_price > 0.0 {
-                        ((current_price - position.entry_price) / position.entry_price) * 100.0
+                    // === PRICE STALENESS GUARD (tiered) ===
+                    let price_age_secs = if let Some(updated_at) = position.price_updated_at {
+                        (chrono::Utc::now() - updated_at).num_seconds().max(0)
                     } else {
-                        0.0
+                        999 // No price update ever = extremely stale
                     };
 
-                    // Calculate drop from peak (for trailing stop)
-                    let peak_price = if position.peak_price > 0.0 {
-                        position.peak_price
+                    // Calculate P&L from entry (NaN-safe: treat NaN/Inf as -100%)
+                    let pnl_pct = if position.entry_price > 0.0 {
+                        let raw = ((current_price - position.entry_price) / position.entry_price) * 100.0;
+                        if raw.is_finite() { raw } else {
+                            error!("NaN/Inf detected in P&L for {} - treating as -100%", position.symbol);
+                            -100.0
+                        }
                     } else {
-                        position.entry_price
-                    };
-                    let drop_from_peak_pct = if peak_price > 0.0 {
-                        ((peak_price - current_price) / peak_price) * 100.0
-                    } else {
-                        0.0
+                        -100.0 // No entry price = assume total loss
                     };
 
                     let hold_time_secs = (chrono::Utc::now() - position.entry_time)
                         .num_seconds()
                         .max(0) as u64;
 
-                    // Get entry-type-specific thresholds
-                    let tp_pct = position.entry_type.take_profit_pct();
-                    let sl_pct = position.entry_type.stop_loss_pct();
-                    let quick_profit_pct = position.entry_type.quick_profit_pct();
-                    let max_hold = position.entry_type.max_hold_secs();
+                    // === BACKTEST-VALIDATED EXIT STRATEGY ===
+                    // Simple, proven: SL/TP from config, computed at entry time.
+                    // Priority: catastrophe > stale > kill-switch > SL > TP
+                    let sl_pct = monitor_config.auto_sell.stop_loss_pct;
+                    let tp_pct = monitor_config.auto_sell.take_profit_pct;
+                    let catastrophe_floor_pct = 35.0;
+
+                    // For legacy positions without tp_price/sl_price, compute from config
+                    let tp_price = if position.tp_price > 0.0 {
+                        position.tp_price
+                    } else {
+                        position.entry_price * (1.0 + tp_pct / 100.0)
+                    };
+                    let sl_price = if position.sl_price > 0.0 {
+                        position.sl_price
+                    } else {
+                        position.entry_price * (1.0 - sl_pct / 100.0)
+                    };
+
+                    // Price freshness flag: only execute SL/trail on fresh prices
+                    // Stale DexScreener cache can produce phantom low prints
+                    let price_is_fresh = price_age_secs < 30;
+
+                    // Compute trailing stop BEFORE logging so we show effective SL
+                    let mut effective_sl = sl_price;
+                    let mut trailing_active = false;
+                    if monitor_config.auto_sell.trailing_stop_enabled && position.peak_price > 0.0 && position.entry_price > 0.0 {
+                        let peak_gain_pct = ((position.peak_price - position.entry_price) / position.entry_price) * 100.0;
+                        let activation = monitor_config.auto_sell.trailing_stop_activation_pct;
+                        let distance = monitor_config.auto_sell.trailing_stop_distance_pct;
+
+                        if peak_gain_pct >= activation {
+                            let trailing_sl = position.peak_price * (1.0 - distance / 100.0);
+                            // Breakeven floor: once trailing activates, never lose money (fee-aware)
+                            let breakeven_floor = position.entry_price * 0.985; // 1% slippage + 0.5% fee
+                            let trailing_sl = trailing_sl.max(breakeven_floor);
+                            if trailing_sl > effective_sl {
+                                effective_sl = trailing_sl;
+                                trailing_active = true;
+                            }
+                        }
+                    }
 
                     // Log position status periodically
                     if hold_time_secs % 15 == 0 {
-                        info!(
-                            "[{}] Price: {:.10} | P&L: {:+.1}% | Peak: {:+.1}% | Hold: {}s",
-                            position.symbol,
-                            current_price,
-                            pnl_pct,
-                            if peak_price > position.entry_price {
-                                ((peak_price - position.entry_price) / position.entry_price) * 100.0
-                            } else {
-                                0.0
-                            },
-                            hold_time_secs
+                        if trailing_active {
+                            let locked_pct = ((effective_sl - position.entry_price) / position.entry_price) * 100.0;
+                            let peak_pct = ((position.peak_price - position.entry_price) / position.entry_price) * 100.0;
+                            info!(
+                                "[{}] Price: {:.10} | P&L: {:+.1}% | TRAIL: {:.10} (locks {:+.1}%, peak {:+.1}%) | TP: {:.10} | Hold: {}s",
+                                position.symbol, current_price, pnl_pct,
+                                effective_sl, locked_pct, peak_pct,
+                                tp_price, hold_time_secs
+                            );
+                        } else {
+                            info!(
+                                "[{}] Price: {:.10} | P&L: {:+.1}% | SL: {:.10} | TP: {:.10} | Hold: {}s",
+                                position.symbol, current_price, pnl_pct,
+                                sl_price, tp_price, hold_time_secs
+                            );
+                        }
+                    }
+
+                    let mut should_sell = false;
+                    let sell_pct = "100%"; // Always full exit (no more partial sells)
+                    let mut reason = String::new();
+
+                    // 0. CATASTROPHE FLOOR — fires even on stale prices (building is on fire)
+                    if pnl_pct <= -catastrophe_floor_pct {
+                        should_sell = true;
+                        reason = format!(
+                            "CATASTROPHE FLOOR at {:.1}% (limit: -{:.0}%) - EMERGENCY EXIT",
+                            pnl_pct, catastrophe_floor_pct
                         );
                     }
 
-                    // Get config values for layered exits
-                    let no_movement_secs = monitor_config.auto_sell.no_movement_secs;
-                    let no_movement_threshold = monitor_config.auto_sell.no_movement_threshold_pct;
-                    let second_profit_pct = monitor_config.auto_sell.second_profit_pct;
-
-                    // === DYNAMIC TRAILING STOP ===
-                    // Tighten trailing stop as profit grows to prevent round-tripping
-                    let trailing_stop_pct = if monitor_config.auto_sell.dynamic_trailing_enabled {
-                        if pnl_pct >= 25.0 {
-                            monitor_config.auto_sell.trailing_stop_tight_pct  // 3% at high gains
-                        } else if pnl_pct >= 15.0 {
-                            monitor_config.auto_sell.trailing_stop_medium_pct // 4% at medium gains
-                        } else {
-                            monitor_config.auto_sell.trailing_stop_base_pct   // 5% base
-                        }
-                    } else {
-                        5.0 // Fixed trailing stop if dynamic disabled
-                    };
-
-                    let mut should_sell = false;
-                    let mut sell_pct = "100%";
-                    let mut reason = String::new();
-
-                    // === KILL-SWITCH CHECK (HIGHEST PRIORITY) ===
-                    // First check position flag (set by other systems)
-                    if let Some(ks_reason) = monitor_positions.is_kill_switch_triggered(&position.mint).await {
+                    // 0b. STALE PRICE FORCE-SELL (conservative: never sell winners on staleness)
+                    if !should_sell && price_age_secs >= 180 && pnl_pct < 0.0 {
                         should_sell = true;
-                        reason = format!("KILL-SWITCH: {}", ks_reason);
-                        warn!("KILL-SWITCH EXIT: {} - {}", position.symbol, ks_reason);
+                        reason = format!(
+                            "STALE PRICE ({}s) + LOSS ({:.1}%): No data for 3min+ while underwater - emergency exit",
+                            price_age_secs, pnl_pct
+                        );
                     }
-                    // Then actively evaluate kill-switch conditions
+                    if !should_sell && price_age_secs >= 90 && pnl_pct < -10.0 {
+                        should_sell = true;
+                        reason = format!(
+                            "STALE PRICE ({}s) + DEEP LOSS ({:.1}%): Exiting to prevent further bleed",
+                            price_age_secs, pnl_pct
+                        );
+                    }
+
+                    // 0c. KILL-SWITCH CHECK
+                    if !should_sell {
+                        if let Some(ks_reason) = monitor_positions.is_kill_switch_triggered(&position.mint).await {
+                            should_sell = true;
+                            reason = format!("KILL-SWITCH: {}", ks_reason);
+                            warn!("KILL-SWITCH EXIT: {} - {}", position.symbol, ks_reason);
+                        }
+                    }
                     if !should_sell {
                         if let Some(ref evaluator) = monitor_kill_switch {
                             if let KillSwitchDecision::Exit(alert) = evaluator.should_exit(&position.mint) {
@@ -2825,70 +3102,30 @@ pub async fn hot_scan(
                         }
                     }
 
-                    // 1. Stop loss
-                    if !should_sell && pnl_pct <= -sl_pct {
-                        should_sell = true;
-                        reason = format!("STOP LOSS at {:.1}% (limit: -{:.0}%)", pnl_pct, sl_pct);
-                    }
-
-                    // 2. Trailing stop (only if in profit and dropped from peak)
-                    // Now uses dynamic trailing stop percentage
-                    if !should_sell && pnl_pct > 0.0 && drop_from_peak_pct >= trailing_stop_pct {
+                    // 1. TAKE PROFIT — checked BEFORE SL so TP wins on same-tick edge case
+                    if !should_sell && current_price >= tp_price && tp_price > 0.0 {
                         should_sell = true;
                         reason = format!(
-                            "TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%, trail: {:.0}%)",
-                            drop_from_peak_pct, pnl_pct, trailing_stop_pct
+                            "TAKE PROFIT at {:.1}% (price {:.10} >= TP {:.10})",
+                            pnl_pct, current_price, tp_price
                         );
                     }
 
-                    // 3. Take profit (final exit)
-                    if !should_sell && pnl_pct >= tp_pct {
+                    // 2. STOP LOSS / TRAILING STOP — only on FRESH prices (stale cache can phantom-trigger)
+                    if !should_sell && price_is_fresh && current_price <= effective_sl && effective_sl > 0.0 {
                         should_sell = true;
-                        reason = format!("TAKE PROFIT at {:.1}% (target: {:.0}%)", pnl_pct, tp_pct);
-                    }
-
-                    // 4. Quick profit - FIRST LAYER (50% sell at quick_profit_pct)
-                    if !should_sell
-                        && !position.quick_profit_taken
-                        && pnl_pct >= quick_profit_pct
-                        && pnl_pct < second_profit_pct
-                    {
-                        should_sell = true;
-                        sell_pct = "50%";
-                        reason = format!("LAYER 1: Quick profit at {:.1}% - selling 50%", pnl_pct);
-                    }
-
-                    // 5. Second profit - SECOND LAYER (25% sell at second_profit_pct)
-                    if !should_sell
-                        && position.quick_profit_taken
-                        && !position.second_profit_taken
-                        && pnl_pct >= second_profit_pct
-                        && pnl_pct < tp_pct
-                    {
-                        should_sell = true;
-                        sell_pct = "25%";
-                        reason = format!("LAYER 2: Second profit at {:.1}% - selling 25%", pnl_pct);
-                    }
-
-                    // 6. No-movement exit
-                    if !should_sell
-                        && hold_time_secs >= no_movement_secs
-                        && pnl_pct.abs() < no_movement_threshold
-                    {
-                        should_sell = true;
-                        reason = format!("NO MOVEMENT: {:.1}% after {}s", pnl_pct, hold_time_secs);
-                    }
-
-                    // 7. Max hold time
-                    if !should_sell {
-                        if let Some(max_secs) = max_hold {
-                            if hold_time_secs >= max_secs {
-                                should_sell = true;
-                                reason = format!(
-                                    "MAX HOLD TIME ({} secs) P&L: {:.1}%",
-                                    max_secs, pnl_pct
-                                );
-                            }
+                        if trailing_active {
+                            let locked_pct = ((effective_sl - position.entry_price) / position.entry_price) * 100.0;
+                            let peak_pct = ((position.peak_price - position.entry_price) / position.entry_price) * 100.0;
+                            reason = format!(
+                                "TRAILING STOP at {:.1}% (peak was {:+.1}%, locked {:+.1}% profit, price {:.10} <= trail {:.10})",
+                                pnl_pct, peak_pct, locked_pct, current_price, effective_sl
+                            );
+                        } else {
+                            reason = format!(
+                                "STOP LOSS at {:.1}% (price {:.10} <= SL {:.10})",
+                                pnl_pct, current_price, sl_price
+                            );
                         }
                     }
 
@@ -2900,7 +3137,7 @@ pub async fn hot_scan(
                         );
 
                         if let Some(ref trader) = monitor_trader {
-                            let slippage = monitor_config.trading.slippage_bps / 100;
+                            let slippage = monitor_config.trading.sell_slippage_bps / 100;
                             let priority_fee =
                                 monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
@@ -3109,12 +3346,29 @@ pub async fn hot_scan(
                                         )
                                         .await;
 
-                                        // Add to sold_mints with 5-minute cooldown before re-entry
-                                        // This prevents immediate re-buy at the top
+                                        // Add to sold_mints with variable cooldown:
+                                        // Profitable exits (TP or trailing stop winner) → 5min
+                                        // Losing exits (SL, catastrophe, trailing stop loser) → 30min
                                         {
+                                            let is_win = pnl_sol > 0.0;
+                                            let cooldown = if is_win { "5min" } else { "30min" };
                                             let mut sold = monitor_sold_mints.lock().await;
-                                            sold.insert(position.mint.clone(), chrono::Utc::now().timestamp());
-                                            info!("[{}] Added to sold_mints (5min cooldown before re-entry)", position.symbol);
+                                            // Encode cooldown type: positive timestamp = loss (30min), negative = win (5min)
+                                            let ts = chrono::Utc::now().timestamp();
+                                            let encoded_ts = if is_win { -ts } else { ts };
+                                            sold.insert(position.mint.clone(), encoded_ts);
+                                            info!("[{}] Added to sold_mints ({} cooldown before re-entry)", position.symbol, cooldown);
+                                        }
+
+                                        // Track per-mint loss count (block after 2 losses on same mint)
+                                        if pnl_sol < 0.0 {
+                                            let mut losses = monitor_mint_loss_count.lock().await;
+                                            let count = losses.entry(position.mint.clone()).or_insert(0);
+                                            *count += 1;
+                                            if *count >= MAX_LOSSES_PER_MINT {
+                                                warn!("[{}] {} losses on this mint - BLOCKED for rest of session",
+                                                      position.symbol, count);
+                                            }
                                         }
 
                                         info!("=== TRADE CLOSED (Full) ===");
@@ -3148,7 +3402,7 @@ pub async fn hot_scan(
         println!("\n{:=<80}", "");
         println!("Scanning DexScreener for hot tokens...");
 
-        let hot_tokens = dex_client.scan_hot_tokens(&scan_config).await?;
+        let hot_tokens = dex_client.scan_hot_tokens_parallel(&scan_config).await?;
 
         if hot_tokens.is_empty() {
             println!("No tokens matching criteria found.");
@@ -3187,22 +3441,29 @@ pub async fn hot_scan(
                             continue;
                         }
 
-                        // Check sold_mints cooldown (5 minutes after selling)
+                        // Check sold_mints cooldown (5min for wins, 30min for losses)
                         {
                             let sold = sold_mints.lock().await;
-                            if let Some(&sold_at) = sold.get(&token.mint) {
+                            if let Some(&encoded_ts) = sold.get(&token.mint) {
                                 let now = chrono::Utc::now().timestamp();
+                                // Encoding: negative = win (5min cooldown), positive = loss (30min cooldown)
+                                let (sold_at, cooldown) = if encoded_ts < 0 {
+                                    (-encoded_ts, SOLD_MINTS_COOLDOWN_WIN_SECS)
+                                } else {
+                                    (encoded_ts, SOLD_MINTS_COOLDOWN_LOSS_SECS)
+                                };
                                 let elapsed = now - sold_at;
-                                if elapsed < SOLD_MINTS_COOLDOWN_SECS {
-                                    let remaining = SOLD_MINTS_COOLDOWN_SECS - elapsed;
-                                    info!("Skipping {} - sold {}s ago, cooldown {}s remaining",
-                                          token.symbol, elapsed, remaining);
+                                if elapsed < cooldown {
+                                    let remaining_mins = (cooldown - elapsed) / 60;
+                                    let cd_type = if encoded_ts < 0 { "win" } else { "loss" };
+                                    info!("Skipping {} - {} {}m ago, {}min cooldown remaining",
+                                          token.symbol, cd_type, elapsed / 60, remaining_mins);
                                     continue;
                                 }
                             }
                         }
 
-                        // Check failed_mints cooldown (30 minutes after failed buy)
+                        // Check failed_mints cooldown (15 minutes after failed buy)
                         {
                             let failed = failed_mints.lock().await;
                             if let Some(&failed_at) = failed.get(&token.mint) {
@@ -3217,19 +3478,22 @@ pub async fn hot_scan(
                             }
                         }
 
+                        // Check per-mint loss count (block after 2 losses on same mint)
+                        {
+                            let losses = mint_loss_count.lock().await;
+                            if let Some(&count) = losses.get(&token.mint) {
+                                if count >= MAX_LOSSES_PER_MINT {
+                                    info!("Skipping {} - {} losses this session, permanently blocked",
+                                          token.symbol, count);
+                                    continue;
+                                }
+                            }
+                        }
+
                         // Check if we already have a position
                         if position_manager.get_position(&token.mint).await.is_some() {
                             info!("Skipping {} - already have position", token.symbol);
                             continue;
-                        }
-
-                        // PRE-TRADE VALIDATION: Check position limits BEFORE trading
-                        if let Err(e) = position_manager.can_open_position(buy_amount).await {
-                            warn!(
-                                "Cannot open position for {}: {} - stopping buy loop",
-                                token.symbol, e
-                            );
-                            break; // Stop trying to buy more tokens
                         }
 
                         info!(
@@ -3250,7 +3514,8 @@ pub async fn hot_scan(
                             }
                         }
 
-                        // SMART MONEY CHECK: Analyze token creator's past performance
+                        // SMART MONEY CHECK: Calculate final buy amount with alpha adjustments FIRST
+                        // This must happen BEFORE risk check so we validate the actual trade size
                         let final_buy_amount = if let (Some(ref helius), Some(ref profiler)) = (&helius_client, &wallet_profiler) {
                             match helius.get_token_creator(&token.mint).await {
                                 Ok(creator) => {
@@ -3284,10 +3549,10 @@ pub async fn hot_scan(
                                                 1.0 // Normal for decent wallets
                                             } else {
                                                 info!(
-                                                    "[{}] Weak creator {} | Win: {:.0}% | Alpha: {:.2} -> 0.7x size",
+                                                    "[{}] Weak creator {} | Win: {:.0}% | Alpha: {:.2} -> 1.0x size (no penalty)",
                                                     token.symbol, &creator[..8], profile.win_rate * 100.0, profile.alpha_score.value
                                                 );
-                                                0.7 // 30% less for weak wallets
+                                                1.0 // No penalty - at 22% WR with 4:1 payoff, undersizing winners costs more
                                             };
 
                                             buy_amount * alpha_multiplier
@@ -3306,6 +3571,16 @@ pub async fn hot_scan(
                         } else {
                             buy_amount // No profiler, use default
                         };
+
+                        // RISK VALIDATION: Check position limits with FINAL amount (after alpha adjustment)
+                        // This ensures elite 1.5x multiplier is properly accounted for in risk limits
+                        if let Err(e) = position_manager.can_open_position(final_buy_amount).await {
+                            warn!(
+                                "Cannot open position for {} (adjusted amount {:.4} SOL): {} - stopping buy loop",
+                                token.symbol, final_buy_amount, e
+                            );
+                            break; // Stop trying to buy more tokens
+                        }
 
                         if dry_run {
                             warn!(
@@ -3348,13 +3623,14 @@ pub async fn hot_scan(
 
                             let buy_result = if use_local_api {
                                 trader
-                                    .buy_local(
+                                    .buy_local_with_retry(
                                         &token.mint,
                                         final_buy_amount,
                                         slippage,
                                         priority_fee,
                                         &trading_keypair,
                                         &rpc_client,
+                                        3, // max retries with escalating slippage
                                     )
                                     .await
                             } else {
@@ -3373,11 +3649,23 @@ pub async fn hot_scan(
 
                                     // Record position
                                     let estimated_tokens = (final_buy_amount / token.price_native) as u64;
+                                    let tp_pct = config.auto_sell.take_profit_pct;
+                                    let sl_pct = config.auto_sell.stop_loss_pct;
+                                    // Derive bonding curve PDA from mint for on-chain price monitoring
+                                    let bc_address = match Pubkey::from_str(&token.mint) {
+                                        Ok(mint_pk) => {
+                                            match crate::trading::transaction::derive_bonding_curve(&mint_pk) {
+                                                Ok((bc, _)) => bc.to_string(),
+                                                Err(_) => String::new(),
+                                            }
+                                        }
+                                        Err(_) => String::new(),
+                                    };
                                     let position = crate::position::manager::Position {
                                         mint: token.mint.clone(),
                                         name: token.name.clone(),
                                         symbol: token.symbol.clone(),
-                                        bonding_curve: String::new(), // Not available from DexScreener
+                                        bonding_curve: bc_address,
                                         token_amount: estimated_tokens,
                                         entry_price: token.price_native,
                                         total_cost_sol: final_buy_amount,
@@ -3389,9 +3677,17 @@ pub async fn hot_scan(
                                         second_profit_taken: false,
                                         peak_price: token.price_native,
                                         current_price: token.price_native,
+                                        price_updated_at: None,
                                         kill_switch_triggered: false,
                                         kill_switch_reason: None,
-                                        wallet_pubkey: trading_keypair.pubkey().to_string(),
+                                        wallet_pubkey: if use_local_api {
+                                            trading_keypair.pubkey().to_string()
+                                        } else {
+                                            config.pumpportal.lightning_wallet.clone()
+                                        },
+                                        tp_price: token.price_native * (1.0 + tp_pct / 100.0),
+                                        sl_price: token.price_native * (1.0 - sl_pct / 100.0),
+                                        exit_reason: None,
                                     };
 
                                     if let Err(e) = position_manager.open_position(position).await {
@@ -3401,96 +3697,191 @@ pub async fn hot_scan(
                                         continue;
                                     }
 
-                                    // CRITICAL: Wait for tx confirmation, then verify tokens received
-                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                    // === SPAWN BACKGROUND VERIFICATION TASK ===
+                                    // This allows the main loop to continue immediately
+                                    // while we wait for TX confirmation
+                                    {
+                                        let mint = token.mint.clone();
+                                        let symbol = token.symbol.clone();
+                                        let estimated_tokens = estimated_tokens;
+                                        let final_buy_amount = final_buy_amount;
+                                        let check_wallet = if use_local_api {
+                                            trading_keypair.pubkey()
+                                        } else {
+                                            Pubkey::from_str(&config.pumpportal.lightning_wallet)
+                                                .unwrap_or(trading_keypair.pubkey())
+                                        };
+                                        let rpc_client = rpc_client.clone();
+                                        let position_manager = position_manager.clone();
+                                        let bought_mints = bought_mints.clone();
+                                        let bought_mints_path = bought_mints_path.clone();
+                                        let helius_client = helius_client.clone();
+                                        let kill_switch_evaluator = kill_switch_evaluator.clone();
+                                        let failed_mints = failed_mints.clone();
+                                        let mint_loss_count = mint_loss_count.clone();
+                                        // Clone trader + config for verification retry with 2x fee
+                                        let retry_trader = trader.clone();
+                                        let retry_slippage = slippage;
+                                        let retry_priority_fee = priority_fee * 2.0;
+                                        let retry_keypair = trading_keypair.clone();
+                                        let retry_rpc = rpc_client.clone();
+                                        let retry_use_local = use_local_api;
+                                        let retry_buy_amount = final_buy_amount;
 
-                                    // Determine which wallet to check based on API mode
-                                    let check_wallet = if use_local_api {
-                                        trading_keypair.pubkey() // Use the selected trading wallet
-                                    } else {
-                                        // For Lightning API, use the lightning wallet
-                                        Pubkey::from_str(&config.pumpportal.lightning_wallet)
-                                            .unwrap_or(trading_keypair.pubkey())
-                                    };
+                                        tokio::spawn(async move {
+                                            // Poll for TX confirmation: 7 attempts × 2s = 14s max
+                                            // (matches monitor 1 verification logic)
+                                            let max_attempts = 7u32;
+                                            let mut actual_balance_raw = 0u64;
+                                            for attempt in 1..=max_attempts {
+                                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                                actual_balance_raw = query_token_balance_async(
+                                                    rpc_client.clone(),
+                                                    check_wallet,
+                                                    mint.clone(),
+                                                ).await;
+                                                if actual_balance_raw > 0 {
+                                                    info!(
+                                                        "BUY VERIFIED on attempt {}/{}: {} raw tokens for {}",
+                                                        attempt, max_attempts, actual_balance_raw, symbol
+                                                    );
+                                                    break;
+                                                }
+                                                if attempt < max_attempts {
+                                                    warn!(
+                                                        "Buy verification attempt {}/{}: no tokens yet for {} - retrying...",
+                                                        attempt, max_attempts, symbol
+                                                    );
+                                                }
+                                            }
 
-                                    let actual_balance_raw = query_token_balance(
-                                        &rpc_client,
-                                        &check_wallet,
-                                        &token.mint,
-                                    );
-                                    // Normalize balance: pump.fun tokens have 6 decimals
-                                    // query_token_balance returns raw units, we need normalized tokens
-                                    let actual_balance = actual_balance_raw / 1_000_000;
+                                            // === VERIFICATION RETRY: If 7/7 failed, try ONE more buy with 2x priority fee ===
+                                            if actual_balance_raw == 0 {
+                                                warn!(
+                                                    "[{}] Initial verification failed after {}s - retrying buy with 2x priority fee ({:.6} SOL)",
+                                                    symbol, max_attempts * 2, retry_priority_fee
+                                                );
+                                                {
+                                                    let retry_result = if retry_use_local {
+                                                        retry_trader.buy_local(
+                                                            &mint, retry_buy_amount, retry_slippage,
+                                                            retry_priority_fee, &retry_keypair, &retry_rpc,
+                                                        ).await
+                                                    } else {
+                                                        retry_trader.buy(&mint, retry_buy_amount, retry_slippage, retry_priority_fee).await
+                                                    };
+                                                    match retry_result {
+                                                        Ok(sig) => {
+                                                            info!("[{}] Retry buy sent: {}", symbol, sig);
+                                                            // Poll 3 more attempts for the retry TX
+                                                            for attempt in 1..=3u32 {
+                                                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                                                actual_balance_raw = query_token_balance_async(
+                                                                    rpc_client.clone(), check_wallet, mint.clone(),
+                                                                ).await;
+                                                                if actual_balance_raw > 0 {
+                                                                    info!(
+                                                                        "[{}] RETRY VERIFIED on attempt {}/3: {} raw tokens",
+                                                                        symbol, attempt, actual_balance_raw
+                                                                    );
+                                                                    break;
+                                                                }
+                                                                if attempt < 3 {
+                                                                    warn!("[{}] Retry verification {}/3: no tokens yet", symbol, attempt);
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("[{}] Retry buy failed: {}", symbol, e);
+                                                        }
+                                                    }
+                                                }
+                                            }
 
-                                    if actual_balance_raw == 0 {
-                                        // CRITICAL: TX failed silently - REMOVE the position we just recorded
-                                        error!(
-                                            "BUY VERIFICATION FAILED: No tokens received for {} after 3s wait. Removing failed position.",
-                                            token.symbol
-                                        );
-                                        if let Err(e) = position_manager.abandon_position(&token.mint).await {
-                                            error!("Failed to abandon failed position: {}", e);
-                                        }
-                                        bought.remove(&token.mint);
-                                        persist_bought_mints(&*bought_mints_path, &*bought);
-                                        continue; // Skip kill-switch setup for failed buy
+                                            // Normalize balance: pump.fun tokens have 6 decimals
+                                            let actual_balance = actual_balance_raw / 1_000_000;
+
+                                            if actual_balance_raw == 0 {
+                                                // All attempts + retry exhausted - TX likely failed
+                                                error!(
+                                                    "BUY VERIFICATION FAILED: No tokens received for {} after initial {}s + retry. Removing failed position.",
+                                                    symbol, max_attempts * 2
+                                                );
+                                                if let Err(e) = position_manager.abandon_position(&mint).await {
+                                                    error!("Failed to abandon failed position: {}", e);
+                                                }
+                                                {
+                                                    let mut bought = bought_mints.lock().await;
+                                                    bought.remove(&mint);
+                                                    persist_bought_mints(&*bought_mints_path, &*bought);
+                                                }
+                                                // Add to failed_mints banlist to prevent re-buying
+                                                {
+                                                    let mut failed = failed_mints.lock().await;
+                                                    failed.insert(mint.clone(), chrono::Utc::now().timestamp());
+                                                }
+                                                // Count verification failure toward mint loss limit (blocks after 1 failure)
+                                                {
+                                                    let mut losses = mint_loss_count.lock().await;
+                                                    let count = losses.entry(mint.clone()).or_insert(0);
+                                                    *count += 1;
+                                                    warn!("[{}] Verification failure counted as loss ({} total) - BLOCKED for session", symbol, count);
+                                                }
+                                                return;
+                                            }
+
+                                            info!("BUY VERIFIED: Received {} tokens for {}", actual_balance, symbol);
+
+                                            // Update position with verified data including corrected entry price
+                                            // This calculates the true fill price from total_cost_sol / actual_tokens
+                                            if let Err(e) = position_manager
+                                                .update_position_verified(&mint, actual_balance, final_buy_amount)
+                                                .await
+                                            {
+                                                warn!("Failed to update verified position: {}", e);
+                                            }
+
+                                            // === SET UP KILL-SWITCH MONITORING ===
+                                            if let Some(ref evaluator) = kill_switch_evaluator {
+                                                if let Some(ref helius) = helius_client {
+                                                    // Get token creator
+                                                    let creator = match helius.get_token_creator(&mint).await {
+                                                        Ok(c) => {
+                                                            info!("[{}] Creator for kill-switch: {}", symbol, &c[..8]);
+                                                            c
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[{}] Could not get creator: {} - using empty", symbol, e);
+                                                            String::new()
+                                                        }
+                                                    };
+
+                                                    // Get top holders
+                                                    let holders = match helius.get_token_holders(&mint, 10).await {
+                                                        Ok(h) => {
+                                                            info!("[{}] Fetched {} top holders for kill-switch", symbol, h.len());
+                                                            h.into_iter()
+                                                                .map(|hi| (hi.address, hi.amount, hi.percentage))
+                                                                .collect::<Vec<_>>()
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[{}] Could not get holders: {} - monitoring creator only", symbol, e);
+                                                            vec![]
+                                                        }
+                                                    };
+
+                                                    // Start kill-switch monitoring
+                                                    evaluator.watch_position(&mint, &creator, holders);
+                                                    info!(
+                                                        "[{}] Kill-switch monitoring ACTIVE (creator: {}, holders: tracked)",
+                                                        symbol,
+                                                        if creator.is_empty() { "unknown" } else { &creator[..8] }
+                                                    );
+                                                }
+                                            }
+                                        });
                                     }
-
-                                    info!("BUY VERIFIED: Received {} tokens for {}", actual_balance, token.symbol);
-
-                                    if actual_balance != estimated_tokens {
-                                        info!(
-                                            "Updating position with actual balance: {} (raw: {}, estimated: {})",
-                                            actual_balance, actual_balance_raw, estimated_tokens
-                                        );
-                                        // Update position with NORMALIZED balance (not raw units)
-                                        if let Err(e) = position_manager
-                                            .update_token_amount(&token.mint, actual_balance)
-                                            .await
-                                        {
-                                            warn!("Failed to update token amount: {}", e);
-                                        }
-                                    }
-
-                                    // === SET UP KILL-SWITCH MONITORING ===
-                                    // Fetch creator and top holders for this token
-                                    if let Some(ref evaluator) = kill_switch_evaluator {
-                                        if let Some(ref helius) = helius_client {
-                                            // Get token creator
-                                            let creator = match helius.get_token_creator(&token.mint).await {
-                                                Ok(c) => {
-                                                    info!("[{}] Creator for kill-switch: {}", token.symbol, &c[..8]);
-                                                    c
-                                                }
-                                                Err(e) => {
-                                                    warn!("[{}] Could not get creator: {} - using empty", token.symbol, e);
-                                                    String::new()
-                                                }
-                                            };
-
-                                            // Get top holders (address, amount, percentage)
-                                            let holders = match helius.get_token_holders(&token.mint, 10).await {
-                                                Ok(h) => {
-                                                    info!("[{}] Fetched {} top holders for kill-switch monitoring", token.symbol, h.len());
-                                                    h.into_iter()
-                                                        .map(|hi| (hi.address, hi.amount, hi.percentage))
-                                                        .collect::<Vec<_>>()
-                                                }
-                                                Err(e) => {
-                                                    warn!("[{}] Could not get holders: {} - monitoring creator only", token.symbol, e);
-                                                    vec![]
-                                                }
-                                            };
-
-                                            // Start kill-switch monitoring
-                                            evaluator.watch_position(&token.mint, &creator, holders);
-                                            info!(
-                                                "[{}] Kill-switch monitoring ACTIVE (creator: {}, holders: tracked)",
-                                                token.symbol,
-                                                if creator.is_empty() { "unknown" } else { &creator[..8] }
-                                            );
-                                        }
-                                    }
+                                    // Main loop continues immediately
                                 }
                                 Err(e) => {
                                     error!("BUY FAILED for {}: {}", token.symbol, e);
@@ -3538,14 +3929,20 @@ pub async fn hot_scan(
                 let hold_time = (chrono::Utc::now() - pos.entry_time).num_seconds();
                 let pnl_pct = pos.unrealized_pnl_pct();
                 total_unrealized += pos.unrealized_pnl();
+                let tp_pct = if pos.tp_price > 0.0 && pos.entry_price > 0.0 {
+                    ((pos.tp_price / pos.entry_price) - 1.0) * 100.0
+                } else { 100.0 };
+                let sl_pct = if pos.sl_price > 0.0 && pos.entry_price > 0.0 {
+                    (1.0 - (pos.sl_price / pos.entry_price)) * 100.0
+                } else { 22.0 };
                 println!(
                     "  {} | Entry: {:.10} | P&L: {:+.1}% | Hold: {}s | TP: {:.0}% SL: -{:.0}%",
                     pos.symbol,
                     pos.entry_price,
                     pnl_pct,
                     hold_time,
-                    pos.entry_type.take_profit_pct(),
-                    pos.entry_type.stop_loss_pct()
+                    tp_pct,
+                    sl_pct
                 );
             }
             println!("  Total Unrealized P&L: {:+.4} SOL", total_unrealized);
