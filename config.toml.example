@@ -2,9 +2,10 @@
 # All values shown are defaults unless otherwise noted
 
 [rpc]
-# Override via RPC_ENDPOINT env var (or set below)
-endpoint = "https://mainnet.helius-rpc.com/?api-key=066a76e6-916f-4ef2-9194-c86676072933"
-ws_endpoint = "wss://mainnet.helius-rpc.com/?api-key=066a76e6-916f-4ef2-9194-c86676072933"
+# Copy this file to config.toml (gitignored), then set real endpoints locally
+# or override with SNIPER__RPC__ENDPOINT / SNIPER__RPC__WS_ENDPOINT.
+endpoint = "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
+ws_endpoint = "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
 timeout_ms = 30000
 max_retries = 3
 
@@ -34,11 +35,11 @@ reconnect_delay_ms = 1000
 max_reconnect_attempts = 10
 ping_interval_secs = 30
 # API key for Lightning Trading API (get from https://pumpportal.fun)
-# Leave empty to use Local API (sign transactions yourself)
-# NOTE: Lightning API uses the wallet tied to the API key (9EwatauCtiQSK4ArSPvuQZFqtF6mvogM8qurL6av24mo)
-api_key = "618ppm9rf8r3cru29h56jgk4f9anerkj5d44yh3q8dvm4vbd9mtq4uvra9gmmy1re9m38cbjahc7mmj175r46c349cqn6yjp8npp2mu99hw7jt25cx17ccurddr6phv46n7jywbm84yku9hbn8wjd8566uctpad230x2t5wf1b5epauenr6yhj2dxrpjv2970tq6vk6e5vkuf8"
-# Lightning wallet address (derived from API key)
-lightning_wallet = "9EwatauCtiQSK4ArSPvuQZFqtF6mvogM8qurL6av24mo"
+# SECRET — set locally in config.toml or via SNIPER__PUMPPORTAL__API_KEY.
+# Leave empty to use Local API when configuration selects it.
+api_key = ""
+# Public wallet associated with the Lightning credential, when Lightning is used.
+lightning_wallet = ""
 # Use PumpPortal for trading (true) or Jito bundles (false)
 use_for_trading = true
 # CRITICAL: Force Local API even with API key set (0.5% fee vs 1% Lightning)
