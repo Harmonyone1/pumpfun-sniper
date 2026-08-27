@@ -316,10 +316,6 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let tracked_wallets: std::collections::HashSet<String> =
         config.wallet_tracking.wallets.iter().cloned().collect();
 
-    // Track tokens we've already evaluated from trade events (to avoid re-evaluating)
-    let seen_trade_tokens: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
-
     info!("Starting price feed...");
     // Wrap trader in Arc for sharing across tasks
     let trader_arc: Option<std::sync::Arc<PumpPortalTrader>> =
@@ -1108,15 +1104,16 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         }
                     }
                     PumpPortalEvent::Trade(trade) => {
-                        // Calculate SOL amount for logging
-                        let sol_amount = trade.sol_amount as f64 / 1e9;
+                        // PumpPortal TradeEvent.sol_amount is ALREADY in SOL (see
+                        // stream::pumpportal). Do NOT divide by 1e9.
+                        let sol_amount_sol = trade.sol_amount;
 
                         // Log all trades for visibility
                         info!(
                             "Trade: {} {} {:.6} SOL on {} (mcap: {:.2})",
                             &trade.trader_public_key[..8],
                             trade.tx_type,
-                            sol_amount,
+                            sol_amount_sol,
                             &trade.mint[..12],
                             trade.market_cap_sol
                         );
@@ -1135,7 +1132,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         &trade.mint,
                                         &trade.trader_public_key,
                                         trade.token_amount as u64,
-                                        sol_amount,
+                                        sol_amount_sol,
                                         &trade.signature,
                                     );
 
@@ -1206,142 +1203,35 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             }
                         }
 
-                        // Check for tracked wallet trades (copy trading)
+                        // Check for tracked wallet trades (copy trading).
                         if config.wallet_tracking.enabled && tracked_wallets.contains(&trade.trader_public_key) {
                             info!(
                                 "Tracked wallet {} {} {:.4} SOL of {}",
                                 trade.trader_public_key,
                                 if trade.tx_type == "buy" { "bought" } else { "sold" },
-                                sol_amount,
+                                sol_amount_sol,
                                 trade.mint
                             );
 
-                            // Copy the trade if it's a buy
-                            if trade.tx_type == "buy" && !dry_run {
-                                if let Some(ref trader) = trader_arc {
-                                    let slippage_pct = config.trading.slippage_bps / 100;
-                                    let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
-
-                                    info!("Copy trading: buying {} SOL of {}", config.trading.buy_amount_sol, trade.mint);
-                                    let copy_result = if use_local_api {
-                                        trader.buy_local(&trade.mint, config.trading.buy_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client).await
-                                    } else {
-                                        trader.buy(&trade.mint, config.trading.buy_amount_sol, slippage_pct, priority_fee).await
-                                    };
-                                    match copy_result {
-                                        Ok(sig) => info!("Copy trade executed: {}", sig),
-                                        Err(e) => error!("Copy trade failed: {}", e),
-                                    }
-                                }
-                            }
-                        }
-
-                        // Evaluate tokens with significant buy volume that we haven't seen before
-                        if trade.tx_type == "buy" && sol_amount >= 0.05 {
-                            let mut seen = seen_trade_tokens.lock().await;
-
-                            // Skip if we've already evaluated this token
-                            if seen.contains(&trade.mint) {
-                                continue;
-                            }
-
-                            // Check if we already have a position in this token
-                            let positions = position_manager.get_all_positions().await;
-                            if positions.iter().any(|p| p.mint == trade.mint) {
-                                seen.insert(trade.mint.clone());
-                                continue;
-                            }
-
-                            // Mark as seen
-                            seen.insert(trade.mint.clone());
-                            drop(seen); // Release lock before async operations
-
-                            info!(
-                                "Trade detected: {} bought {:.4} SOL of {} (mcap: {:.2} SOL) - evaluating...",
-                                &trade.trader_public_key[..8],
-                                sol_amount,
-                                trade.mint,
-                                trade.market_cap_sol
-                            );
-
-                            // Calculate liquidity from bonding curve
-                            // Note: PumpPortal sends values in SOL, not lamports
-                            let liquidity_sol = if trade.v_sol_in_bonding_curve < 1000.0 {
-                                trade.v_sol_in_bonding_curve as f64
-                            } else {
-                                trade.v_sol_in_bonding_curve as f64 / 1e9
-                            };
-
-                            // Quick liquidity check
-                            if liquidity_sol < 0.05 {
-                                info!("Token {} rejected: liquidity {:.4} SOL too low", trade.mint, liquidity_sol);
-                                continue;
-                            }
-
-                            // Use configured buy amount for trade-based entries
-                            let final_amount_sol = config.trading.buy_amount_sol;
-
-                            info!(
-                                "Trade signal: BUY {:.4} SOL of {} (liquidity: {:.4} SOL)",
-                                final_amount_sol, trade.mint, liquidity_sol
-                            );
-
-                            if !dry_run {
-                                if let Some(ref trader) = trader_arc {
-                                    let slippage_pct = config.trading.slippage_bps / 100;
-                                    let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
-
-                                    let buy_result = if use_local_api {
-                                        trader.buy_local(&trade.mint, final_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client).await
-                                    } else {
-                                        trader.buy(&trade.mint, final_amount_sol, slippage_pct, priority_fee).await
-                                    };
-                                    match buy_result {
-                                        Ok(sig) => {
-                                            info!("Trade buy executed: {}", sig);
-                                            // Estimate tokens from market cap
-                                            let estimated_price = if trade.market_cap_sol > 0.0 {
-                                                trade.market_cap_sol / 1_000_000_000.0
-                                            } else {
-                                                0.000001
-                                            };
-                                            let estimated_tokens = (final_amount_sol / estimated_price) as u64;
-
-                                            // Record position - trade event entries are treated as Probe
-                                            // since we have less information than new token events
-                                            let position = crate::position::manager::Position {
-                                                mint: trade.mint.clone(),
-                                                name: format!("Trade-{}", &trade.mint[..8]),
-                                                symbol: "???".to_string(),
-                                                bonding_curve: trade.bonding_curve_key.clone(),
-                                                token_amount: estimated_tokens,
-                                                entry_price: estimated_price,
-                                                total_cost_sol: final_amount_sol,
-                                                entry_time: chrono::Utc::now(),
-                                                entry_signature: sig.clone(),
-                                                entry_type: crate::position::manager::EntryType::Probe, // Conservative for trade-based entries
-                                                quick_profit_taken: false,
-                                                second_profit_taken: false,
-                                                peak_price: estimated_price,
-                                                current_price: estimated_price,
-                                                kill_switch_triggered: false,
-                                                kill_switch_reason: None,
-                                                wallet_pubkey: keypair.pubkey().to_string(),
-                                            };
-                                            if let Err(e) = position_manager.open_position(position).await {
-                                                error!("Failed to record position: {}", e);
-                                            }
-                                        }
-                                        Err(e) => error!("Trade buy failed: {}", e),
-                                    }
-                                }
-                            } else {
+                            // Automatic copy execution is DISABLED by P0: the old path could
+                            // acquire wallet tokens without creating a fully reconciled managed
+                            // position. Tracked-wallet signals are still observed/logged; they
+                            // must go through the canonical entry + reconciliation pipeline
+                            // before any automatic buy is re-enabled. auto_copy_trade config is
+                            // left unchanged; this is a runtime safety gate.
+                            if config.wallet_tracking.auto_copy_trade && trade.tx_type == "buy" {
                                 info!(
-                                    "DRY-RUN: Would buy {:.4} SOL of {} based on trade activity",
-                                    final_amount_sol, trade.mint
+                                    "Tracked-wallet buy observed; automatic copy execution is disabled by P0 \
+                                     until it passes canonical entry + reconciliation."
                                 );
                             }
                         }
+
+                        // NOTE: the previous "one significant buy => auto-buy" bypass has been
+                        // removed. It sent a buy after a single trade with only a minimal
+                        // liquidity check and an estimated token quantity, bypassing the
+                        // canonical decision gate. A trade event may update/log state, but this
+                        // packet does not contain the canonical observation engine.
                     }
                     PumpPortalEvent::Connected => {
                         info!("Connected to token detection source");
