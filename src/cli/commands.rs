@@ -816,7 +816,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                         // Apply adaptive filter scoring if enabled
                         // Track both position multiplier AND recommendation for context-aware exits
-                        let (position_multiplier, entry_recommendation) = if let Some(ref filter) = adaptive_filter {
+                        let (position_multiplier, entry_recommendation, entry_confidence) = if let Some(ref filter) = adaptive_filter {
                             // Create signal context from token event
                             let signal_context = SignalContext::from_new_token(
                                 token.mint.clone(),
@@ -893,9 +893,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 }
                             }
 
-                            (result.position_size_multiplier, result.recommendation)
+                            // Pass through the REAL calibrated confidence [0,1] separately from the
+                            // position-size multiplier. Reusing the multiplier as confidence was
+                            // circular (the multiplier is itself derived from score/confidence/risk)
+                            // and could exceed the [0,1] confidence range.
+                            (result.position_size_multiplier, result.recommendation, result.confidence)
                         } else {
-                            (1.0, Recommendation::Opportunity) // Default if adaptive filter disabled
+                            // Default if adaptive filter disabled: neutral confidence, not a size multiplier.
+                            (1.0, Recommendation::Opportunity, 0.5)
                         };
 
                         // Strategy engine evaluation (if enabled)
@@ -915,9 +920,15 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             };
                             let token_reserves = token.v_tokens_in_bonding_curve as f64;
 
-                            // Create order flow analysis from available data
+                            // Order-flow analysis. NOTE: a brand-new pump.fun token has ~no trade
+                            // history at detection time, so these are neutral placeholders, NOT
+                            // measured signals. `organic_score` was previously set to
+                            // `position_multiplier.max(0.5)`, which was circular (the multiplier is
+                            // derived from the same score that this feeds into via regime
+                            // classification -> sizing). Use a neutral 0.5 until real order-flow
+                            // tracking (PumpPortal trade stream) is wired in.
                             let order_flow = crate::strategy::regime::OrderFlowAnalysis {
-                                organic_score: position_multiplier.max(0.5),
+                                organic_score: 0.5,   // neutral: no real order-flow data yet
                                 wash_trading_score: 0.0,
                                 buy_sell_ratio: 1.0,
                                 early_sell_pressure: 0.0,
@@ -955,7 +966,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 price_action,
                                 sol_reserves: liquidity_sol,
                                 token_reserves,
-                                confidence_score: position_multiplier,
+                                confidence_score: entry_confidence,
                             };
 
                             let eval = engine_guard.evaluate_entry(&analysis_ctx).await;
