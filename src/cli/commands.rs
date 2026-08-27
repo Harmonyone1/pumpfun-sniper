@@ -937,11 +937,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 info!("Buying {} SOL of {} ({})...", final_amount_sol, token.symbol, mint);
 
                                 // Use buy_local for Local API, buy for Lightning API
+                                let buy_start = std::time::Instant::now();
                                 let buy_result = if use_local_api {
                                     trader.buy_local(mint, final_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client).await
                                 } else {
                                     trader.buy(mint, final_amount_sol, slippage_pct, priority_fee).await
                                 };
+                                // Provider submission/response latency (NOT chain-finality latency).
+                                let buy_latency_ms = buy_start.elapsed().as_millis() as u64;
 
                                 match buy_result {
                                     Ok(signature) => {
@@ -970,6 +973,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 token.symbol, mint
                                             );
                                             error!("Check transaction on Solscan: https://solscan.io/tx/{}", signature);
+                                            // Measurement: confirmed-but-no-tokens is a real execution failure.
+                                            if let Some(ref engine) = strategy_engine {
+                                                engine.write().await.record_tx_failure(
+                                                    mint, true, final_amount_sol, buy_latency_ms,
+                                                    "buy verification: zero token balance after existing verification wait",
+                                                ).await;
+                                            }
                                             // Skip position recording and kill-switch setup
                                             continue;
                                         }
@@ -1043,10 +1053,21 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 exit_levels_hit: vec![],
                                             };
                                             engine.write().await.record_entry(strategy_position).await;
+                                            // Measurement: verified fill. Unpriced — the bot does not
+                                            // parse real fill prices, so NO slippage sample is created.
+                                            engine.write().await.record_verified_execution_unpriced(
+                                                &token.mint, true, final_amount_sol, buy_latency_ms, &signature,
+                                            ).await;
                                         }
                                     }
                                     Err(e) => {
                                         error!("Buy failed for {}: {}", token.symbol, e);
+                                        // Measurement: real provider submission failure.
+                                        if let Some(ref engine) = strategy_engine {
+                                            engine.write().await.record_tx_failure(
+                                                mint, true, final_amount_sol, buy_latency_ms, &e.to_string(),
+                                            ).await;
+                                        }
                                     }
                                 }
                             }

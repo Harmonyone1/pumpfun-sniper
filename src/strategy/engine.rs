@@ -454,6 +454,35 @@ impl StrategyEngine {
         chain_health.record_tx(true);
     }
 
+    /// Record a verified successful execution when the real fill price is UNKNOWN.
+    /// Records success + latency + fill-rate, but no slippage sample and no
+    /// invented expected/actual price. Use this until real fill prices are parsed.
+    pub async fn record_verified_execution_unpriced(
+        &mut self,
+        mint: &str,
+        is_buy: bool,
+        size_sol: f64,
+        latency_ms: u64,
+        tx_sig: &str,
+    ) {
+        let mut feedback = self.execution_feedback.write().await;
+        feedback.record_verified_success_unpriced(
+            mint,
+            if is_buy {
+                super::types::Side::Buy
+            } else {
+                super::types::Side::Sell
+            },
+            size_sol,
+            latency_ms,
+            tx_sig,
+        );
+        drop(feedback);
+
+        let mut chain_health = self.chain_health.write().await;
+        chain_health.record_tx(true);
+    }
+
     /// Record a failed transaction
     pub async fn record_tx_failure(
         &mut self,
@@ -610,20 +639,36 @@ impl StrategyEngine {
         }
         drop(chain_health);
 
-        // Check execution quality
+        // Check execution quality. None observations display as "unknown", never
+        // as a fake 0.00 / 100%.
         let exec_feedback = self.execution_feedback.read().await;
         let quality = exec_feedback.get_quality();
+        let fill_rate_dbg = quality
+            .recent_fill_rate
+            .map(|f| format!("{:.2}", f))
+            .unwrap_or_else(|| "unknown".to_string());
+        let slippage_dbg = quality
+            .recent_avg_slippage
+            .map(|s| format!("{:.2}", s))
+            .unwrap_or_else(|| "unknown".to_string());
         tracing::debug!(
-            "Execution quality check: fill_rate={:.2}, slippage={:.2}, should_pause={}",
-            quality.recent_fill_rate,
-            quality.recent_avg_slippage,
+            "Execution quality check: fill_rate={}, slippage={}, should_pause={}",
+            fill_rate_dbg,
+            slippage_dbg,
             quality.should_pause_trading
         );
         if quality.should_pause_trading {
+            let fill_rate_str = quality
+                .recent_fill_rate
+                .map(|f| format!("{:.1}%", f * 100.0))
+                .unwrap_or_else(|| "unknown".to_string());
+            let slippage_str = quality
+                .recent_avg_slippage
+                .map(|s| format!("{:.1}%", s))
+                .unwrap_or_else(|| "unknown".to_string());
             return Some(format!(
-                "Poor execution quality: fill_rate={:.1}%, avg_slippage={:.1}%",
-                quality.recent_fill_rate * 100.0,
-                quality.recent_avg_slippage
+                "Poor execution quality: fill_rate={}, avg_slippage={}",
+                fill_rate_str, slippage_str
             ));
         }
         drop(exec_feedback);
@@ -735,7 +780,7 @@ impl StrategyEngine {
             portfolio_block_reason: None,
             chain_congestion: chain_state.congestion_level,
             chain_action_taken: chain_state.recommended_action.clone(),
-            recent_slippage_avg: 0.0,
+            recent_slippage_avg: None,
             confidence_adjustment: 0.0,
             entry_delay_applied_ms: 0,
             size_jitter_applied_pct: 0.0,

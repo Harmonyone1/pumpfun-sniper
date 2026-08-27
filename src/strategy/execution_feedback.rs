@@ -12,9 +12,10 @@ use super::types::ExecutionRecord;
 /// Execution quality metrics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutionQuality {
-    pub recent_avg_slippage: f64,
-    pub recent_avg_latency_ms: u64,
-    pub recent_fill_rate: f64,
+    /// None when there are no observations of that kind (never a fake 0/perfect).
+    pub recent_avg_slippage: Option<f64>,
+    pub recent_avg_latency_ms: Option<u64>,
+    pub recent_fill_rate: Option<f64>,
     pub confidence_adjustment: f64,
     pub should_reduce_size: bool,
     pub should_pause_trading: bool,
@@ -69,8 +70,12 @@ impl ExecutionFeedback {
             return;
         }
 
-        // Add to rolling windows
-        self.avg_slippage_pct.add(record.slippage_pct);
+        // Add to rolling windows. Unknown slippage is NOT a 0% sample — only add
+        // it when a real priced slippage exists. Latency and fill outcome are
+        // always real observations.
+        if let Some(slippage_pct) = record.slippage_pct {
+            self.avg_slippage_pct.add(slippage_pct);
+        }
         self.avg_latency_ms.add(record.latency_ms as f64);
         self.fill_rate.add(if record.success { 1.0 } else { 0.0 });
 
@@ -94,9 +99,9 @@ impl ExecutionFeedback {
         tx_sig: &str,
     ) {
         let slippage = if expected_price > 0.0 {
-            ((actual_price - expected_price) / expected_price) * 100.0
+            Some(((actual_price - expected_price) / expected_price) * 100.0)
         } else {
-            0.0
+            None
         };
 
         self.record(ExecutionRecord {
@@ -105,8 +110,8 @@ impl ExecutionFeedback {
             side: super::types::Side::Buy,
             requested_size_sol: size_sol,
             filled_size_sol: size_sol,
-            expected_price,
-            actual_price,
+            expected_price: Some(expected_price),
+            actual_price: Some(actual_price),
             slippage_pct: slippage,
             latency_ms,
             success: true,
@@ -126,9 +131,9 @@ impl ExecutionFeedback {
         tx_sig: &str,
     ) {
         let slippage = if expected_price > 0.0 {
-            ((expected_price - actual_price) / expected_price) * 100.0
+            Some(((expected_price - actual_price) / expected_price) * 100.0)
         } else {
-            0.0
+            None
         };
 
         self.record(ExecutionRecord {
@@ -137,14 +142,34 @@ impl ExecutionFeedback {
             side: super::types::Side::Sell,
             requested_size_sol: size_sol,
             filled_size_sol: size_sol,
-            expected_price,
-            actual_price,
+            expected_price: Some(expected_price),
+            actual_price: Some(actual_price),
             slippage_pct: slippage,
             latency_ms,
             success: true,
             failure_reason: None,
             tx_signature: Some(tx_sig.to_string()),
         });
+    }
+
+    /// Record a verified successful execution when the real fill price is UNKNOWN.
+    /// Records success + latency + fill-rate but NO slippage sample.
+    pub fn record_verified_success_unpriced(
+        &mut self,
+        mint: &str,
+        side: super::types::Side,
+        size_sol: f64,
+        latency_ms: u64,
+        tx_sig: &str,
+    ) {
+        self.record(ExecutionRecord::success_unpriced(
+            mint.to_string(),
+            side,
+            size_sol,
+            size_sol,
+            latency_ms,
+            tx_sig.to_string(),
+        ));
     }
 
     /// Record a failed execution
@@ -162,9 +187,9 @@ impl ExecutionFeedback {
             side,
             requested_size_sol: size_sol,
             filled_size_sol: 0.0,
-            expected_price: 0.0,
-            actual_price: 0.0,
-            slippage_pct: 0.0,
+            expected_price: None,
+            actual_price: None,
+            slippage_pct: None,
             latency_ms,
             success: false,
             failure_reason: Some(reason.to_string()),
@@ -172,42 +197,48 @@ impl ExecutionFeedback {
         });
     }
 
-    /// Get current execution quality
+    /// Get current execution quality. Unknown observations stay None and never
+    /// incur a penalty OR a reward.
     pub fn get_quality(&self) -> ExecutionQuality {
-        let avg_slippage = self.avg_slippage_pct.average();
-        let avg_latency = self.avg_latency_ms.average() as u64;
+        let avg_slippage = if self.avg_slippage_pct.count() > 0 {
+            Some(self.avg_slippage_pct.average())
+        } else {
+            None
+        };
+        let avg_latency = if self.avg_latency_ms.count() > 0 {
+            Some(self.avg_latency_ms.average() as u64)
+        } else {
+            None
+        };
         let fill_rate = if self.fill_rate.count() > 0 {
-            self.fill_rate.average()
+            Some(self.fill_rate.average())
         } else {
-            1.0
+            None
         };
 
-        // Calculate confidence adjustment based on slippage
-        let slippage_adj: f64 = if avg_slippage > 10.0 {
-            -0.3 // Severe slippage
-        } else if avg_slippage > self.config.slippage_penalty_threshold_pct {
-            -0.15
-        } else if avg_slippage > 2.0 {
-            -0.05
-        } else {
-            0.0
+        // Confidence penalty only on KNOWN slippage.
+        let slippage_adj: f64 = match avg_slippage {
+            Some(s) if s > 10.0 => -0.3, // Severe slippage
+            Some(s) if s > self.config.slippage_penalty_threshold_pct => -0.15,
+            Some(s) if s > 2.0 => -0.05,
+            _ => 0.0,
         };
 
-        // Adjust for fill rate
-        let fill_adj: f64 = if fill_rate < 0.5 {
-            -0.2
-        } else if fill_rate < self.config.fill_rate_penalty_threshold {
-            -0.1
-        } else {
-            0.0
+        // Confidence penalty only on KNOWN fill rate.
+        let fill_adj: f64 = match fill_rate {
+            Some(f) if f < 0.5 => -0.2,
+            Some(f) if f < self.config.fill_rate_penalty_threshold => -0.1,
+            _ => 0.0,
         };
 
         let confidence_adjustment = (slippage_adj + fill_adj).max(-0.3);
 
-        // Determine if we should reduce size or pause
-        let should_reduce = avg_slippage > self.config.slippage_penalty_threshold_pct;
-        let should_pause =
-            self.config.pause_on_severe_slippage && (fill_rate < 0.3 || avg_slippage > 15.0);
+        // Reduce/pause only react to KNOWN severe slippage / fill rate.
+        let should_reduce =
+            matches!(avg_slippage, Some(s) if s > self.config.slippage_penalty_threshold_pct);
+        let should_pause = self.config.pause_on_severe_slippage
+            && (matches!(fill_rate, Some(f) if f < 0.3)
+                || matches!(avg_slippage, Some(s) if s > 15.0));
 
         ExecutionQuality {
             recent_avg_slippage: avg_slippage,
@@ -219,7 +250,8 @@ impl ExecutionFeedback {
         }
     }
 
-    /// Get size reduction factor based on recent execution quality
+    /// Get size reduction factor based on recent execution quality.
+    /// Returns 1.0 when there is no negative execution evidence (incl. unknown slippage).
     pub fn get_size_factor(&self) -> f64 {
         let quality = self.get_quality();
 
@@ -231,15 +263,12 @@ impl ExecutionFeedback {
             return 0.5;
         }
 
-        // Gradual reduction based on slippage
-        if quality.recent_avg_slippage > 10.0 {
-            0.3
-        } else if quality.recent_avg_slippage > 5.0 {
-            0.6
-        } else if quality.recent_avg_slippage > 2.0 {
-            0.8
-        } else {
-            1.0
+        // Gradual reduction based on KNOWN slippage; unknown => full size.
+        match quality.recent_avg_slippage {
+            Some(s) if s > 10.0 => 0.3,
+            Some(s) if s > 5.0 => 0.6,
+            Some(s) if s > 2.0 => 0.8,
+            _ => 1.0,
         }
     }
 
@@ -253,25 +282,31 @@ impl ExecutionFeedback {
         self.executions.len()
     }
 
-    /// Get success rate
-    pub fn success_rate(&self) -> f64 {
+    /// Get success rate. None when there are no records.
+    pub fn success_rate(&self) -> Option<f64> {
         if self.executions.is_empty() {
-            return 1.0;
+            return None;
         }
 
         let success = self.executions.iter().filter(|e| e.success).count();
-        success as f64 / self.executions.len() as f64
+        Some(success as f64 / self.executions.len() as f64)
     }
 
-    /// Get average slippage for successful executions
-    pub fn avg_slippage(&self) -> f64 {
-        let successful: Vec<_> = self.executions.iter().filter(|e| e.success).collect();
+    /// Get average slippage over successful PRICED executions only.
+    /// None when there are no priced successful records.
+    pub fn avg_slippage(&self) -> Option<f64> {
+        let samples: Vec<f64> = self
+            .executions
+            .iter()
+            .filter(|e| e.success)
+            .filter_map(|e| e.slippage_pct)
+            .collect();
 
-        if successful.is_empty() {
-            return 0.0;
+        if samples.is_empty() {
+            return None;
         }
 
-        successful.iter().map(|e| e.slippage_pct).sum::<f64>() / successful.len() as f64
+        Some(samples.iter().sum::<f64>() / samples.len() as f64)
     }
 
     /// Clear execution history
@@ -297,7 +332,7 @@ mod tests {
         feedback.record_buy("mint", 0.1, 0.001, 0.00105, 100, "sig1");
 
         assert_eq!(feedback.execution_count(), 1);
-        assert!((feedback.avg_slippage() - 5.0).abs() < 0.1);
+        assert!((feedback.avg_slippage().unwrap() - 5.0).abs() < 0.1);
     }
 
     #[test]
@@ -308,7 +343,7 @@ mod tests {
         feedback.record_buy("mint", 0.1, 0.001, 0.0011, 100, "sig1");
 
         let quality = feedback.get_quality();
-        assert!(quality.recent_avg_slippage > 9.0);
+        assert!(quality.recent_avg_slippage.unwrap() > 9.0);
         assert!(quality.confidence_adjustment < 0.0);
     }
 
@@ -320,7 +355,41 @@ mod tests {
         feedback.record_buy("mint", 0.1, 0.001, 0.001, 100, "sig2");
         feedback.record_failure("mint", super::super::types::Side::Buy, 0.1, 100, "Failed");
 
-        assert!((feedback.success_rate() - 0.666).abs() < 0.01);
+        assert!((feedback.success_rate().unwrap() - 0.666).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_unpriced_success_does_not_create_zero_slippage_sample() {
+        let mut feedback = ExecutionFeedback::default();
+
+        feedback.record_verified_success_unpriced(
+            "mint",
+            super::super::types::Side::Buy,
+            0.1,
+            120,
+            "sig1",
+        );
+
+        assert_eq!(feedback.execution_count(), 1);
+
+        let quality = feedback.get_quality();
+        assert_eq!(quality.recent_fill_rate, Some(1.0));
+        assert!(quality.recent_avg_latency_ms.is_some());
+        assert_eq!(quality.recent_avg_slippage, None);
+        assert_eq!(feedback.avg_slippage(), None);
+        assert!((feedback.get_size_factor() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_failure_does_not_create_slippage_sample() {
+        let mut feedback = ExecutionFeedback::default();
+
+        feedback.record_failure("mint", super::super::types::Side::Buy, 0.1, 100, "Failed");
+
+        assert_eq!(feedback.success_rate(), Some(0.0));
+        assert_eq!(feedback.get_quality().recent_fill_rate, Some(0.0));
+        assert_eq!(feedback.avg_slippage(), None);
+        assert_eq!(feedback.get_quality().recent_avg_slippage, None);
     }
 
     #[test]
