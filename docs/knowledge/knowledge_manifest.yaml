@@ -1,0 +1,138 @@
+knowledge_layer:
+  version: '1.1'
+  repository: Harmonyone1/pumpfun-sniper
+  baseline_commit: 2158c64426de0f0c532221c578348c1dad1e075d
+  verified_date: '2026-08-27'
+  purpose: Canonical architecture and implementation-agent routing for pumpfun-sniper
+  truth_precedence:
+  - latest_explicit_implementation_packet
+  - canonical_invariants_and_target_architecture
+  - current_official_external_docs
+  - current_repository_runtime
+  - legacy_comments_commits_backups
+subsystems:
+  market_data:
+    read:
+    - 00_INDEX.md
+    - 01_SYSTEM_CHARTER.md
+    - 02_CANONICAL_INVARIANTS.md
+    - 05_MARKET_DATA.md
+    - 06_DOMAIN_TYPES_AND_UNITS.md
+    - 07_RUNTIME_FLOWS.md
+    - 14_EXTERNAL_PROTOCOL_REGISTRY.md
+    paths:
+    - src/stream/
+    - src/filter/helius.rs
+    - src/filter/enrichment.rs
+  entry_model:
+    read:
+    - 00_INDEX.md
+    - 01_SYSTEM_CHARTER.md
+    - 02_CANONICAL_INVARIANTS.md
+    - 05_MARKET_DATA.md
+    - 06_DOMAIN_TYPES_AND_UNITS.md
+    - 08_ENTRY_AND_MODEL.md
+    - 11_KNOWN_DEFECTS.md
+    - 19_ADDED_MODULE_REVIEW.md
+    paths:
+    - src/filter/
+    - src/strategy/regime.rs
+    - src/strategy/engine.rs
+    - src/dexscreener.rs
+  execution:
+    read:
+    - 00_INDEX.md
+    - 01_SYSTEM_CHARTER.md
+    - 02_CANONICAL_INVARIANTS.md
+    - 06_DOMAIN_TYPES_AND_UNITS.md
+    - 09_EXECUTION_AND_RECONCILIATION.md
+    - 10_POSITION_RISK_AND_EXIT.md
+    - 14_EXTERNAL_PROTOCOL_REGISTRY.md
+    - 19_ADDED_MODULE_REVIEW.md
+    paths:
+    - src/trading/
+    - src/cli/commands.rs
+    - src/strategy/liquidity.rs
+    - src/strategy/randomization.rs
+    - src/strategy/chain_health.rs
+  position_exit:
+    read:
+    - 00_INDEX.md
+    - 01_SYSTEM_CHARTER.md
+    - 02_CANONICAL_INVARIANTS.md
+    - 06_DOMAIN_TYPES_AND_UNITS.md
+    - 09_EXECUTION_AND_RECONCILIATION.md
+    - 10_POSITION_RISK_AND_EXIT.md
+    - 19_ADDED_MODULE_REVIEW.md
+    paths:
+    - src/position/
+    - src/strategy/exit_manager.rs
+    - src/filter/kill_switch.rs
+    - src/filter/holder_watcher.rs
+  wallets:
+    read:
+    - 00_INDEX.md
+    - 01_SYSTEM_CHARTER.md
+    - 02_CANONICAL_INVARIANTS.md
+    - 03_CURRENT_REPOSITORY_MAP.md
+    - 10_POSITION_RISK_AND_EXIT.md
+    - 19_ADDED_MODULE_REVIEW.md
+    paths:
+    - src/wallet/
+invariant_families:
+- UNIT
+- DATA
+- ENTRY
+- EXEC
+- POS
+- MODEL
+- SEC
+known_defects:
+  P0:
+  - DEF-P0-001
+  - DEF-P0-002
+  - DEF-P0-003
+  - DEF-P0-004
+  - DEF-P0-005
+  - DEF-P0-006
+  - DEF-P0-007
+  - DEF-P0-008
+  - DEF-P0-009
+  - DEF-P0-010
+  - DEF-P0-011
+  - DEF-P0-012
+  - DEF-P0-013
+  P1:
+  - DEF-P1-001
+  - DEF-P1-002
+  - DEF-P1-003
+  - DEF-P1-004
+  - DEF-P1-005
+  - DEF-P1-006
+  - DEF-P1-007
+  - DEF-P1-008
+  - DEF-P1-009
+  - DEF-P1-010
+  - DEF-P1-011
+  - DEF-P1-012
+  - DEF-P1-013
+  - DEF-P1-014
+  - DEF-P1-015
+  - DEF-P1-016
+  P2:
+  - DEF-P2-001
+  - DEF-P2-002
+  - DEF-P2-003
+  - DEF-P2-004
+  - DEF-P2-005
+  - DEF-P2-006
+implementation_packet_template: 15_IMPLEMENTATION_PACKET_TEMPLATE.md
+revalidation_checklist: 16_REVALIDATION_CHECKLIST.md
+roadmap: 17_ROADMAP.md
+added_module_review: 19_ADDED_MODULE_REVIEW.md
+module_status_classes:
+- canonical_live
+- canonical_unwired
+- experimental
+- legacy_deprecated
+- unsafe_blocked
