@@ -64,6 +64,9 @@ pub enum Error {
     #[error("Transaction send failed: {0}")]
     TransactionSend(String),
 
+    #[error("Transaction reconciliation failed: {0}")]
+    TransactionReconciliation(String),
+
     #[error("Slippage exceeded: expected {expected}, got {actual}")]
     SlippageExceeded { expected: u64, actual: u64 },
 
