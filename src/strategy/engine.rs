@@ -77,6 +77,9 @@ impl Default for StrategyEngineConfig {
 #[derive(Debug, Clone)]
 pub struct TokenAnalysisContext {
     pub mint: String,
+    /// Token creator/deployer address. Used by the fatal-risk engine for the
+    /// known-rug-deployer check; an empty string disables that check.
+    pub creator: String,
     pub order_flow: OrderFlowAnalysis,
     pub distribution: TokenDistribution,
     pub creator_behavior: CreatorBehavior,
@@ -172,8 +175,12 @@ impl StrategyEngine {
 
         let fatal_context = FatalRiskContext {
             mint: ctx.mint.clone(),
-            creator: String::new(),       // Would come from token data
-            mint_authority_active: false, // Would come from RPC
+            creator: ctx.creator.clone(), // real deployer address (enables rug-deployer check)
+            // Authority flags default false here; the fatal-risk engine additionally
+            // consults the shared FilterCache (populated by Helius enrichment) for the
+            // real mint/freeze authority, so these being false does not mask a known-bad
+            // authority when enrichment data is available.
+            mint_authority_active: false,
             freeze_authority_active: false,
             creator_sell_info,
             effective_liquidity_sol: ctx.sol_reserves,
@@ -815,6 +822,7 @@ mod tests {
 
         let ctx = TokenAnalysisContext {
             mint: "wash_mint".to_string(),
+            creator: "test_creator".to_string(),
             order_flow: OrderFlowAnalysis {
                 wash_trading_score: 0.9, // High wash trading
                 organic_score: 0.1,

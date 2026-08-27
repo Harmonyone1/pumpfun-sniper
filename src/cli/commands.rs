@@ -960,6 +960,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             // Evaluate entry using strategy engine
                             let analysis_ctx = crate::strategy::engine::TokenAnalysisContext {
                                 mint: token.mint.clone(),
+                                creator: token.trader_public_key.clone(),
                                 order_flow,
                                 distribution,
                                 creator_behavior,

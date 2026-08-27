@@ -287,6 +287,21 @@ impl FatalRiskEngine {
             return Some(FatalRisk::FreezeAuthorityActive);
         }
 
+        // Authority check via shared cache (populated by Helius enrichment). The
+        // caller-supplied context flags above default to false in the live path, so
+        // this is what actually catches active mint/freeze authority when enrichment
+        // data is present. No extra RPC: it only reads already-cached mint info.
+        if let Some(cache) = &self.cache {
+            if let Some(mint_info) = cache.get_mint_info(&context.mint) {
+                if self.config.check_mint_authority && mint_info.has_mint_authority() {
+                    return Some(FatalRisk::MintAuthorityActive);
+                }
+                if self.config.check_freeze_authority && mint_info.has_freeze_authority() {
+                    return Some(FatalRisk::FreezeAuthorityActive);
+                }
+            }
+        }
+
         // Check creator dump
         if let Some((pct_sold, within_secs)) = context.creator_sell_info {
             if pct_sold > self.config.max_creator_dump_pct
