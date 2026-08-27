@@ -631,7 +631,18 @@ mod tests {
             total_cost_sol: 0.01,
             entry_time: chrono::Utc::now(),
             entry_signature: "test_sig".to_string(),
+            entry_type: EntryType::Legacy,
+            quick_profit_taken: false,
+            second_profit_taken: false,
+            peak_price: 0.00000001,
             current_price: 0.000000015, // 50% profit: 0.015 SOL for 1M tokens
+            price_updated_at: None,
+            kill_switch_triggered: false,
+            kill_switch_reason: None,
+            wallet_pubkey: "test_wallet".to_string(),
+            tp_price: 0.000000015,
+            sl_price: 0.000000007,
+            exit_reason: None,
         }
     }
 

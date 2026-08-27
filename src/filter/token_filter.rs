@@ -282,6 +282,7 @@ mod tests {
             name_patterns: vec![],
             // Use case-insensitive regex patterns
             blocked_patterns: vec!["(?i)scam".to_string(), "(?i)rug".to_string()],
+            ..crate::config::Config::default().filters
         }
     }
 

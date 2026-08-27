@@ -176,6 +176,7 @@ mod tests {
             stop_loss_pct: 30.0,
             partial_take_profit: false,
             price_poll_interval_ms: 1000,
+            ..crate::config::Config::default().auto_sell
         }
     }
 
@@ -190,7 +191,18 @@ mod tests {
             total_cost_sol: 0.01,
             entry_time: chrono::Utc::now(),
             entry_signature: "sig".to_string(),
+            entry_type: crate::position::manager::EntryType::Legacy,
+            quick_profit_taken: false,
+            second_profit_taken: false,
+            peak_price: entry_price,
             current_price,
+            price_updated_at: None,
+            kill_switch_triggered: false,
+            kill_switch_reason: None,
+            wallet_pubkey: "test_wallet".to_string(),
+            tp_price: entry_price * 1.5,
+            sl_price: entry_price * 0.7,
+            exit_reason: None,
         }
     }
 

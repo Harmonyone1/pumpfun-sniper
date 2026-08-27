@@ -247,6 +247,7 @@ mod tests {
         let config = TradingConfig {
             buy_amount_sol: 0.05,
             slippage_bps: 2500, // 25%
+            sell_slippage_bps: 1200,
             priority_fee_lamports: 100000,
             simulate_before_send: false,
         };
