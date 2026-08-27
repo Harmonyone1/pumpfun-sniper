@@ -330,7 +330,6 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
         let monitor_use_local_api = use_local_api;
-        let monitor_engine = strategy_engine.clone();
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
@@ -592,19 +591,15 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     }
                                 }
                                 Err(e) => {
+                                    let sell_latency_ms = sell_start.elapsed().as_millis() as u64;
                                     error!(
-                                        "AUTO-SELL FAILED for {} (attempt {}): {}",
-                                        position.symbol, attempts, e
+                                        "AUTO-SELL FAILED for {} (attempt {}): {} ({}ms)",
+                                        position.symbol, attempts, e, sell_latency_ms
                                     );
-                                    // Measurement: failed sells are an exit-risk/honeypot signal.
-                                    // Size is only a quote-size proxy, not exact filled size.
-                                    if let Some(ref engine) = monitor_engine {
-                                        let latency_ms = sell_start.elapsed().as_millis() as u64;
-                                        engine.write().await.record_tx_failure(
-                                            &position.mint, false, position.total_cost_sol,
-                                            latency_ms, &e.to_string(),
-                                        ).await;
-                                    }
+                                    // Sell failure is logged but intentionally not fed into global execution
+                                    // feedback yet. Successful sells cannot be authoritatively reconciled today;
+                                    // failure-only samples would corrupt fill-rate/chain-health controls.
+                                    // Transaction reconciliation will wire both sides symmetrically.
                                 }
                             }
                         }
