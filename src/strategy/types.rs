@@ -496,6 +496,35 @@ impl ExecutionRecord {
         }
     }
 
+    /// Create a successful execution record from an on-chain RECONCILED fill
+    /// whose actual price is KNOWN but whose reference/expected price is not.
+    /// Records success + actual price, but no slippage sample (expected is None,
+    /// so slippage cannot be computed and must never be faked as 0%).
+    pub fn success_reconciled_unquoted(
+        mint: String,
+        side: Side,
+        requested_size_sol: f64,
+        filled_size_sol: f64,
+        actual_price: f64,
+        latency_ms: u64,
+        tx_signature: String,
+    ) -> Self {
+        Self {
+            timestamp: chrono::Utc::now(),
+            mint,
+            side,
+            requested_size_sol,
+            filled_size_sol,
+            expected_price: None,
+            actual_price: Some(actual_price),
+            slippage_pct: None,
+            latency_ms,
+            success: true,
+            failure_reason: None,
+            tx_signature: Some(tx_signature),
+        }
+    }
+
     /// Create a failed execution record. A failure is NOT a zero-slippage fill:
     /// price/slippage are all None.
     pub fn failure(

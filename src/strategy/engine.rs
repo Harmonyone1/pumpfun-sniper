@@ -402,10 +402,20 @@ impl StrategyEngine {
 
     /// Record a successful exit
     pub async fn record_exit(&mut self, mint: &str, pnl_sol: f64) {
-        // Update portfolio
+        // Update portfolio. close_position returns false when the position was
+        // already closed / never tracked — in that case DO NOT record duplicate
+        // P&L, but still clear the local trackers below so state stays consistent.
         let mut portfolio = self.portfolio_risk.write().await;
-        portfolio.close_position(mint, pnl_sol);
+        let closed = portfolio.close_position(mint, pnl_sol);
         drop(portfolio);
+
+        if !closed {
+            tracing::warn!(
+                "record_exit: ignored duplicate/untracked full exit for {} (pnl {:.6} SOL not recorded); clearing trackers only",
+                mint,
+                pnl_sol
+            );
+        }
 
         // Clear exit manager tracking
         let mut exit_manager = self.exit_manager.write().await;
@@ -481,6 +491,53 @@ impl StrategyEngine {
 
         let mut chain_health = self.chain_health.write().await;
         chain_health.record_tx(true);
+    }
+
+    /// Record a reconciled successful execution whose actual fill price is KNOWN
+    /// but whose reference/expected price is not. Records success + latency +
+    /// fill-rate and the actual price, but no slippage sample.
+    pub async fn record_reconciled_execution(
+        &mut self,
+        mint: &str,
+        is_buy: bool,
+        requested_size_sol: f64,
+        filled_size_sol: f64,
+        actual_price: f64,
+        latency_ms: u64,
+        tx_sig: &str,
+    ) {
+        let mut feedback = self.execution_feedback.write().await;
+        feedback.record_reconciled_success(
+            mint,
+            if is_buy {
+                super::types::Side::Buy
+            } else {
+                super::types::Side::Sell
+            },
+            requested_size_sol,
+            filled_size_sol,
+            actual_price,
+            latency_ms,
+            tx_sig,
+        );
+        drop(feedback);
+
+        let mut chain_health = self.chain_health.write().await;
+        chain_health.record_tx(true);
+    }
+
+    /// Record a partial exit against the portfolio governor: reduce the tracked
+    /// position in place and record the realized PnL once. Returns false when
+    /// the position is absent or the remaining size is invalid.
+    pub async fn record_partial_exit(
+        &mut self,
+        mint: &str,
+        remaining_size_sol: f64,
+        remaining_tokens: u64,
+        realized_pnl_sol: f64,
+    ) -> bool {
+        let mut portfolio = self.portfolio_risk.write().await;
+        portfolio.record_partial_exit(mint, remaining_size_sol, remaining_tokens, realized_pnl_sol)
     }
 
     /// Record a failed transaction
