@@ -105,7 +105,22 @@ impl PositionSizer {
         // 6. Portfolio constraint
         size = size.min(ctx.portfolio_remaining_sol);
 
-        // 7. Clamp to configured limits
+        // 7. Capacity gate (P0 fix): if the real binding capacity (liquidity exit
+        //    ceiling and/or remaining portfolio) can't cover the minimum viable
+        //    position, do NOT trade. Previously step 8's clamp could raise `size`
+        //    back UP to min_size_sol even when the binding capacity cap was below
+        //    it, producing a position larger than actually available capacity.
+        let capacity_ceiling = if ctx.liquidity.exit_feasible {
+            ctx.portfolio_remaining_sol
+                .min(ctx.liquidity.max_safe_exit_sol * 0.8)
+        } else {
+            ctx.portfolio_remaining_sol
+        };
+        if capacity_ceiling < self.config.min_size_sol {
+            return 0.0;
+        }
+
+        // 8. Clamp to configured limits (min is now known to fit within capacity)
         size = size.clamp(self.config.min_size_sol, self.config.max_size_sol);
 
         size
@@ -340,6 +355,60 @@ mod tests {
 
         let size = sizer.calculate_size(&ctx);
         assert!(size <= 0.3);
+    }
+
+    #[test]
+    fn test_capacity_below_min_returns_zero() {
+        // P0 regression: when real portfolio capacity is below the configured
+        // minimum, sizing must return 0 (no trade), NOT clamp back up to min.
+        let sizer = PositionSizer::new(PositionSizingConfig {
+            base_size_sol: 0.1,
+            min_size_sol: 0.01,
+            max_size_sol: 0.5,
+            confidence_scaling: false,
+        });
+
+        let ctx = SizingContext {
+            portfolio_remaining_sol: 0.002, // below min_size_sol of 0.01
+            regime: TokenRegime::OrganicPump {
+                confidence: 0.8,
+                expected_duration_secs: 60,
+            },
+            ..Default::default()
+        };
+
+        let size = sizer.calculate_size(&ctx);
+        assert_eq!(size, 0.0, "capacity below min must return 0, got {}", size);
+    }
+
+    #[test]
+    fn test_liquidity_below_min_returns_zero() {
+        // Exit capacity too thin to place even a minimum position -> no trade.
+        let sizer = PositionSizer::new(PositionSizingConfig {
+            base_size_sol: 0.1,
+            min_size_sol: 0.01,
+            max_size_sol: 0.5,
+            confidence_scaling: false,
+        });
+
+        let mut liquidity = LiquidityAnalysis::default();
+        liquidity.exit_feasible = true;
+        liquidity.max_safe_exit_sol = 0.005; // 0.8 * 0.005 = 0.004 < min 0.01
+
+        let ctx = SizingContext {
+            confidence: 0.5,
+            regime: TokenRegime::OrganicPump {
+                confidence: 0.8,
+                expected_duration_secs: 60,
+            },
+            liquidity,
+            portfolio_remaining_sol: 10.0,
+            chain_size_factor: 1.0,
+            execution_size_factor: 1.0,
+        };
+
+        let size = sizer.calculate_size(&ctx);
+        assert_eq!(size, 0.0, "liquidity below min must return 0, got {}", size);
     }
 
     #[test]

@@ -11,6 +11,8 @@ Cargo.lock
 
 # Environment and secrets
 .env
+# Live config contains API keys / endpoints — track config.toml.example instead
+config.toml
 
 # Keypairs - NEVER commit these
 keypair*.json
