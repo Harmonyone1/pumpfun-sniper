@@ -124,8 +124,13 @@ pub struct Position {
     pub symbol: String,
     /// Bonding curve address
     pub bonding_curve: String,
-    /// Amount of tokens held
+    /// Amount of tokens held.
+    /// For reconciled positions this is RAW token units; legacy positions may differ.
     pub token_amount: u64,
+    /// Token decimals from confirmed transaction metadata.
+    /// `None` means legacy/unmigrated position whose unit semantics are not yet canonical.
+    #[serde(default)]
+    pub token_decimals: Option<u8>,
     /// Entry price in SOL per token
     pub entry_price: f64,
     /// Total SOL cost (including fees)
@@ -158,12 +163,29 @@ pub struct Position {
     /// Wallet pubkey that holds this position (for multi-wallet support)
     #[serde(default)]
     pub wallet_pubkey: String,
+    /// Confirmed sell signatures already applied to this position (idempotent partial exits).
+    #[serde(default)]
+    pub applied_exit_signatures: Vec<String>,
 }
 
 impl Position {
+    /// Human-readable (UI) token amount, normalized by decimals.
+    /// Returns `None` for legacy/unmigrated positions with no known decimals.
+    pub fn token_amount_ui(&self) -> Option<f64> {
+        match self.token_decimals {
+            Some(d) => Some(self.token_amount as f64 / 10_f64.powi(d as i32)),
+            None => None,
+        }
+    }
+
     /// Calculate current value in SOL
     pub fn current_value(&self) -> f64 {
-        self.token_amount as f64 * self.current_price
+        match self.token_amount_ui() {
+            Some(ui) => ui * self.current_price,
+            // Legacy fallback: raw token_amount treated as UI units.
+            // Temporary until 001C migrates all positions to canonical decimals.
+            None => self.token_amount as f64 * self.current_price,
+        }
     }
 
     /// Calculate unrealized P&L in SOL
@@ -241,6 +263,17 @@ impl DailyStats {
         }
         (self.winning_trades as f64 / self.total_trades as f64) * 100.0
     }
+}
+
+/// Result of a reconciled (signature-idempotent) position close.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconciledCloseResult {
+    pub pnl_sol: f64,
+    pub fully_closed: bool,
+    pub already_applied: bool,
+    pub sold_amount: u64,
+    pub remaining_amount: u64,
+    pub remaining_cost_sol: f64,
 }
 
 /// Position manager
@@ -322,6 +355,173 @@ impl PositionManager {
         self.check_risk_limits(buy_amount).await
     }
 
+    /// Record a position that has already been confirmed on-chain.
+    ///
+    /// Does NOT check risk limits: the tokens are already owned, so refusing to
+    /// track them would only hide real exposure. Returns `Ok(true)` if a new
+    /// position was inserted, `Ok(false)` if an identical position (same mint and
+    /// entry_signature) already exists (idempotent). A mint that already exists
+    /// with a DIFFERENT entry_signature is an accounting conflict and is rejected
+    /// without overwriting.
+    pub async fn record_confirmed_position(&self, position: Position) -> Result<bool> {
+        if position.mint.is_empty() {
+            return Err(Error::PositionAccounting("mint is empty".to_string()));
+        }
+        if position.token_amount == 0 {
+            return Err(Error::PositionAccounting("token_amount must be > 0".to_string()));
+        }
+        if position.token_decimals.is_none() {
+            return Err(Error::PositionAccounting(
+                "token_decimals must be known for a confirmed position".to_string(),
+            ));
+        }
+        if !position.total_cost_sol.is_finite() || position.total_cost_sol <= 0.0 {
+            return Err(Error::PositionAccounting(
+                "total_cost_sol must be finite and > 0".to_string(),
+            ));
+        }
+        if !position.entry_price.is_finite() || position.entry_price <= 0.0 {
+            return Err(Error::PositionAccounting(
+                "entry_price must be finite and > 0".to_string(),
+            ));
+        }
+        if position.wallet_pubkey.is_empty() {
+            return Err(Error::PositionAccounting("wallet_pubkey is empty".to_string()));
+        }
+        if position.entry_signature.is_empty() {
+            return Err(Error::PositionAccounting("entry_signature is empty".to_string()));
+        }
+
+        let mint = position.mint.clone();
+        {
+            let mut positions = self.positions.write().await;
+            match positions.get(&mint) {
+                None => {
+                    positions.insert(mint.clone(), position);
+                }
+                Some(existing) => {
+                    if existing.entry_signature == position.entry_signature {
+                        return Ok(false);
+                    }
+                    return Err(Error::PositionAccounting(format!(
+                        "position for {} already exists with a different entry_signature",
+                        mint
+                    )));
+                }
+            }
+        }
+
+        info!("Recorded confirmed position in {}", mint);
+        self.save().await?;
+        Ok(true)
+    }
+
+    /// Close a position against a confirmed sell, idempotent by exit signature.
+    ///
+    /// Uses the confirmed on-chain `sold_amount` and `received_sol` (net proceeds,
+    /// which may be negative). Applying the same `exit_signature` twice is a no-op
+    /// and does not double-count P&L. Rejects an oversell (sold_amount greater than
+    /// the tracked balance) without mutating state or stats.
+    pub async fn close_position_reconciled(
+        &self,
+        mint: &str,
+        exit_signature: &str,
+        sold_amount: u64,
+        received_sol: f64,
+    ) -> Result<ReconciledCloseResult> {
+        if exit_signature.is_empty() {
+            return Err(Error::PositionAccounting("exit_signature is empty".to_string()));
+        }
+        if sold_amount == 0 {
+            return Err(Error::PositionAccounting("sold_amount must be > 0".to_string()));
+        }
+        if !received_sol.is_finite() {
+            return Err(Error::PositionAccounting("received_sol must be finite".to_string()));
+        }
+
+        // Result computed under the lock; stats/persist happen after unlocking.
+        let (result, pnl_to_record, record_stats) = {
+            let mut positions = self.positions.write().await;
+            let position = positions
+                .get_mut(mint)
+                .ok_or_else(|| Error::PositionNotFound(mint.to_string()))?;
+
+            if position.token_amount == 0 {
+                return Err(Error::PositionAccounting(format!(
+                    "position for {} has zero token_amount",
+                    mint
+                )));
+            }
+            if sold_amount > position.token_amount {
+                return Err(Error::PositionAccounting(format!(
+                    "oversell for {}: sold {} > held {}",
+                    mint, sold_amount, position.token_amount
+                )));
+            }
+
+            // Idempotency: already applied this signature.
+            if position.applied_exit_signatures.iter().any(|s| s == exit_signature) {
+                return Ok(ReconciledCloseResult {
+                    pnl_sol: 0.0,
+                    fully_closed: false,
+                    already_applied: true,
+                    sold_amount: 0,
+                    remaining_amount: position.token_amount,
+                    remaining_cost_sol: position.total_cost_sol,
+                });
+            }
+
+            let sold_ratio = sold_amount as f64 / position.token_amount as f64;
+            let cost_basis = position.total_cost_sol * sold_ratio;
+            let pnl = received_sol - cost_basis;
+            let fully_closed = sold_amount == position.token_amount;
+
+            let result = if fully_closed {
+                positions.remove(mint);
+                info!("Reconciled close of {} (full) P&L: {} SOL", mint, pnl);
+                ReconciledCloseResult {
+                    pnl_sol: pnl,
+                    fully_closed: true,
+                    already_applied: false,
+                    sold_amount,
+                    remaining_amount: 0,
+                    remaining_cost_sol: 0.0,
+                }
+            } else {
+                position.token_amount -= sold_amount;
+                position.total_cost_sol -= cost_basis;
+                position.applied_exit_signatures.push(exit_signature.to_string());
+                info!(
+                    "Reconciled partial close of {}, remaining {} tokens, P&L: {} SOL",
+                    mint, position.token_amount, pnl
+                );
+                ReconciledCloseResult {
+                    pnl_sol: pnl,
+                    fully_closed: false,
+                    already_applied: false,
+                    sold_amount,
+                    remaining_amount: position.token_amount,
+                    remaining_cost_sol: position.total_cost_sol,
+                }
+            };
+
+            (result, pnl, true)
+        };
+
+        // Update daily stats exactly once (same path legacy close uses).
+        if record_stats {
+            let mut stats = self.daily_stats.write().await;
+            stats.record_trade(pnl_to_record);
+            drop(stats);
+        }
+
+        self.save().await?;
+        Ok(result)
+    }
+
+    /// Legacy/non-reconciled close path. Do not use for newly wired live execution.
+    /// 001C will migrate remaining callers.
+    ///
     /// Close a position (fully or partially)
     pub async fn close_position(
         &self,
@@ -563,6 +763,7 @@ mod tests {
             symbol: "TEST".to_string(),
             bonding_curve: "test_curve".to_string(),
             token_amount: 1_000_000,
+            token_decimals: None,
             entry_price: 0.00000001, // 0.01 SOL for 1M tokens
             total_cost_sol: 0.01,
             entry_time: chrono::Utc::now(),
@@ -575,7 +776,34 @@ mod tests {
             kill_switch_reason: None,
             wallet_pubkey: "test_wallet".to_string(),
             current_price: 0.000000015, // 50% profit: 0.015 SOL for 1M tokens
+            applied_exit_signatures: vec![],
         }
+    }
+
+    /// Build a manager with a very small max_position_sol so post-fill recording
+    /// exceeds pre-buy risk limits.
+    fn tiny_limit_manager() -> PositionManager {
+        let cfg = SafetyConfig {
+            require_sell_confirmation: false,
+            max_position_sol: 0.001,
+            daily_loss_limit_sol: 100.0,
+            keypair_balance_warning_sol: 0.0,
+        };
+        PositionManager::new(cfg, None)
+    }
+
+    /// A confirmed position: raw units with known decimals and all invariants met.
+    fn confirmed_position(mint: &str, sig: &str, token_amount: u64, cost: f64) -> Position {
+        let mut p = test_position();
+        p.mint = mint.to_string();
+        p.token_amount = token_amount;
+        p.token_decimals = Some(6);
+        p.total_cost_sol = cost;
+        p.entry_price = 0.00000001;
+        p.entry_signature = sig.to_string();
+        p.wallet_pubkey = "test_wallet".to_string();
+        p.applied_exit_signatures = vec![];
+        p
     }
 
     #[test]
@@ -604,5 +832,164 @@ mod tests {
         assert_eq!(stats.winning_trades, 2);
         assert_eq!(stats.losing_trades, 1);
         assert!((stats.win_rate() - 66.67).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_reconciled_position_current_value_uses_decimals() {
+        let mut p = test_position();
+        p.token_amount = 1_500_000;
+        p.token_decimals = Some(6);
+        p.current_price = 0.002;
+
+        assert!((p.token_amount_ui().unwrap() - 1.5).abs() < 1e-9);
+        // 1.5 * 0.002 = 0.003
+        assert!((p.current_value() - 0.003).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_record_confirmed_position_records_owned_position_over_postfill_limit() {
+        let mgr = tiny_limit_manager();
+        let cost = 0.05; // well above max_position_sol of 0.001
+        let pos = confirmed_position("mintA", "sigA", 1_000_000, cost);
+
+        // Pre-buy check would refuse this.
+        assert!(mgr.can_open_position(cost).await.is_err());
+
+        // But recording an already-confirmed position succeeds.
+        assert_eq!(mgr.record_confirmed_position(pos).await.unwrap(), true);
+        assert!(mgr.get_position("mintA").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_record_confirmed_position_same_signature_is_idempotent() {
+        let mgr = tiny_limit_manager();
+        let pos = confirmed_position("mintB", "sigB", 1_000_000, 0.05);
+        assert_eq!(mgr.record_confirmed_position(pos.clone()).await.unwrap(), true);
+        // Same mint + same signature => no-op false.
+        assert_eq!(mgr.record_confirmed_position(pos).await.unwrap(), false);
+        assert_eq!(mgr.position_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_record_confirmed_position_different_signature_does_not_overwrite() {
+        let mgr = tiny_limit_manager();
+        let first = confirmed_position("mintC", "sigC1", 1_000_000, 0.05);
+        assert_eq!(mgr.record_confirmed_position(first).await.unwrap(), true);
+
+        let second = confirmed_position("mintC", "sigC2", 2_000_000, 0.09);
+        assert!(mgr.record_confirmed_position(second).await.is_err());
+
+        // Original untouched.
+        let stored = mgr.get_position("mintC").await.unwrap();
+        assert_eq!(stored.entry_signature, "sigC1");
+        assert_eq!(stored.token_amount, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_close_rejects_oversell_without_mutation() {
+        let mgr = tiny_limit_manager();
+        let pos = confirmed_position("mintD", "sigD", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        let res = mgr
+            .close_position_reconciled("mintD", "exitD", 101, 0.5)
+            .await;
+        assert!(res.is_err());
+
+        let stored = mgr.get_position("mintD").await.unwrap();
+        assert_eq!(stored.token_amount, 100);
+        assert!((stored.total_cost_sol - 1.0).abs() < 1e-12);
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_partial_close_uses_actual_ratio_and_proceeds() {
+        let mgr = tiny_limit_manager();
+        let pos = confirmed_position("mintE", "sigE", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        // Sell 40 of 100 for 0.6 SOL. cost_basis = 1.0 * 0.4 = 0.4, pnl = +0.2.
+        let res = mgr
+            .close_position_reconciled("mintE", "exitE", 40, 0.6)
+            .await
+            .unwrap();
+
+        assert!(!res.already_applied);
+        assert!(!res.fully_closed);
+        assert_eq!(res.sold_amount, 40);
+        assert!((res.pnl_sol - 0.2).abs() < 1e-9);
+        assert_eq!(res.remaining_amount, 60);
+        assert!((res.remaining_cost_sol - 0.6).abs() < 1e-9);
+
+        let stored = mgr.get_position("mintE").await.unwrap();
+        assert_eq!(stored.token_amount, 60);
+        assert!((stored.total_cost_sol - 0.6).abs() < 1e-9);
+
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_partial_close_is_idempotent_by_signature() {
+        let mgr = tiny_limit_manager();
+        let pos = confirmed_position("mintF", "sigF", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        let first = mgr
+            .close_position_reconciled("mintF", "exitF", 40, 0.6)
+            .await
+            .unwrap();
+        assert!(!first.already_applied);
+
+        // Replay same signature: no-op, no P&L, no stats change.
+        let replay = mgr
+            .close_position_reconciled("mintF", "exitF", 40, 0.6)
+            .await
+            .unwrap();
+        assert!(replay.already_applied);
+        assert_eq!(replay.pnl_sol, 0.0);
+        assert_eq!(replay.sold_amount, 0);
+        assert_eq!(replay.remaining_amount, 60);
+        assert!((replay.remaining_cost_sol - 0.6).abs() < 1e-9);
+
+        let stored = mgr.get_position("mintF").await.unwrap();
+        assert_eq!(stored.token_amount, 60);
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_full_close_removes_position() {
+        let mgr = tiny_limit_manager();
+        let pos = confirmed_position("mintG", "sigG", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        let res = mgr
+            .close_position_reconciled("mintG", "exitG", 100, 1.5)
+            .await
+            .unwrap();
+
+        assert!(res.fully_closed);
+        assert!((res.pnl_sol - 0.5).abs() < 1e-9);
+        assert_eq!(res.remaining_amount, 0);
+        assert_eq!(res.remaining_cost_sol, 0.0);
+        assert!(mgr.get_position("mintG").await.is_none());
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_close_allows_negative_net_received() {
+        let mgr = tiny_limit_manager();
+        let pos = confirmed_position("mintH", "sigH", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        // Negative net proceeds are allowed (e.g. fees exceed proceeds).
+        let res = mgr
+            .close_position_reconciled("mintH", "exitH", 100, -0.05)
+            .await
+            .unwrap();
+
+        assert!(res.fully_closed);
+        // pnl = -0.05 - 1.0 = -1.05
+        assert!((res.pnl_sol - (-1.05)).abs() < 1e-9);
+        assert_eq!(mgr.get_daily_stats().await.losing_trades, 1);
     }
 }

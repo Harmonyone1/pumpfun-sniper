@@ -1027,6 +1027,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             symbol: token.symbol.clone(),
                                             bonding_curve: token.bonding_curve_key.clone(),
                                             token_amount: actual_tokens, // Use ACTUAL tokens, not estimate
+                                            token_decimals: None,
                                             entry_price: estimated_price,
                                             total_cost_sol: final_amount_sol,
                                             entry_time: chrono::Utc::now(),
@@ -1039,6 +1040,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             kill_switch_triggered: false,
                                             kill_switch_reason: None,
                                             wallet_pubkey: keypair.pubkey().to_string(),
+                                            applied_exit_signatures: vec![],
                                         };
 
                                         if let Err(e) = position_manager.open_position(position).await {
@@ -3326,6 +3328,7 @@ pub async fn hot_scan(
                                         symbol: token.symbol.clone(),
                                         bonding_curve: String::new(), // Not available from DexScreener
                                         token_amount: estimated_tokens,
+                                        token_decimals: None,
                                         entry_price: token.price_native,
                                         total_cost_sol: final_buy_amount,
                                         entry_time: chrono::Utc::now(),
@@ -3339,6 +3342,7 @@ pub async fn hot_scan(
                                         kill_switch_triggered: false,
                                         kill_switch_reason: None,
                                         wallet_pubkey: trading_keypair.pubkey().to_string(),
+                                        applied_exit_signatures: vec![],
                                     };
 
                                     if let Err(e) = position_manager.open_position(position).await {
