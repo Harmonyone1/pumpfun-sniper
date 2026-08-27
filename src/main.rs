@@ -108,7 +108,7 @@ enum Commands {
         interval: u64,
     },
 
-    /// Scan DexScreener for hot tokens with momentum (uses Survivor Mode validation)
+    /// Scan DexScreener for hot tokens with momentum
     HotScan {
         /// Minimum 5-minute price change percentage
         #[arg(long, default_value = "10.0")]
