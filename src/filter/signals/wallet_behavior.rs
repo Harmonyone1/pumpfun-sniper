@@ -367,12 +367,12 @@ mod tests {
         // Add wallet with history
         let history = WalletHistory {
             address: "test_wallet".to_string(),
-            first_transaction: Some(Utc::now() - chrono::Duration::days(100)),
-            total_transactions: 150,
-            pump_fun_transactions: 50,
+            first_seen: Some(Utc::now() - chrono::Duration::days(100)),
+            total_trades: 150,
+            winning_trades: 100,
+            total_volume_sol: 25.0,
             tokens_deployed: 5,
             tokens_traded: 20,
-            win_rate: 0.65,
             avg_holding_time_secs: 300,
             deployed_rug_count: 0,
             associated_wallets: vec![],

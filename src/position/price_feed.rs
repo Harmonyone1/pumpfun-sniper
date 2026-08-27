@@ -309,6 +309,7 @@ mod tests {
             stop_loss_pct: 30.0,
             partial_take_profit: false,
             price_poll_interval_ms: 1000,
+            ..crate::config::Config::default().auto_sell
         }
     }
 

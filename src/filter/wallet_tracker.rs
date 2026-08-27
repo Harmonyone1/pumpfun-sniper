@@ -127,6 +127,7 @@ mod tests {
             enabled: true,
             wallets: vec!["DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK".to_string()],
             priority_boost: true,
+            ..crate::config::Config::default().wallet_tracking
         }
     }
 
@@ -147,6 +148,7 @@ mod tests {
             enabled: true,
             wallets: vec![],
             priority_boost: true,
+            ..crate::config::Config::default().wallet_tracking
         })
         .unwrap();
 
