@@ -5,6 +5,7 @@ use dialoguer::Confirm;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -22,6 +23,10 @@ use crate::stream::pumpportal::{PumpPortalClient, PumpPortalEvent};
 #[cfg(feature = "shredstream")]
 use crate::stream::shredstream::ShredStreamClient;
 use crate::trading::pumpportal_api::PumpPortalTrader;
+use crate::trading::{
+    PendingBuyContext, PendingExecution, PendingExecutionStore, PendingSellContext,
+    PendingSellIntent, ReconciliationOutcome, ReconciliationSide, TradeReconciler,
+};
 
 /// Query actual token balance for a wallet and mint
 /// Returns the token balance or 0 if not found
@@ -144,6 +149,51 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     // Initialize trader based on configuration
     // Force Local API if configured (0.5% fee vs 1% for Lightning)
     let use_local_api = config.pumpportal.api_key.is_empty() || config.pumpportal.force_local_api;
+
+    // Exact execution-wallet resolution. Lightning and Local execution wallets are
+    // NOT interchangeable (INV-WALLET-001). We never fall back to the local keypair
+    // for a Lightning execution wallet.
+    let primary_execution_wallet: Option<Pubkey> = if use_local_api {
+        // Local mode signs with the local keypair.
+        Some(keypair.pubkey())
+    } else if !dry_run && config.pumpportal.use_for_trading {
+        // Live Lightning mode: the configured lightning wallet must be present and
+        // valid. Fail closed BEFORE any listening/trading if it is not.
+        let lw = config.pumpportal.lightning_wallet.trim();
+        if lw.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Lightning execution requires config.pumpportal.lightning_wallet to be set; refusing to trade"
+            ));
+        }
+        match Pubkey::from_str(lw) {
+            Ok(pk) => {
+                info!("Lightning execution wallet: {}", pk);
+                Some(pk)
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Lightning execution wallet is not a valid Pubkey: {}",
+                    e
+                ));
+            }
+        }
+    } else {
+        // Dry-run or non-trading: attempt to parse for logging, but only warn.
+        let lw = config.pumpportal.lightning_wallet.trim();
+        if lw.is_empty() {
+            warn!("No lightning_wallet configured (dry-run/non-trading) - execution wallet unresolved");
+            None
+        } else {
+            match Pubkey::from_str(lw) {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    warn!("lightning_wallet is not a valid Pubkey (dry-run/non-trading): {}", e);
+                    None
+                }
+            }
+        }
+    };
+
     let pumpportal_trader = if config.pumpportal.use_for_trading {
         info!("Using PumpPortal API for trading");
         if use_local_api {
@@ -207,6 +257,36 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     ));
     if let Err(e) = position_manager.load().await {
         warn!("Could not load positions: {} (starting fresh)", e);
+    }
+
+    // Initialize the trade reconciler (001A). Uses the default reviewed config
+    // (250ms polling / 15s timeout) - do not change here.
+    let trade_reconciler = Arc::new(TradeReconciler::new(rpc_client.clone()));
+
+    // Initialize the persistent pending-execution journal. A submitted signature is
+    // submission identity, not fill proof (INV-TX-001); the journal records
+    // in-flight signatures so unresolved state survives restarts.
+    let pending_path = format!(
+        "{}/pending_executions.json",
+        config.wallet.credentials_dir
+    );
+    let pending_executions = Arc::new(PendingExecutionStore::new(pending_path));
+    pending_executions.load().await?;
+
+    // Fail-closed halt flag for NEW entries. Set when unresolved transaction state
+    // exists; 001C owns recovery/unhalt semantics.
+    let new_entries_halted = Arc::new(AtomicBool::new(false));
+
+    // If the journal is non-empty at startup, an earlier run left unresolved
+    // submitted execution(s). We do NOT recover/reconcile/delete them here (that is
+    // 001C). We halt new entries and continue so existing positions can still exit.
+    let pending_at_startup = pending_executions.len().await;
+    if pending_at_startup > 0 {
+        error!(
+            "Found {} unresolved submitted execution(s).\nNew entries are HALTED.\nP0-TRANSACTION-TRUTH-001C startup reconciliation is required.",
+            pending_at_startup
+        );
+        new_entries_halted.store(true, Ordering::SeqCst);
     }
 
     // Initialize kill-switch evaluator
@@ -624,6 +704,16 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             token.market_cap_sol
                         );
 
+                        // Fail-closed new-entry halt gate. Independent of daily loss,
+                        // strategy pause, and filters. Blocks NEW live buys when
+                        // unresolved transaction state requires reconciliation.
+                        if !dry_run && new_entries_halted.load(Ordering::SeqCst) {
+                            warn!(
+                                "New entries halted because unresolved transaction state requires reconciliation"
+                            );
+                            continue;
+                        }
+
                         // Apply filters
                         if config.filters.enabled {
                             use crate::filter::token_filter::FilterResult;
@@ -954,6 +1044,26 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     }
                                 }
 
+                                // Pre-send PositionManager capacity/risk check (INV-POS-008).
+                                // Must run immediately before submission and is separate from
+                                // record_confirmed_position (which runs post-fill).
+                                if let Err(e) = position_manager.can_open_position(final_amount_sol).await {
+                                    warn!(
+                                        "PositionManager pre-trade risk check blocked {}: {}",
+                                        token.symbol, e
+                                    );
+                                    continue;
+                                }
+
+                                // Compute entry_type from the adaptive recommendation BEFORE
+                                // building any pending context or position.
+                                let entry_type = match entry_recommendation {
+                                    Recommendation::StrongBuy => crate::position::manager::EntryType::StrongBuy,
+                                    Recommendation::Opportunity => crate::position::manager::EntryType::Opportunity,
+                                    Recommendation::Probe => crate::position::manager::EntryType::Probe,
+                                    _ => crate::position::manager::EntryType::Legacy,
+                                };
+
                                 info!("Buying {} SOL of {} ({})...", final_amount_sol, token.symbol, mint);
 
                                 // Use buy_local for Local API, buy for Lightning API
@@ -968,123 +1078,253 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                                 match buy_result {
                                     Ok(signature) => {
-                                        info!("Buy successful! Signature: {}", signature);
+                                        // A returned signature is submission identity, NOT fill
+                                        // proof (INV-TX-001). Do not call this "successful".
+                                        info!("BUY SUBMITTED: {} - signature {}", token.symbol, signature);
                                         info!("View on Solscan: https://solscan.io/tx/{}", signature);
 
-                                        // CRITICAL: Verify tokens were actually received before recording position
-                                        // Wait for transaction to confirm
-                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-                                        // Determine which wallet to check based on API mode
-                                        let check_wallet = if use_local_api {
-                                            keypair.pubkey()
-                                        } else {
-                                            // For Lightning API, use the lightning wallet
-                                            Pubkey::from_str(&config.pumpportal.lightning_wallet)
-                                                .unwrap_or(keypair.pubkey())
-                                        };
-
-                                        let actual_tokens = query_token_balance(&rpc_client, &check_wallet, mint);
-
-                                        if actual_tokens == 0 {
-                                            // Transaction may have failed - DON'T record position
-                                            error!(
-                                                "BUY VERIFICATION FAILED: No tokens received for {} ({}) after 2s wait. TX may have failed silently. NOT recording position.",
-                                                token.symbol, mint
-                                            );
-                                            error!("Check transaction on Solscan: https://solscan.io/tx/{}", signature);
-                                            // Measurement: confirmed-but-no-tokens is a real execution failure.
-                                            if let Some(ref engine) = strategy_engine {
-                                                engine.write().await.record_tx_failure(
-                                                    mint, true, final_amount_sol, buy_latency_ms,
-                                                    "buy verification: zero token balance after existing verification wait",
-                                                ).await;
+                                        // Resolve the exact execution wallet. Never invent a local
+                                        // wallet on a live path.
+                                        let execution_wallet = match primary_execution_wallet {
+                                            Some(pk) => pk,
+                                            None => {
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "STRUCTURAL: buy submitted for {} (sig {}) but execution wallet is unresolved; halting new entries",
+                                                    token.symbol, signature
+                                                );
+                                                continue;
                                             }
-                                            // Skip position recording and kill-switch setup
-                                            continue;
-                                        }
-
-                                        info!("BUY VERIFIED: Received {} tokens for {}", actual_tokens, token.symbol);
-
-                                        // Record position with ACTUAL token amount (not estimate)
-                                        let estimated_price = if token.v_tokens_in_bonding_curve > 0 {
-                                            token.v_sol_in_bonding_curve as f64 / token.v_tokens_in_bonding_curve as f64
-                                        } else {
-                                            0.000001 // fallback
                                         };
+                                        let wallet_string = execution_wallet.to_string();
 
-                                        // Convert recommendation to EntryType for context-aware exits
-                                        let entry_type = match entry_recommendation {
-                                            Recommendation::StrongBuy => crate::position::manager::EntryType::StrongBuy,
-                                            Recommendation::Opportunity => crate::position::manager::EntryType::Opportunity,
-                                            Recommendation::Probe => crate::position::manager::EntryType::Probe,
-                                            _ => crate::position::manager::EntryType::Legacy,
-                                        };
-
-                                        let position = crate::position::manager::Position {
-                                            mint: token.mint.clone(),
-                                            name: token.name.clone(),
-                                            symbol: token.symbol.clone(),
-                                            bonding_curve: token.bonding_curve_key.clone(),
-                                            token_amount: actual_tokens, // Use ACTUAL tokens, not estimate
-                                            token_decimals: None,
-                                            entry_price: estimated_price,
-                                            total_cost_sol: final_amount_sol,
-                                            entry_time: chrono::Utc::now(),
-                                            entry_signature: signature.clone(),
-                                            entry_type,
-                                            quick_profit_taken: false,
-                                            second_profit_taken: false,
-                                            peak_price: estimated_price,
-                                            current_price: estimated_price,
-                                            kill_switch_triggered: false,
-                                            kill_switch_reason: None,
-                                            wallet_pubkey: keypair.pubkey().to_string(),
-                                            applied_exit_signatures: vec![],
-                                        };
-
-                                        if let Err(e) = position_manager.open_position(position).await {
-                                            error!("Failed to record position: {}", e);
-                                        }
-
-                                        // Start kill-switch monitoring for this position
-                                        if let Some(ref evaluator) = kill_switch_evaluator {
-                                            // Creator is the trader_public_key for new tokens
-                                            let creator = token.trader_public_key.clone();
-                                            // TODO: Fetch top holders from Helius for holder_watcher
-                                            // For now, we just track the deployer
-                                            evaluator.watch_position(&token.mint, &creator, vec![]);
-                                            info!(
-                                                "Kill-switch monitoring active for {} (creator: {})",
-                                                &token.mint[..12], &creator[..8]
+                                        // Persist the submitted signature BEFORE treating it as
+                                        // filled (INV-TX-015).
+                                        let pending = PendingExecution::buy(
+                                            signature.clone(),
+                                            token.mint.clone(),
+                                            wallet_string.clone(),
+                                            PendingBuyContext {
+                                                name: token.name.clone(),
+                                                symbol: token.symbol.clone(),
+                                                bonding_curve: token.bonding_curve_key.clone(),
+                                                entry_type,
+                                                requested_sol: final_amount_sol,
+                                            },
+                                        );
+                                        if let Err(e) = pending_executions.upsert(pending).await {
+                                            // Serious state-integrity failure: the tx was already
+                                            // sent. Halt new entries, still attempt immediate
+                                            // reconciliation, never send another buy.
+                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                            error!(
+                                                "Failed to persist pending buy for {} (sig {}): {} - halting new entries; still reconciling",
+                                                token.symbol, signature, e
                                             );
                                         }
 
-                                        // Record entry in strategy engine
-                                        if let Some(ref engine) = strategy_engine {
-                                            let strategy_position = crate::strategy::types::Position {
-                                                mint: token.mint.clone(),
-                                                entry_price: estimated_price,
-                                                entry_time: chrono::Utc::now(),
-                                                size_sol: final_amount_sol,
-                                                tokens_held: actual_tokens,
-                                                strategy: config.strategy.default_strategy.clone(),
-                                                exit_style: crate::strategy::types::ExitStyle::default(),
-                                                highest_price: estimated_price,
-                                                lowest_price: estimated_price,
-                                                exit_levels_hit: vec![],
-                                            };
-                                            engine.write().await.record_entry(strategy_position).await;
-                                            // Measurement: verified fill. Unpriced — the bot does not
-                                            // parse real fill prices, so NO slippage sample is created.
-                                            engine.write().await.record_verified_execution_unpriced(
-                                                &token.mint, true, final_amount_sol, buy_latency_ms, &signature,
-                                            ).await;
+                                        // Reconcile the submitted signature. No sleep before the call.
+                                        let outcome = trade_reconciler
+                                            .reconcile(
+                                                &signature,
+                                                &wallet_string,
+                                                mint,
+                                                ReconciliationSide::Buy,
+                                            )
+                                            .await;
+
+                                        match outcome {
+                                            Ok(ReconciliationOutcome::ConfirmedFailure { error, observed_after_ms, .. }) => {
+                                                // Real fill-rate failure sample.
+                                                match pending_executions.remove(&signature).await {
+                                                    Ok(_) => {}
+                                                    Err(e) => {
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "Failed to remove pending buy after ConfirmedFailure (sig {}): {} - halting new entries",
+                                                            signature, e
+                                                        );
+                                                    }
+                                                }
+                                                let total_latency_ms = buy_start.elapsed().as_millis() as u64;
+                                                error!(
+                                                    "BUY CONFIRMED FAILED for {} (sig {}): {} ({}ms observed)",
+                                                    token.symbol, signature, error, observed_after_ms
+                                                );
+                                                if let Some(ref engine) = strategy_engine {
+                                                    engine.write().await.record_tx_failure(
+                                                        mint, true, final_amount_sol, total_latency_ms, &error,
+                                                    ).await;
+                                                }
+                                                continue;
+                                            }
+                                            Ok(ReconciliationOutcome::Unresolved { reason, .. }) => {
+                                                // Timeout/observation gap is NOT a failed fill
+                                                // (INV-TX-014). Keep pending, halt new entries.
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, new entries HALTED",
+                                                    mint, signature, wallet_string, reason
+                                                );
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                // Structural observer failure is not tx-failure proof.
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "CRITICAL: buy reconciliation error for {} (sig {}): {} - pending kept, new entries HALTED",
+                                                    token.symbol, signature, e
+                                                );
+                                                continue;
+                                            }
+                                            Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+                                                // Validate exact identity at the live boundary.
+                                                if fill.side != ReconciliationSide::Buy
+                                                    || fill.wallet != wallet_string
+                                                    || fill.mint != *mint
+                                                {
+                                                    new_entries_halted.store(true, Ordering::SeqCst);
+                                                    error!(
+                                                        "CRITICAL: reconciled buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept, new entries HALTED",
+                                                        signature
+                                                    );
+                                                    continue;
+                                                }
+
+                                                // Extract canonical fill economics via pure helper.
+                                                let (token_amount_raw, _token_decimals, actual_cost_sol, actual_entry_price) =
+                                                    match primary_buy_fill_values(&fill) {
+                                                        Ok(v) => v,
+                                                        Err(e) => {
+                                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                                            error!(
+                                                                "CRITICAL: reconciled buy fill conversion failed for sig {}: {} - pending kept, new entries HALTED",
+                                                                signature, e
+                                                            );
+                                                            continue;
+                                                        }
+                                                    };
+
+                                                let entry_time = fill
+                                                    .block_time
+                                                    .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
+                                                    .unwrap_or_else(chrono::Utc::now);
+
+                                                info!(
+                                                    "BUY CONFIRMED: {} (sig {}) raw_tokens={} decimals={} cost={:.9} SOL price={:.12} SOL/token wait={}ms",
+                                                    token.symbol,
+                                                    signature,
+                                                    token_amount_raw,
+                                                    fill.token_decimals,
+                                                    actual_cost_sol,
+                                                    actual_entry_price,
+                                                    fill.reconciliation_wait_ms
+                                                );
+
+                                                // Canonical confirmed-owned position from actuals.
+                                                let position = crate::position::manager::Position {
+                                                    mint: token.mint.clone(),
+                                                    name: token.name.clone(),
+                                                    symbol: token.symbol.clone(),
+                                                    bonding_curve: token.bonding_curve_key.clone(),
+                                                    token_amount: token_amount_raw,
+                                                    token_decimals: Some(fill.token_decimals),
+                                                    entry_price: actual_entry_price,
+                                                    total_cost_sol: actual_cost_sol,
+                                                    entry_time,
+                                                    entry_signature: fill.signature.clone(),
+                                                    entry_type,
+                                                    quick_profit_taken: false,
+                                                    second_profit_taken: false,
+                                                    peak_price: actual_entry_price,
+                                                    current_price: actual_entry_price,
+                                                    kill_switch_triggered: false,
+                                                    kill_switch_reason: None,
+                                                    wallet_pubkey: fill.wallet.clone(),
+                                                    applied_exit_signatures: vec![],
+                                                };
+
+                                                // Record confirmed ownership. NOT open_position.
+                                                let newly_applied = match position_manager
+                                                    .record_confirmed_position(position)
+                                                    .await
+                                                {
+                                                    Ok(applied) => applied,
+                                                    Err(e) => {
+                                                        // Confirmed on-chain but could not record.
+                                                        // Keep pending, halt; do not pretend failure.
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "Confirmed owned position could not be recorded for {} (sig {}): {} - pending kept, new entries HALTED",
+                                                            token.symbol, signature, e
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+
+                                                if newly_applied {
+                                                    // Kill-switch monitoring for the new position.
+                                                    if let Some(ref evaluator) = kill_switch_evaluator {
+                                                        let creator = token.trader_public_key.clone();
+                                                        evaluator.watch_position(&token.mint, &creator, vec![]);
+                                                        info!(
+                                                            "Kill-switch monitoring active for {} (creator: {})",
+                                                            &token.mint[..12], &creator[..8]
+                                                        );
+                                                    }
+
+                                                    // Strategy portfolio record_entry using actuals.
+                                                    if let Some(ref engine) = strategy_engine {
+                                                        let strategy_position = crate::strategy::types::Position {
+                                                            mint: token.mint.clone(),
+                                                            entry_price: actual_entry_price,
+                                                            entry_time,
+                                                            size_sol: actual_cost_sol,
+                                                            tokens_held: token_amount_raw,
+                                                            strategy: config.strategy.default_strategy.clone(),
+                                                            exit_style: crate::strategy::types::ExitStyle::default(),
+                                                            highest_price: actual_entry_price,
+                                                            lowest_price: actual_entry_price,
+                                                            exit_levels_hit: vec![],
+                                                        };
+                                                        engine.write().await.record_entry(strategy_position).await;
+
+                                                        // Reconciled-success execution feedback:
+                                                        // actual price, fill rate, latency, NO slippage.
+                                                        let total_execution_latency_ms =
+                                                            buy_start.elapsed().as_millis() as u64;
+                                                        engine.write().await.record_reconciled_execution(
+                                                            mint,
+                                                            true,
+                                                            final_amount_sol,
+                                                            actual_cost_sol,
+                                                            actual_entry_price,
+                                                            total_execution_latency_ms,
+                                                            &signature,
+                                                        ).await;
+                                                    }
+                                                } else {
+                                                    // Idempotent: same signature already applied.
+                                                    info!(
+                                                        "Confirmed buy for {} (sig {}) was already applied; skipping duplicate strategy entry",
+                                                        token.symbol, signature
+                                                    );
+                                                }
+
+                                                // Remove pending LAST, after all state applied.
+                                                if let Err(e) = pending_executions.remove(&signature).await {
+                                                    new_entries_halted.store(true, Ordering::SeqCst);
+                                                    error!(
+                                                        "Failed to remove pending buy after confirmed fill (sig {}): {} - halting new entries; position retained",
+                                                        signature, e
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Buy failed for {}: {}", token.symbol, e);
-                                        // Measurement: real provider submission failure.
+                                        // Provider submission error: no signature, no pending.
+                                        error!("Buy submission failed for {}: {}", token.symbol, e);
                                         if let Some(ref engine) = strategy_engine {
                                             engine.write().await.record_tx_failure(
                                                 mint, true, final_amount_sol, buy_latency_ms, &e.to_string(),
@@ -3529,6 +3769,62 @@ fn strategy_entry_size(action: &TradingAction) -> Option<f64> {
     }
 }
 
+/// Pure fill-validation boundary for the primary buy path. Extracts the canonical
+/// economics from a reconciled BUY fill without mutating any state.
+///
+/// Returns `(raw_tokens, decimals, positive_actual_cost_sol, positive_actual_price)`.
+/// The actual cost is `-wallet_sol_delta_sol()` (a buy spends SOL). The fee is NOT
+/// added again — the wallet SOL delta already includes all economic effects.
+fn primary_buy_fill_values(
+    fill: &crate::trading::ReconciledFill,
+) -> crate::error::Result<(u64, u8, f64, f64)> {
+    use crate::error::Error;
+
+    if fill.side != ReconciliationSide::Buy {
+        return Err(Error::TransactionReconciliation(
+            "primary_buy_fill_values: fill side is not Buy".to_string(),
+        ));
+    }
+
+    let token_amount_raw = fill.token_amount_raw().ok_or_else(|| {
+        Error::TransactionReconciliation(
+            "primary_buy_fill_values: raw token amount does not fit in u64".to_string(),
+        )
+    })?;
+    if token_amount_raw == 0 {
+        return Err(Error::TransactionReconciliation(
+            "primary_buy_fill_values: raw token amount is zero".to_string(),
+        ));
+    }
+
+    if fill.token_amount_ui() <= 0.0 {
+        return Err(Error::TransactionReconciliation(
+            "primary_buy_fill_values: UI token amount is not positive".to_string(),
+        ));
+    }
+
+    let wallet_delta = fill.wallet_sol_delta_sol();
+    if !(wallet_delta < 0.0) {
+        return Err(Error::TransactionReconciliation(
+            "primary_buy_fill_values: buy wallet SOL delta is not negative".to_string(),
+        ));
+    }
+    let actual_cost_sol = -wallet_delta;
+
+    let actual_entry_price = fill.effective_price_sol_per_token().ok_or_else(|| {
+        Error::TransactionReconciliation(
+            "primary_buy_fill_values: effective price unavailable".to_string(),
+        )
+    })?;
+    if !actual_entry_price.is_finite() || actual_entry_price <= 0.0 {
+        return Err(Error::TransactionReconciliation(
+            "primary_buy_fill_values: effective price is not finite/positive".to_string(),
+        ));
+    }
+
+    Ok((token_amount_raw, fill.token_decimals, actual_cost_sol, actual_entry_price))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3567,5 +3863,50 @@ mod tests {
             }),
             None
         );
+    }
+
+    fn synthetic_buy_fill() -> crate::trading::ReconciledFill {
+        // 6-decimal fixture is ONLY a test input; the helper must read decimals
+        // from the fill, not hard-code them.
+        crate::trading::ReconciledFill {
+            signature: "sig-buy".to_string(),
+            slot: 100,
+            block_time: Some(1_700_000_000),
+            wallet: "WalletPubkey1111111111111111111111111111111".to_string(),
+            mint: "Mint1111111111111111111111111111111111111111".to_string(),
+            side: ReconciliationSide::Buy,
+            // +1_500_000 raw tokens received.
+            token_delta_raw: 1_500_000,
+            token_decimals: 6,
+            // Wallet spent 0.03 SOL net (negative delta). 0.03 SOL = 30_000_000 lamports.
+            wallet_sol_delta_lamports: -30_000_000,
+            fee_lamports: 5_000,
+            reconciliation_wait_ms: 250,
+        }
+    }
+
+    #[test]
+    fn test_primary_buy_fill_values_use_raw_amount_decimals_and_wallet_delta() {
+        let fill = synthetic_buy_fill();
+        let (raw, decimals, cost, price) =
+            primary_buy_fill_values(&fill).expect("valid buy fill");
+
+        // Raw amount preserved exactly.
+        assert_eq!(raw, 1_500_000);
+        // Decimals come from the fill, not hard-coded logic.
+        assert_eq!(decimals, 6);
+        // Cost uses the wallet SOL delta (0.03 SOL), and the fee is NOT added again.
+        assert!((cost - 0.03).abs() < 1e-12, "cost was {}", cost);
+        assert!(cost < 0.03 + fill.fee_sol());
+        // Price = cost / UI amount = 0.03 / 1.5 = 0.02.
+        assert!((price - 0.02).abs() < 1e-12, "price was {}", price);
+    }
+
+    #[test]
+    fn test_primary_buy_fill_rejects_wrong_side() {
+        let mut fill = synthetic_buy_fill();
+        fill.side = ReconciliationSide::Sell;
+        // A sell fill passed into the buy helper must error.
+        assert!(primary_buy_fill_values(&fill).is_err());
     }
 }
