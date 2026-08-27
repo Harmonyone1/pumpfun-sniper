@@ -586,6 +586,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 continue;
                             }
 
+                            let sell_start = std::time::Instant::now();
                             let sell_result: Result<String, crate::error::Error> = if monitor_use_local_api {
                                 // Local API mode: always use sell_local (no wasted Lightning attempts)
                                 info!("Attempting LOCAL API sell (attempt {})", attempts);
@@ -687,6 +688,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         "AUTO-SELL FAILED for {} (attempt {}): {}",
                                         position.symbol, attempts, e
                                     );
+                                    // Measurement: failed sells are a honeypot/exit-risk signal.
+                                    if let Some(ref engine) = monitor_engine {
+                                        let sell_latency_ms = sell_start.elapsed().as_millis() as u64;
+                                        engine.write().await.record_tx_failure(
+                                            &position.mint, false, position.total_cost_sol,
+                                            sell_latency_ms, &e.to_string(),
+                                        ).await;
+                                    }
                                 }
                             }
                         }
@@ -1062,11 +1071,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 info!("Buying {} SOL of {} ({})...", final_amount_sol, token.symbol, mint);
 
                                 // Use buy_local for Local API, buy for Lightning API
+                                let buy_start = std::time::Instant::now();
                                 let buy_result = if use_local_api {
                                     trader.buy_local(mint, final_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client).await
                                 } else {
                                     trader.buy(mint, final_amount_sol, slippage_pct, priority_fee).await
                                 };
+                                // Real submission->result latency (excludes the later balance-poll loop).
+                                let buy_latency_ms = buy_start.elapsed().as_millis() as u64;
 
                                 match buy_result {
                                     Ok(signature) => {
@@ -1109,6 +1121,15 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 token.symbol, mint, max_verification_attempts * 2
                                             );
                                             error!("Check transaction on Solscan: https://solscan.io/tx/{}", signature);
+                                            // Measurement: a confirmed-but-no-tokens buy is a real execution
+                                            // failure (likely honeypot / failed fill). Feed it to the
+                                            // execution-feedback + chain-health tracker.
+                                            if let Some(ref engine) = strategy_engine {
+                                                engine.write().await.record_tx_failure(
+                                                    mint, true, final_amount_sol, buy_latency_ms,
+                                                    "buy verification: no tokens received",
+                                                ).await;
+                                            }
                                             // Add to banlist to prevent re-buying this mint
                                             {
                                                 let mut guard = failed_verification_mints.lock().await;
@@ -1191,10 +1212,27 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 exit_levels_hit: vec![],
                                             };
                                             engine.write().await.record_entry(strategy_position).await;
+                                            // Measurement: record the successful fill for latency + fill-rate
+                                            // tracking (feeds chain_health). NOTE: expected/actual price are
+                                            // both the estimate here — the bot does not yet parse real fill
+                                            // prices, so slippage is not measured. Wire real fill-price
+                                            // parsing before trusting execution_feedback's slippage output.
+                                            engine.write().await.record_execution(
+                                                &token.mint, true, final_amount_sol,
+                                                estimated_price, estimated_price,
+                                                buy_latency_ms, &signature,
+                                            ).await;
                                         }
                                     }
                                     Err(e) => {
                                         error!("Buy failed for {}: {}", token.symbol, e);
+                                        // Measurement: real submission failure (RPC/slippage/etc.).
+                                        if let Some(ref engine) = strategy_engine {
+                                            engine.write().await.record_tx_failure(
+                                                mint, true, final_amount_sol, buy_latency_ms,
+                                                &e.to_string(),
+                                            ).await;
+                                        }
                                     }
                                 }
                             }
