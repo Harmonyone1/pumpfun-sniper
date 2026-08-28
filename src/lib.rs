@@ -7,6 +7,7 @@ pub mod config;
 pub mod dexscreener;
 pub mod error;
 pub mod filter;
+pub mod market;
 pub mod position;
 pub mod pump;
 pub mod strategy;
