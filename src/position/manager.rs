@@ -276,12 +276,49 @@ pub struct ReconciledCloseResult {
     pub remaining_cost_sol: f64,
 }
 
+/// A durable, canonical record of an applied exit (partial or full).
+///
+/// Keyed in the ledger by `signature`. This is the source of truth for
+/// crash-safe idempotent replay: it survives even after the underlying
+/// `Position` is removed on a full close.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedExitReceipt {
+    pub signature: String,
+    pub mint: String,
+    pub sold_amount: u64,
+    pub received_sol: f64,
+    pub pnl_sol: f64,
+    pub fully_closed: bool,
+    pub remaining_amount: u64,
+    pub remaining_cost_sol: f64,
+}
+
+/// Versioned on-disk snapshot: positions plus the applied-exit receipt ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PositionStoreSnapshot {
+    version: u32,
+    positions: HashMap<String, Position>,
+    #[serde(default)]
+    applied_exit_receipts: HashMap<String, AppliedExitReceipt>,
+}
+
+/// Backward-compatible on-disk representation. New snapshots are the tagged
+/// `PositionStoreSnapshot`; legacy files are a bare `HashMap<String, Position>`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PositionStoreOnDisk {
+    Snapshot(PositionStoreSnapshot),
+    Legacy(HashMap<String, Position>),
+}
+
 /// Position manager
 pub struct PositionManager {
     positions: Arc<RwLock<HashMap<String, Position>>>,
     daily_stats: Arc<RwLock<DailyStats>>,
     safety_config: SafetyConfig,
     persistence_path: Option<String>,
+    /// Canonical ledger of applied exits, keyed by exit signature.
+    applied_exit_receipts: Arc<RwLock<HashMap<String, AppliedExitReceipt>>>,
 }
 
 impl PositionManager {
@@ -292,10 +329,71 @@ impl PositionManager {
             daily_stats: Arc::new(RwLock::new(DailyStats::new())),
             safety_config,
             persistence_path,
+            applied_exit_receipts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Load positions from disk
+    /// Validate a single applied-exit receipt (called on load). Live-money
+    /// accounting: a malformed ledger must fail the load rather than silently
+    /// corrupt recovery.
+    fn validate_receipt(key: &str, r: &AppliedExitReceipt) -> Result<()> {
+        if key != r.signature {
+            return Err(Error::PositionPersistence(format!(
+                "receipt ledger key {} does not match receipt.signature {}",
+                key, r.signature
+            )));
+        }
+        if r.signature.is_empty() {
+            return Err(Error::PositionPersistence(
+                "applied exit receipt has empty signature".to_string(),
+            ));
+        }
+        if r.mint.is_empty() {
+            return Err(Error::PositionPersistence(format!(
+                "applied exit receipt {} has empty mint",
+                r.signature
+            )));
+        }
+        if r.sold_amount == 0 {
+            return Err(Error::PositionPersistence(format!(
+                "applied exit receipt {} has sold_amount == 0",
+                r.signature
+            )));
+        }
+        if !r.received_sol.is_finite() {
+            return Err(Error::PositionPersistence(format!(
+                "applied exit receipt {} has non-finite received_sol",
+                r.signature
+            )));
+        }
+        if !r.pnl_sol.is_finite() {
+            return Err(Error::PositionPersistence(format!(
+                "applied exit receipt {} has non-finite pnl_sol",
+                r.signature
+            )));
+        }
+        if !r.remaining_cost_sol.is_finite() || r.remaining_cost_sol < 0.0 {
+            return Err(Error::PositionPersistence(format!(
+                "applied exit receipt {} has invalid remaining_cost_sol",
+                r.signature
+            )));
+        }
+        if r.fully_closed && r.remaining_amount != 0 {
+            return Err(Error::PositionPersistence(format!(
+                "applied exit receipt {} is fully_closed but remaining_amount != 0",
+                r.signature
+            )));
+        }
+        if r.fully_closed && r.remaining_cost_sol != 0.0 {
+            return Err(Error::PositionPersistence(format!(
+                "applied exit receipt {} is fully_closed but remaining_cost_sol != 0",
+                r.signature
+            )));
+        }
+        Ok(())
+    }
+
+    /// Load positions (and the applied-exit receipt ledger) from disk.
     pub async fn load(&self) -> Result<()> {
         if let Some(path) = &self.persistence_path {
             if Path::new(path).exists() {
@@ -303,30 +401,67 @@ impl PositionManager {
                     .await
                     .map_err(|e| Error::PositionPersistence(e.to_string()))?;
 
-                let positions: HashMap<String, Position> = serde_json::from_str(&data)
+                let on_disk: PositionStoreOnDisk = serde_json::from_str(&data)
                     .map_err(|e| Error::PositionPersistence(e.to_string()))?;
 
-                let mut guard = self.positions.write().await;
-                *guard = positions;
+                let (positions, receipts) = match on_disk {
+                    PositionStoreOnDisk::Snapshot(snap) => {
+                        (snap.positions, snap.applied_exit_receipts)
+                    }
+                    PositionStoreOnDisk::Legacy(positions) => (positions, HashMap::new()),
+                };
 
-                info!("Loaded {} positions from {}", guard.len(), path);
+                // Validate receipt ledger before committing to in-memory state.
+                for (key, receipt) in &receipts {
+                    Self::validate_receipt(key, receipt)?;
+                }
+
+                let positions_len = positions.len();
+                let receipts_len = receipts.len();
+
+                {
+                    let mut guard = self.positions.write().await;
+                    *guard = positions;
+                }
+                {
+                    let mut guard = self.applied_exit_receipts.write().await;
+                    *guard = receipts;
+                }
+
+                info!(
+                    "Loaded {} positions and {} applied-exit receipts from {}",
+                    positions_len, receipts_len, path
+                );
             }
         }
         Ok(())
     }
 
-    /// Save positions to disk
+    /// Save positions and the receipt ledger to disk as a versioned snapshot.
     pub async fn save(&self) -> Result<()> {
         if let Some(path) = &self.persistence_path {
             let positions = self.positions.read().await;
-            let data = serde_json::to_string_pretty(&*positions)
+            let receipts = self.applied_exit_receipts.read().await;
+
+            let snapshot = PositionStoreSnapshot {
+                version: 1,
+                positions: positions.clone(),
+                applied_exit_receipts: receipts.clone(),
+            };
+
+            let data = serde_json::to_string_pretty(&snapshot)
                 .map_err(|e| Error::PositionPersistence(e.to_string()))?;
 
             tokio::fs::write(path, data)
                 .await
                 .map_err(|e| Error::PositionPersistence(e.to_string()))?;
 
-            debug!("Saved {} positions to {}", positions.len(), path);
+            debug!(
+                "Saved {} positions and {} receipts to {}",
+                positions.len(),
+                receipts.len(),
+                path
+            );
         }
         Ok(())
     }
@@ -439,6 +574,32 @@ impl PositionManager {
             return Err(Error::PositionAccounting("received_sol must be finite".to_string()));
         }
 
+        // Crash-safe durable idempotency: consult the canonical receipt ledger
+        // BEFORE touching positions. This survives even a full close that
+        // removed the underlying Position, so replay after removal is a no-op
+        // rather than a PositionNotFound.
+        {
+            let receipts = self.applied_exit_receipts.read().await;
+            if let Some(receipt) = receipts.get(exit_signature) {
+                if receipt.mint != mint {
+                    return Err(Error::PositionAccounting(format!(
+                        "exit signature {} already applied to mint {} but replayed for mint {}",
+                        exit_signature, receipt.mint, mint
+                    )));
+                }
+                // Already applied: mirror the receipt's remaining state, record
+                // no new P&L and mutate nothing.
+                return Ok(ReconciledCloseResult {
+                    pnl_sol: 0.0,
+                    fully_closed: false,
+                    already_applied: true,
+                    sold_amount: 0,
+                    remaining_amount: receipt.remaining_amount,
+                    remaining_cost_sol: receipt.remaining_cost_sol,
+                });
+            }
+        }
+
         // Result computed under the lock; stats/persist happen after unlocking.
         let (result, pnl_to_record, record_stats) = {
             let mut positions = self.positions.write().await;
@@ -507,6 +668,26 @@ impl PositionManager {
 
             (result, pnl, true)
         };
+
+        // Insert the canonical receipt into the ledger. This is the durable
+        // record used for crash-safe replay (canonical over per-Position
+        // applied_exit_signatures, which the partial path also updates).
+        {
+            let mut receipts = self.applied_exit_receipts.write().await;
+            receipts.insert(
+                exit_signature.to_string(),
+                AppliedExitReceipt {
+                    signature: exit_signature.to_string(),
+                    mint: mint.to_string(),
+                    sold_amount: result.sold_amount,
+                    received_sol,
+                    pnl_sol: result.pnl_sol,
+                    fully_closed: result.fully_closed,
+                    remaining_amount: result.remaining_amount,
+                    remaining_cost_sol: result.remaining_cost_sol,
+                },
+            );
+        }
 
         // Update daily stats exactly once (same path legacy close uses).
         if record_stats {
@@ -663,6 +844,12 @@ impl PositionManager {
     pub async fn get_position(&self, mint: &str) -> Option<Position> {
         let positions = self.positions.read().await;
         positions.get(mint).cloned()
+    }
+
+    /// Get an applied-exit receipt by exit signature (read-only).
+    pub async fn get_applied_exit_receipt(&self, signature: &str) -> Option<AppliedExitReceipt> {
+        let receipts = self.applied_exit_receipts.read().await;
+        receipts.get(signature).cloned()
     }
 
     /// Get all positions
@@ -991,5 +1178,214 @@ mod tests {
         // pnl = -0.05 - 1.0 = -1.05
         assert!((res.pnl_sol - (-1.05)).abs() < 1e-9);
         assert_eq!(mgr.get_daily_stats().await.losing_trades, 1);
+    }
+
+    /// Unique temp file path for a persistence-backed manager.
+    fn tmp_persistence_path(tag: &str) -> String {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("pumpfun_posstore_{}_{}.json", tag, nanos));
+        p.to_string_lossy().to_string()
+    }
+
+    fn manager_with_path(path: &str) -> PositionManager {
+        let cfg = SafetyConfig {
+            require_sell_confirmation: false,
+            max_position_sol: 100.0,
+            daily_loss_limit_sol: 100.0,
+            keypair_balance_warning_sol: 0.0,
+        };
+        PositionManager::new(cfg, Some(path.to_string()))
+    }
+
+    #[tokio::test]
+    async fn test_position_store_loads_legacy_hashmap_format() {
+        let path = tmp_persistence_path("legacy");
+
+        // Write a legacy bare HashMap<String, Position> JSON.
+        let mut legacy: HashMap<String, Position> = HashMap::new();
+        legacy.insert(
+            "mintLegacy".to_string(),
+            confirmed_position("mintLegacy", "sigLegacy", 1_000_000, 0.05),
+        );
+        let json = serde_json::to_string_pretty(&legacy).unwrap();
+        tokio::fs::write(&path, json).await.unwrap();
+
+        let mgr = manager_with_path(&path);
+        mgr.load().await.unwrap();
+
+        assert!(mgr.get_position("mintLegacy").await.is_some());
+        // Receipt ledger empty for legacy load.
+        assert!(mgr.get_applied_exit_receipt("sigLegacy").await.is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_position_store_round_trips_applied_exit_receipts() {
+        let path = tmp_persistence_path("roundtrip");
+
+        let mgr = manager_with_path(&path);
+        let pos = confirmed_position("mintRT", "sigRT", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        // Full close => receipt recorded and persisted.
+        let res = mgr
+            .close_position_reconciled("mintRT", "exitRT", 100, 1.5)
+            .await
+            .unwrap();
+        assert!(res.fully_closed);
+
+        // Reload into a fresh manager.
+        let mgr2 = manager_with_path(&path);
+        mgr2.load().await.unwrap();
+
+        // Position gone, receipt present.
+        assert!(mgr2.get_position("mintRT").await.is_none());
+        let receipt = mgr2.get_applied_exit_receipt("exitRT").await.unwrap();
+        assert_eq!(receipt.signature, "exitRT");
+        assert_eq!(receipt.mint, "mintRT");
+        assert!(receipt.fully_closed);
+        assert_eq!(receipt.remaining_amount, 0);
+        assert!((receipt.pnl_sol - 0.5).abs() < 1e-9);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_full_close_replay_is_idempotent_after_position_removed() {
+        let path = tmp_persistence_path("fullreplay");
+
+        let mgr = manager_with_path(&path);
+        let pos = confirmed_position("mintFR", "sigFR", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        let res = mgr
+            .close_position_reconciled("mintFR", "exitFR", 100, 1.5)
+            .await
+            .unwrap();
+        assert!(res.fully_closed);
+        assert!(mgr.get_position("mintFR").await.is_none());
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 1);
+
+        // Reload fresh (position absent, receipt present).
+        let mgr2 = manager_with_path(&path);
+        mgr2.load().await.unwrap();
+        assert!(mgr2.get_position("mintFR").await.is_none());
+
+        // Replay the same full close: already_applied, NOT PositionNotFound.
+        let replay = mgr2
+            .close_position_reconciled("mintFR", "exitFR", 100, 1.5)
+            .await
+            .unwrap();
+        assert!(replay.already_applied);
+        assert_eq!(replay.pnl_sol, 0.0);
+        assert_eq!(replay.sold_amount, 0);
+        assert_eq!(replay.remaining_amount, 0);
+        // Fresh manager's stats untouched by the replay (no new trade recorded).
+        assert_eq!(mgr2.get_daily_stats().await.total_trades, 0);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_reconciled_partial_close_replay_uses_global_receipt() {
+        let path = tmp_persistence_path("partialreplay");
+
+        let mgr = manager_with_path(&path);
+        let pos = confirmed_position("mintPR", "sigPR", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        let first = mgr
+            .close_position_reconciled("mintPR", "exitPR", 40, 0.6)
+            .await
+            .unwrap();
+        assert!(!first.already_applied);
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 1);
+
+        // Receipt present in the global ledger.
+        let receipt = mgr.get_applied_exit_receipt("exitPR").await.unwrap();
+        assert_eq!(receipt.remaining_amount, 60);
+
+        // Replay same signature => already_applied via global receipt, no 2nd mutation.
+        let replay = mgr
+            .close_position_reconciled("mintPR", "exitPR", 40, 0.6)
+            .await
+            .unwrap();
+        assert!(replay.already_applied);
+        assert_eq!(replay.pnl_sol, 0.0);
+        assert_eq!(replay.sold_amount, 0);
+        assert_eq!(replay.remaining_amount, 60);
+        assert!((replay.remaining_cost_sol - 0.6).abs() < 1e-9);
+
+        // No second trade recorded, position unchanged.
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 1);
+        let stored = mgr.get_position("mintPR").await.unwrap();
+        assert_eq!(stored.token_amount, 60);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_exit_signature_collision_with_different_mint_is_error() {
+        let path = tmp_persistence_path("collision");
+
+        let mgr = manager_with_path(&path);
+        // Establish a receipt for sig "exitX" on mint A via a real close.
+        let pos_a = confirmed_position("mintA", "sigA", 100, 1.0);
+        mgr.record_confirmed_position(pos_a).await.unwrap();
+        mgr.close_position_reconciled("mintA", "exitX", 100, 1.2)
+            .await
+            .unwrap();
+
+        // Now a different mint B replays the SAME exit signature => error.
+        let pos_b = confirmed_position("mintB", "sigB", 100, 1.0);
+        mgr.record_confirmed_position(pos_b).await.unwrap();
+        let res = mgr
+            .close_position_reconciled("mintB", "exitX", 100, 1.0)
+            .await;
+        assert!(matches!(res, Err(Error::PositionAccounting(_))));
+
+        // Mint B untouched.
+        let stored = mgr.get_position("mintB").await.unwrap();
+        assert_eq!(stored.token_amount, 100);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_invalid_applied_exit_receipt_fails_load() {
+        let path = tmp_persistence_path("invalidreceipt");
+
+        // Snapshot with an invalid receipt: fully_closed but remaining_amount != 0.
+        let mut receipts: HashMap<String, AppliedExitReceipt> = HashMap::new();
+        receipts.insert(
+            "exitBad".to_string(),
+            AppliedExitReceipt {
+                signature: "exitBad".to_string(),
+                mint: "mintBad".to_string(),
+                sold_amount: 100,
+                received_sol: 1.0,
+                pnl_sol: 0.0,
+                fully_closed: true,
+                remaining_amount: 5, // invalid: fully_closed => must be 0
+                remaining_cost_sol: 0.0,
+            },
+        );
+        let snapshot = PositionStoreSnapshot {
+            version: 1,
+            positions: HashMap::new(),
+            applied_exit_receipts: receipts,
+        };
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        tokio::fs::write(&path, json).await.unwrap();
+
+        let mgr = manager_with_path(&path);
+        assert!(mgr.load().await.is_err());
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }
