@@ -1756,13 +1756,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                         // KILL-SWITCH: Check sells on tokens we hold
                         if trade.tx_type == "sell" {
-                            // Check if we have a position in this token
-                            let positions = position_manager.get_all_positions().await;
-                            let our_position = positions.iter().find(|p| p.mint == trade.mint);
+                            // Check if we have a position in this token. Use a fresh
+                            // canonical snapshot (E3 parses its exact wallet identity).
+                            let our_position = position_manager.get_position(&trade.mint).await;
 
                             if let Some(position) = our_position {
-                                let position_token_amount = position.token_amount;
-
                                 if let Some(ref evaluator) = kill_switch_evaluator {
                                     let decision = evaluator.evaluate_sell(
                                         &trade.mint,
@@ -1779,60 +1777,344 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         );
 
                                         // Execute emergency sell if not dry run
-                                        if !dry_run {
-                                            if let Some(ref trader) = trader_arc {
-                                                let slippage_pct = config.trading.slippage_bps / 100;
-                                                let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
-
-                                                // Sell 100% immediately
-                                                info!(
-                                                    "Executing kill-switch sell for {} (urgency: {:?})",
-                                                    &trade.mint[..12], alert.urgency
-                                                );
-
-                                                let sell_result = if use_local_api {
-                                                    trader.sell_local(
-                                                        &trade.mint,
-                                                        "100%", // 100% sell
-                                                        slippage_pct,
-                                                        priority_fee,
-                                                        &keypair,
-                                                        &rpc_client,
-                                                    ).await
-                                                } else {
-                                                    trader.sell(&trade.mint, "100%", slippage_pct, priority_fee).await
-                                                };
-
-                                                match sell_result {
-                                                    Ok(sig) => {
-                                                        warn!(
-                                                            "KILL-SWITCH SELL EXECUTED: {} - sig: {}",
-                                                            alert.reason, sig
-                                                        );
-
-                                                        // Close position in manager (use position's token amount since we sold 100%)
-                                                        // Note: We don't know exact proceeds yet, estimate from current price
-                                                        let estimated_proceeds = position_token_amount as f64 * trade.market_cap_sol / 1_000_000_000.0;
-                                                        if let Err(e) = position_manager.close_position(&trade.mint, position_token_amount, estimated_proceeds).await {
-                                                            error!("Failed to close position after kill-switch: {}", e);
-                                                        }
-
-                                                        // Stop monitoring this position
-                                                        evaluator.unwatch_position(&trade.mint);
-                                                    }
-                                                    Err(e) => {
-                                                        error!(
-                                                            "KILL-SWITCH SELL FAILED for {}: {} - MANUAL EXIT NEEDED!",
-                                                            &trade.mint[..12], e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        } else {
+                                        if dry_run {
                                             warn!(
                                                 "DRY-RUN: Kill-switch would sell 100% of {} (reason: {})",
                                                 &trade.mint[..12], alert.reason
                                             );
+                                        } else {
+                                            // §E2 PENDING GUARD: if a Sell for this mint is already
+                                            // in flight, do NOT submit a second emergency sell. Keep
+                                            // the kill-switch alert active and log the pending sig.
+                                            if let Some(existing) = pending_executions
+                                                .get_for_mint(&trade.mint, ReconciliationSide::Sell)
+                                                .await
+                                            {
+                                                warn!(
+                                                    "KILL-SWITCH: pending sell already in flight for {} (sig {}) - not submitting a second emergency sell; alert remains active",
+                                                    &trade.mint[..12], existing.signature
+                                                );
+                                            } else if let Some(ref trader) = trader_arc {
+                                                // §E3 EXACT ROUTE: resolve the exact execution route
+                                                // and signer for the position's recorded wallet.
+                                                // Empty/invalid wallet, unknown route, or missing
+                                                // Local signer => no sell + halt new entries. No
+                                                // Lightning->Local fallback (INV-WALLET-001/003).
+                                                let position_wallet = match Pubkey::from_str(
+                                                    position.wallet_pubkey.trim(),
+                                                ) {
+                                                    Ok(pk) if !position.wallet_pubkey.trim().is_empty() => pk,
+                                                    _ => {
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "KILL-SWITCH: position {} has empty/invalid wallet_pubkey '{}' - no sell, new entries HALTED",
+                                                            &trade.mint[..12], position.wallet_pubkey
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+
+                                                let slippage_pct = config.trading.slippage_bps / 100;
+                                                let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
+
+                                                let sell_start = std::time::Instant::now();
+                                                let routed_sell: Option<Result<String, crate::error::Error>> =
+                                                    match recovery_registry.route_for(&position_wallet) {
+                                                        Some(crate::wallet::ExecutionRoute::Local) => {
+                                                            // Exact local signer: primary keypair if its
+                                                            // pubkey matches, else recovery multi-wallet.
+                                                            if keypair.pubkey() == position_wallet {
+                                                                info!(
+                                                                    "KILL-SWITCH: Local sell for {} via primary keypair",
+                                                                    &trade.mint[..12]
+                                                                );
+                                                                Some(trader.sell_local(
+                                                                    &trade.mint,
+                                                                    "100%",
+                                                                    slippage_pct,
+                                                                    priority_fee,
+                                                                    &keypair,
+                                                                    &rpc_client,
+                                                                ).await)
+                                                            } else if let Some(ref mw) = recovery_multi_wallet {
+                                                                match mw.find_by_address(&position.wallet_pubkey) {
+                                                                    Some(tw) => {
+                                                                        info!(
+                                                                            "KILL-SWITCH: Local sell for {} via recovery wallet {}",
+                                                                            &trade.mint[..12], position.wallet_pubkey
+                                                                        );
+                                                                        Some(trader.sell_local(
+                                                                            &trade.mint,
+                                                                            "100%",
+                                                                            slippage_pct,
+                                                                            priority_fee,
+                                                                            &tw.keypair,
+                                                                            &rpc_client,
+                                                                        ).await)
+                                                                    }
+                                                                    None => None,
+                                                                }
+                                                            } else {
+                                                                None
+                                                            }
+                                                        }
+                                                        Some(crate::wallet::ExecutionRoute::Lightning) => {
+                                                            // Require a Lightning trader / API key. No
+                                                            // Local fallback.
+                                                            if config.pumpportal.api_key.is_empty() || use_local_api {
+                                                                None
+                                                            } else {
+                                                                info!(
+                                                                    "KILL-SWITCH: Lightning sell for {}",
+                                                                    &trade.mint[..12]
+                                                                );
+                                                                Some(trader.sell(&trade.mint, "100%", slippage_pct, priority_fee).await)
+                                                            }
+                                                        }
+                                                        None => None,
+                                                    };
+
+                                                let sell_result = match routed_sell {
+                                                    Some(r) => r,
+                                                    None => {
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "KILL-SWITCH: no exact signer/route for position {} wallet {} - no sell, new entries HALTED",
+                                                            &trade.mint[..12], position.wallet_pubkey
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+
+                                                // §E4 SUBMIT / PERSIST / RECONCILE.
+                                                let signature = match sell_result {
+                                                    Ok(sig) => sig,
+                                                    Err(e) => {
+                                                        // Provider error: no pending. Record a strategy
+                                                        // sell failure if enabled. Position stays.
+                                                        let provider_latency_ms = sell_start.elapsed().as_millis() as u64;
+                                                        error!(
+                                                            "KILL-SWITCH SELL SUBMISSION FAILED for {}: {} ({}ms) - position remains OPEN/TRACKED",
+                                                            &trade.mint[..12], e, provider_latency_ms
+                                                        );
+                                                        if let Some(ref engine) = strategy_engine {
+                                                            engine.write().await.record_tx_failure(
+                                                                &position.mint,
+                                                                false,
+                                                                position.total_cost_sol,
+                                                                provider_latency_ms,
+                                                                &e.to_string(),
+                                                            ).await;
+                                                        }
+                                                        continue;
+                                                    }
+                                                };
+
+                                                warn!(
+                                                    "KILL-SWITCH SELL SUBMITTED: {} - sig: {}",
+                                                    alert.reason, signature
+                                                );
+
+                                                let pending_sell = PendingExecution::sell(
+                                                    signature.clone(),
+                                                    position.mint.clone(),
+                                                    position.wallet_pubkey.clone(),
+                                                    PendingSellContext {
+                                                        requested_amount: "100%".to_string(),
+                                                        intent: PendingSellIntent::KillSwitch,
+                                                        reason: alert.reason.clone(),
+                                                    },
+                                                );
+                                                if let Err(e) = pending_executions.upsert(pending_sell).await {
+                                                    new_entries_halted.store(true, Ordering::SeqCst);
+                                                    error!(
+                                                        "KILL-SWITCH: failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
+                                                        signature, e
+                                                    );
+                                                }
+
+                                                let outcome = trade_reconciler
+                                                    .reconcile(
+                                                        &signature,
+                                                        &position.wallet_pubkey,
+                                                        &position.mint,
+                                                        ReconciliationSide::Sell,
+                                                    )
+                                                    .await;
+
+                                                match outcome {
+                                                    Ok(ReconciliationOutcome::ConfirmedFailure { error, observed_after_ms, .. }) => {
+                                                        // Remove pending, record failure, keep position.
+                                                        if let Err(e) = pending_executions.remove(&signature).await {
+                                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                                            error!(
+                                                                "KILL-SWITCH: failed to remove pending after ConfirmedFailure (sig {}): {} - new entries HALTED",
+                                                                signature, e
+                                                            );
+                                                        }
+                                                        let latency_ms = sell_start.elapsed().as_millis() as u64;
+                                                        error!(
+                                                            "KILL-SWITCH SELL CONFIRMED FAILED for {} (sig {}): {} ({}ms observed) - position remains OPEN/TRACKED",
+                                                            &trade.mint[..12], signature, error, observed_after_ms
+                                                        );
+                                                        if let Some(ref engine) = strategy_engine {
+                                                            engine.write().await.record_tx_failure(
+                                                                &position.mint,
+                                                                false,
+                                                                position.total_cost_sol,
+                                                                latency_ms,
+                                                                &error,
+                                                            ).await;
+                                                        }
+                                                        continue;
+                                                    }
+                                                    Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
+                                                        // Keep pending, halt new entries, keep position.
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "KILL-SWITCH SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, position kept, new entries HALTED",
+                                                            position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                                        );
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        // Structural observer failure is not tx-failure proof.
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "CRITICAL: kill-switch sell reconciliation error for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
+                                                            &trade.mint[..12], signature, e
+                                                        );
+                                                        continue;
+                                                    }
+                                                    Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+                                                        // Identity validation at the live boundary
+                                                        // (exact wallet/mint/side).
+                                                        if fill.side != ReconciliationSide::Sell
+                                                            || fill.wallet != position.wallet_pubkey
+                                                            || fill.mint != position.mint
+                                                        {
+                                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                                            error!(
+                                                                "CRITICAL: kill-switch fill identity mismatch for sig {} (wallet/mint/side) - pending kept, position kept, new entries HALTED",
+                                                                signature
+                                                            );
+                                                            continue;
+                                                        }
+
+                                                        // Exact economics + decimals validation (also
+                                                        // rejects oversell / decimals mismatch).
+                                                        let (actual_sold_raw, actual_received_sol, actual_exit_price) =
+                                                            match primary_sell_fill_values(&fill, &position) {
+                                                                Ok(v) => v,
+                                                                Err(e) => {
+                                                                    new_entries_halted.store(true, Ordering::SeqCst);
+                                                                    error!(
+                                                                        "KILL-SWITCH fill validation failed for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
+                                                                        position.mint, signature, e
+                                                                    );
+                                                                    continue;
+                                                                }
+                                                            };
+
+                                                        let pre_close_cost = position.total_cost_sol;
+                                                        let pre_close_tokens = position.token_amount;
+
+                                                        let close_result = match position_manager
+                                                            .close_position_reconciled(
+                                                                &position.mint,
+                                                                &signature,
+                                                                actual_sold_raw,
+                                                                actual_received_sol,
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(r) => r,
+                                                            Err(e) => {
+                                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                                error!(
+                                                                    "KILL-SWITCH reconciled close failed for {} (sig {}): {} - pending kept, new entries HALTED",
+                                                                    position.mint, signature, e
+                                                                );
+                                                                continue;
+                                                            }
+                                                        };
+
+                                                        // Actual fill decides full vs partial.
+                                                        let fully_closed = close_result.fully_closed;
+                                                        let already_applied = close_result.already_applied;
+                                                        let latency_ms = sell_start.elapsed().as_millis() as u64;
+
+                                                        if !already_applied {
+                                                            if let Some(ref engine) = strategy_engine {
+                                                                if fully_closed {
+                                                                    engine.write().await.record_exit(
+                                                                        &position.mint,
+                                                                        close_result.pnl_sol,
+                                                                    ).await;
+                                                                } else {
+                                                                    let ok = engine.write().await.record_partial_exit(
+                                                                        &position.mint,
+                                                                        close_result.remaining_cost_sol,
+                                                                        close_result.remaining_amount,
+                                                                        close_result.pnl_sol,
+                                                                    ).await;
+                                                                    if !ok {
+                                                                        warn!(
+                                                                            "Strategy governor lacks position {} for kill-switch partial exit; PositionManager result unchanged",
+                                                                            position.mint
+                                                                        );
+                                                                    }
+                                                                }
+
+                                                                let requested_proxy = if pre_close_tokens > 0 {
+                                                                    pre_close_cost
+                                                                        * (actual_sold_raw as f64 / pre_close_tokens as f64)
+                                                                } else {
+                                                                    pre_close_cost
+                                                                };
+                                                                engine.write().await.record_reconciled_execution(
+                                                                    &position.mint,
+                                                                    false,
+                                                                    requested_proxy,
+                                                                    actual_received_sol,
+                                                                    actual_exit_price,
+                                                                    latency_ms,
+                                                                    &signature,
+                                                                ).await;
+                                                            }
+                                                        }
+
+                                                        // Full exit: unwatch evaluator. Partial: KEEP
+                                                        // watching the remaining position.
+                                                        if kill_switch_unwatch_on_close(fully_closed) {
+                                                            info!("=== KILL-SWITCH SELL CONFIRMED (Full) ===");
+                                                            evaluator.unwatch_position(&trade.mint);
+                                                        } else {
+                                                            info!("=== KILL-SWITCH SELL CONFIRMED (Partial) ===");
+                                                        }
+                                                        info!(
+                                                            "  {} (sig {}) | sold_raw={} decimals={} net_sol_delta={:+.9} exit_price={:.12} SOL/token | realized P&L: {:+.9} SOL{}",
+                                                            &trade.mint[..12],
+                                                            signature,
+                                                            actual_sold_raw,
+                                                            fill.token_decimals,
+                                                            actual_received_sol,
+                                                            actual_exit_price,
+                                                            close_result.pnl_sol,
+                                                            if already_applied { " (already applied; idempotent)" } else { "" }
+                                                        );
+
+                                                        // Remove pending LAST.
+                                                        if let Err(e) = pending_executions.remove(&signature).await {
+                                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                                            error!(
+                                                                "KILL-SWITCH: failed to remove pending after confirmed fill (sig {}): {} - new entries HALTED; position state already applied",
+                                                                signature, e
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -4320,6 +4602,16 @@ fn primary_sell_fill_values(
     Ok((actual_sold_raw, actual_received_sol, actual_exit_price))
 }
 
+/// AGENT E — pure full/partial decision for the primary event kill-switch exit.
+///
+/// The ACTUAL reconciled close result decides whether the position is fully
+/// closed. Only a full close unwatches the kill-switch evaluator; a partial
+/// close keeps the evaluator watching the remaining position. No threshold or
+/// market-price input is involved.
+fn kill_switch_unwatch_on_close(fully_closed: bool) -> bool {
+    fully_closed
+}
+
 // ===========================================================================
 // AGENT D — STARTUP RECOVERY + STRATEGY REBUILD (D1-D8)
 //
@@ -5330,5 +5622,71 @@ mod tests {
             OwnedHolderResolution::Multiple(_) | OwnedHolderResolution::None => None,
         };
         assert!(selected.is_none(), "multi-holder must not resolve to a single wallet");
+    }
+
+    // === AGENT E — primary event kill-switch sell ===
+
+    /// E5: a kill-switch pending sell round-trips its intent as
+    /// `PendingSellIntent::KillSwitch` with the exact `"100%"` request.
+    #[test]
+    fn test_kill_switch_pending_intent_round_trips() {
+        let wallet = Pubkey::new_unique().to_string();
+        let pending = PendingExecution::sell(
+            "ks-sig".to_string(),
+            T_MINT.to_string(),
+            wallet.clone(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::KillSwitch,
+                reason: "smart-money dump".to_string(),
+            },
+        );
+        assert_eq!(pending.side, ReconciliationSide::Sell);
+        assert_eq!(pending.mint, T_MINT);
+        assert_eq!(pending.wallet, wallet);
+        pending.validate().expect("kill-switch pending is structurally valid");
+        match &pending.context {
+            crate::trading::PendingExecutionContext::Sell(ctx) => {
+                assert_eq!(ctx.intent, PendingSellIntent::KillSwitch);
+                assert_eq!(ctx.requested_amount, "100%");
+            }
+            _ => panic!("expected Sell context"),
+        }
+
+        // JSON round-trip preserves the KillSwitch variant.
+        let json = serde_json::to_string(&pending).unwrap();
+        let back: PendingExecution = serde_json::from_str(&json).unwrap();
+        match back.context {
+            crate::trading::PendingExecutionContext::Sell(ctx) => {
+                assert_eq!(ctx.intent, PendingSellIntent::KillSwitch);
+            }
+            _ => panic!("expected Sell context after round-trip"),
+        }
+    }
+
+    /// E5: the pure full/partial decision helper. A full actual close unwatches
+    /// the evaluator; a partial close does NOT.
+    #[test]
+    fn test_kill_switch_unwatch_only_on_full_close() {
+        assert!(kill_switch_unwatch_on_close(true), "full close must unwatch");
+        assert!(!kill_switch_unwatch_on_close(false), "partial close keeps watching");
+    }
+
+    /// E3: the kill-switch route selection resolves Local for the primary wallet
+    /// and yields no route (=> no sell + halt) for an unknown wallet, with no
+    /// Lightning->Local fallback.
+    #[test]
+    fn test_kill_switch_route_selection() {
+        let primary = Pubkey::new_unique();
+        let lightning = Pubkey::new_unique();
+        let reg = ExecutionWalletRegistry::new(primary, &[], Some(lightning));
+
+        assert_eq!(reg.route_for(&primary), Some(crate::wallet::ExecutionRoute::Local));
+        assert_eq!(
+            reg.route_for(&lightning),
+            Some(crate::wallet::ExecutionRoute::Lightning)
+        );
+        // Unknown wallet => None => no sell, halt new entries.
+        assert_eq!(reg.route_for(&Pubkey::new_unique()), None);
     }
 }
