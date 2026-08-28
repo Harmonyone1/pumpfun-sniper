@@ -2114,7 +2114,89 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Manually sell a token position
+// ===========================================================================
+// AGENT H — MANUAL SELL TRANSACTION TRUTH (H1-H8)
+//
+// The manual `sell()` command is exact-wallet and transaction-reconciled. It
+// never manufactures proceeds from a market-price estimate (INV-TX-007), never
+// polls wallet SOL before/after as attribution (INV-TX-006 is satisfied by the
+// reconciled fill's exact wallet SOL delta), never assumes six decimals, and
+// never falls back between Local and Lightning signing authority
+// (INV-WALLET-001/002/003). A submitted signature is submission identity, not
+// fill proof (INV-TX-001).
+// ===========================================================================
+
+/// The exact wallet chosen for a manual sell, resolved BEFORE any submission.
+///
+/// - `Tracked` = a canonical tracked Position selected the wallet by its exact
+///   recorded `wallet_pubkey`.
+/// - `Untracked` = no tracked Position; a single positive on-chain holder among
+///   controlled wallets selected the wallet. There is no authoritative cost
+///   basis, so no P&L may be computed (H7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualSellWalletChoice {
+    Tracked(Pubkey),
+    Untracked(Pubkey),
+}
+
+impl ManualSellWalletChoice {
+    fn wallet(&self) -> Pubkey {
+        match self {
+            ManualSellWalletChoice::Tracked(w) | ManualSellWalletChoice::Untracked(w) => *w,
+        }
+    }
+    fn is_tracked(&self) -> bool {
+        matches!(self, ManualSellWalletChoice::Tracked(_))
+    }
+}
+
+/// H1 pure guard: may a manual sell be submitted for this mint given the current
+/// pending journal state? An unresolved pending Buy OR Sell for the same mint
+/// blocks another manual transaction (do not submit a second one). Returns the
+/// blocking signature when blocked.
+fn manual_sell_pending_block(
+    pending_buy: Option<&PendingExecution>,
+    pending_sell: Option<&PendingExecution>,
+) -> Option<String> {
+    if let Some(p) = pending_sell {
+        return Some(p.signature.clone());
+    }
+    if let Some(p) = pending_buy {
+        return Some(p.signature.clone());
+    }
+    None
+}
+
+/// The outcome of resolving an untracked token's controlled-wallet ownership (H2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualUntrackedResolution {
+    /// Exactly one controlled wallet holds a positive balance.
+    Single(Pubkey),
+    /// Held in multiple controlled wallets => ambiguous, refuse.
+    Ambiguous(Vec<Pubkey>),
+    /// No controlled wallet holds a positive balance => refuse.
+    NoHolder,
+}
+
+/// H2 pure mapping from an ownership-probe holder resolution to the manual-sell
+/// decision for an UNTRACKED token. Multiple holders are ambiguous and MUST be
+/// refused (INV-WALLET-004); zero holders refuse; exactly one resolves to that
+/// exact wallet. There is NO preference for Lightning merely because a Lightning
+/// wallet string exists — the wallet is chosen by proven on-chain ownership.
+fn manual_untracked_resolution(
+    resolution: &crate::wallet::OwnedHolderResolution,
+) -> ManualUntrackedResolution {
+    use crate::wallet::OwnedHolderResolution;
+    match resolution {
+        OwnedHolderResolution::None => ManualUntrackedResolution::NoHolder,
+        OwnedHolderResolution::Single(state) => ManualUntrackedResolution::Single(state.wallet),
+        OwnedHolderResolution::Multiple(states) => {
+            ManualUntrackedResolution::Ambiguous(states.iter().map(|s| s.wallet).collect())
+        }
+    }
+}
+
+/// Manually sell a token position — exact wallet, transaction-reconciled (H1-H8).
 pub async fn sell(
     config: &Config,
     token: &str,
@@ -2124,11 +2206,12 @@ pub async fn sell(
 ) -> Result<()> {
     info!("Sell command: token={}, amount={}", token, amount);
 
-    // Parse token address
-    let _token_pubkey = solana_sdk::pubkey::Pubkey::try_from(token)
+    // Parse token address.
+    let token_pubkey = solana_sdk::pubkey::Pubkey::try_from(token)
         .map_err(|e| anyhow::anyhow!("Invalid token address: {}", e))?;
 
-    // Parse amount (can be percentage like "50%" or absolute)
+    // Parse amount (percentage like "50%" or absolute token units). The exact
+    // user input string is preserved verbatim for the pending sell context (H5).
     let is_percentage = amount.ends_with('%');
     let amount_value: f64 = if is_percentage {
         amount
@@ -2140,79 +2223,249 @@ pub async fn sell(
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid amount: {}", e))?
     };
-
     if is_percentage && (amount_value <= 0.0 || amount_value > 100.0) {
         anyhow::bail!("Percentage must be between 0 and 100");
     }
 
-    // Initialize RPC client for balance queries
-    let rpc_client = solana_client::rpc_client::RpcClient::new_with_timeout(
+    if !config.pumpportal.use_for_trading {
+        // Jito manual sell is not implemented; there is no reconciled path for it.
+        anyhow::bail!(
+            "Jito sell not implemented. Set pumpportal.use_for_trading = true in config.toml"
+        );
+    }
+
+    // === H1: fail-closed initialization ===
+    let rpc_client = Arc::new(solana_client::rpc_client::RpcClient::new_with_timeout(
         config.rpc.endpoint.clone(),
         std::time::Duration::from_millis(config.rpc.timeout_ms),
-    );
+    ));
 
-    // Determine which wallet to query for balance (Lightning or local)
-    let balance_wallet = if !config.pumpportal.lightning_wallet.is_empty() {
-        Pubkey::from_str(&config.pumpportal.lightning_wallet)?
-    } else {
-        // Fall back to local keypair
-        let keypair_path = std::env::var("KEYPAIR_PATH")
-            .unwrap_or_else(|_| "credentials/hot-trading/keypair.json".to_string());
-        let keypair_data = std::fs::read_to_string(&keypair_path)?;
-        let secret_key: Vec<u8> = serde_json::from_str(&keypair_data)?;
-        let keypair = Keypair::from_bytes(&secret_key)?;
-        keypair.pubkey()
-    };
+    // Load the primary local keypair (exact local signing authority).
+    let keypair_path = std::env::var("KEYPAIR_PATH")
+        .unwrap_or_else(|_| "credentials/hot-trading/keypair.json".to_string());
+    let keypair_data = std::fs::read_to_string(&keypair_path)?;
+    let secret_key: Vec<u8> = serde_json::from_str(&keypair_data)?;
+    let keypair = Arc::new(Keypair::from_bytes(&secret_key)?);
 
-    // Initialize position manager
-    let position_manager = std::sync::Arc::new(crate::position::manager::PositionManager::new(
+    // Position manager — fail closed on load error (no warn-and-continue).
+    let position_manager = Arc::new(crate::position::manager::PositionManager::new(
         config.safety.clone(),
         Some(format!("{}/positions.json", config.wallet.credentials_dir)),
     ));
-    if let Err(e) = position_manager.load().await {
-        warn!("Could not load positions: {} (continuing anyway)", e);
-    }
+    position_manager.load().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load persisted positions; refusing manual sell with unknown ownership state: {}",
+            e
+        )
+    })?;
 
-    // Load bought_mints cache
-    let bought_mints_path = format!("{}/bought_mints.json", config.wallet.credentials_dir);
-    let bought_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> = {
-        if std::path::Path::new(&bought_mints_path).exists() {
-            match std::fs::read_to_string(&bought_mints_path) {
-                Ok(data) => {
-                    if let Ok(mints) = serde_json::from_str::<std::collections::HashMap<String, i64>>(&data) {
-                        std::sync::Arc::new(tokio::sync::Mutex::new(mints))
-                    } else {
-                        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                    }
+    // Trade reconciler + ownership probe (canonical 001A observer + C primitives).
+    let trade_reconciler = TradeReconciler::new(rpc_client.clone());
+    let ownership_probe = WalletOwnershipProbe::new(rpc_client.clone());
+
+    // Pending-execution journal — load + ensure writable (fail closed).
+    let pending_path = format!("{}/pending_executions.json", config.wallet.credentials_dir);
+    let pending_store = PendingExecutionStore::new(pending_path);
+    pending_store.load().await?;
+    pending_store.ensure_writable().await?;
+
+    // Recovery-only MultiWalletManager so an exact prior HotScan multi-wallet
+    // signer can be recognized. Fail closed if configured wallets will not load.
+    let mut recovery_local_wallets: Vec<Pubkey> = Vec::new();
+    let recovery_multi_wallet = if !config.wallet.trading_wallets.is_empty() {
+        match crate::wallet::MultiWalletManager::new(
+            config.wallet.trading_wallets.clone(),
+            &config.wallet.selection_strategy,
+        ) {
+            Ok(mw) => {
+                for w in mw.wallets() {
+                    recovery_local_wallets.push(w.pubkey());
                 }
-                Err(_) => std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                Some(Arc::new(mw))
             }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to load configured trading_wallets; refusing manual sell: {}",
+                    e
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Strictly parse the configured Lightning wallet if present (fail closed).
+    let lightning_wallet: Option<Pubkey> = {
+        let lw = config.pumpportal.lightning_wallet.trim();
+        if lw.is_empty() {
+            None
         } else {
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+            match Pubkey::from_str(lw) {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Configured lightning_wallet is not a valid Pubkey; refusing manual sell: {}",
+                        e
+                    ));
+                }
+            }
         }
     };
-    let bought_mints_path = std::sync::Arc::new(bought_mints_path);
 
-    // Get position info if we have it
-    let position = position_manager.get_position(token).await;
-    if let Some(ref pos) = position {
+    let registry =
+        ExecutionWalletRegistry::new(keypair.pubkey(), &recovery_local_wallets, lightning_wallet);
+
+    // H1: run pending recovery BEFORE submitting a new sell. This reconciles any
+    // in-flight signatures against the chain and applies/removes them per plan.
+    let _ = recover_pending_store(&trade_reconciler, &pending_store, &position_manager).await?;
+
+    // H1: if the same mint still has an unresolved pending Buy or Sell after
+    // recovery, do NOT submit another manual transaction.
+    let pending_buy = pending_store
+        .get_for_mint(token, ReconciliationSide::Buy)
+        .await;
+    let pending_sell = pending_store
+        .get_for_mint(token, ReconciliationSide::Sell)
+        .await;
+    if let Some(sig) =
+        manual_sell_pending_block(pending_buy.as_ref(), pending_sell.as_ref())
+    {
+        anyhow::bail!(
+            "An unresolved pending transaction (signature {}) already exists for this mint; \
+             refusing to submit another manual sell until it is reconciled.",
+            sig
+        );
+    }
+
+    // bought_mints cache (noncanonical metadata; only ever removed on proof).
+    let bought_mints_path = format!("{}/bought_mints.json", config.wallet.credentials_dir);
+    let bought_mints: Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> = {
+        if std::path::Path::new(&bought_mints_path).exists() {
+            match std::fs::read_to_string(&bought_mints_path) {
+                Ok(data) => match serde_json::from_str::<std::collections::HashMap<String, i64>>(
+                    &data,
+                ) {
+                    Ok(mints) => Arc::new(tokio::sync::Mutex::new(mints)),
+                    Err(_) => Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                },
+                Err(_) => Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            }
+        } else {
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        }
+    };
+    let bought_mints_path = Arc::new(bought_mints_path);
+
+    // === H2: resolve the EXACT execution wallet ===
+    let mut tracked_position = position_manager.get_position(token).await;
+    let wallet_choice: ManualSellWalletChoice = match tracked_position.clone() {
+        Some(pos) if !position_requires_recovery(&pos) => {
+            // Tracked canonical Position: use its EXACT recorded wallet. A route
+            // must exist for it (else refuse — no guessing).
+            let wallet = pos.wallet_pubkey.parse::<Pubkey>().map_err(|e| {
+                anyhow::anyhow!("Tracked position wallet is not a valid Pubkey: {}", e)
+            })?;
+            if registry.route_for(&wallet).is_none() {
+                anyhow::bail!(
+                    "Tracked position wallet {} has no controlled execution route; refusing manual sell.",
+                    wallet
+                );
+            }
+            ManualSellWalletChoice::Tracked(wallet)
+        }
+        Some(_pos) => {
+            // Tracked LEGACY position (decimals None / invalid wallet). Attempt
+            // legacy recovery for this mint FIRST; if it remains recovery-required,
+            // refuse rather than guess units/cost (INV-POS-002/003).
+            info!(
+                "Manual sell: tracked position for {} is legacy/incomplete; attempting chain recovery",
+                token
+            );
+            let _ = recover_legacy_positions(
+                &trade_reconciler,
+                &ownership_probe,
+                &registry,
+                &position_manager,
+            )
+            .await?;
+
+            // Re-read; only proceed if it is now fully canonical AND routable.
+            match position_manager.get_position(token).await {
+                Some(p) if !legacy_recovery_required(&p, &registry) => {
+                    let wallet = p.wallet_pubkey.parse::<Pubkey>().map_err(|e| {
+                        anyhow::anyhow!(
+                            "Recovered position wallet is not a valid Pubkey: {}",
+                            e
+                        )
+                    })?;
+                    tracked_position = Some(p);
+                    ManualSellWalletChoice::Tracked(wallet)
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Position for {} remains recovery-required after chain recovery; \
+                         refusing manual sell rather than guessing units/cost.",
+                        token
+                    );
+                }
+            }
+        }
+        None => {
+            // No tracked Position: probe ALL controlled wallets for the mint.
+            let resolution = ownership_probe
+                .find_positive_holders(&registry, token_pubkey)
+                .await
+                .map_err(|e| anyhow::anyhow!("Ownership probe failed: {}", e))?;
+            match manual_untracked_resolution(&resolution) {
+                ManualUntrackedResolution::Single(w) => ManualSellWalletChoice::Untracked(w),
+                ManualUntrackedResolution::Ambiguous(wallets) => {
+                    for w in &wallets {
+                        println!("  controlled wallet holding {}: {}", token, w);
+                    }
+                    anyhow::bail!(
+                        "Token is held in multiple controlled wallets; manual sell is ambiguous. \
+                         Explicit wallet selection is required but this CLI does not provide it yet."
+                    );
+                }
+                ManualUntrackedResolution::NoHolder => {
+                    anyhow::bail!(
+                        "No controlled wallet holds a positive balance of {}; nothing to sell.",
+                        token
+                    );
+                }
+            }
+        }
+    };
+
+    let execution_wallet = wallet_choice.wallet();
+    let route = match registry.route_for(&execution_wallet) {
+        Some(r) => r,
+        None => {
+            anyhow::bail!(
+                "Resolved wallet {} has no controlled execution route; refusing manual sell.",
+                execution_wallet
+            );
+        }
+    };
+
+    if let Some(ref pos) = tracked_position {
         println!("\nPosition found:");
         println!("  Symbol: {}", pos.symbol);
-        println!("  Tokens: {}", pos.token_amount);
+        println!("  Tokens (raw): {}", pos.token_amount);
         println!("  Entry price: {:.10} SOL", pos.entry_price);
         println!("  Cost: {:.4} SOL", pos.total_cost_sol);
     }
+    println!("  Execution wallet: {} ({:?})", execution_wallet, route);
 
-    // Confirmation prompt (unless --force)
+    // === H4: preserve the manual confirmation prompt + dry-run no-send ===
     if config.safety.require_sell_confirmation && !force {
         let confirmed = Confirm::new()
             .with_prompt(format!(
-                "Sell {} of token {}? This cannot be undone.",
-                amount, token
+                "Sell {} of token {} from wallet {}? This cannot be undone.",
+                amount, token, execution_wallet
             ))
             .default(false)
             .interact()?;
-
         if !confirmed {
             info!("Sell cancelled by user");
             return Ok(());
@@ -2220,124 +2473,285 @@ pub async fn sell(
     }
 
     if dry_run {
-        info!("DRY-RUN: Would sell {} of {}", amount, token);
+        info!("DRY-RUN: Would sell {} of {} from {}", amount, token, execution_wallet);
         return Ok(());
     }
 
-    // Execute sell based on configuration
-    if config.pumpportal.use_for_trading {
-        // Use PumpPortal API
-        if config.pumpportal.api_key.is_empty() {
-            anyhow::bail!("PumpPortal API key required for selling via Lightning API");
-        }
+    // === H3: exact route submission ===
+    let slippage_pct = config.trading.slippage_bps / 100;
+    let priority_fee = config.trading.priority_fee_lamports as f64 / 1_000_000_000.0;
 
-        let trader = PumpPortalTrader::lightning(config.pumpportal.api_key.clone());
-        let slippage_pct = config.trading.slippage_bps / 100;
-        let priority_fee = config.trading.priority_fee_lamports as f64 / 1_000_000_000.0;
-
-        // Query SOL balance BEFORE sell for real P&L
-        let sol_before = rpc_client.get_balance(&balance_wallet).unwrap_or(0) as f64 / 1_000_000_000.0;
-        info!("Balance before sell: {:.4} SOL", sol_before);
-
-        info!("Submitting sell via PumpPortal API...");
-        match trader.sell(token, amount, slippage_pct, priority_fee).await {
-            Ok(signature) => {
-                info!("Sell successful! Signature: {}", signature);
-                println!("\nSell transaction confirmed!");
-                println!("Signature: {}", signature);
-                println!("View on Solscan: https://solscan.io/tx/{}", signature);
-
-                // Wait for tx confirmation then query actual SOL received
-                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                let sol_after = rpc_client.get_balance(&balance_wallet).unwrap_or(0) as f64 / 1_000_000_000.0;
-                let raw_received = (sol_after - sol_before).max(0.0);
-
-                println!("Balance after sell: {:.4} SOL", sol_after);
-                println!("SOL received (raw): {:.4} SOL", raw_received);
-
-                // Update position manager and stats
-                if let Some(ref pos) = position {
-                    let is_full_sell = amount == "100%" || amount_value >= 100.0;
-                    let tokens_sold = if is_full_sell {
-                        pos.token_amount
-                    } else if is_percentage {
-                        (pos.token_amount as f64 * amount_value / 100.0) as u64
-                    } else {
-                        amount_value as u64
-                    };
-
-                    // Sanity check: received SOL shouldn't be more than 10x position cost
-                    // If it is, the balance query likely failed (sol_before was 0)
-                    let max_reasonable = pos.total_cost_sol * 10.0;
-                    let actual_received = if raw_received > max_reasonable {
-                        warn!(
-                            "Balance query anomaly: before={:.4}, after={:.4}, diff={:.4} (max reasonable: {:.4}) - using estimate",
-                            sol_before, sol_after, raw_received, max_reasonable
+    let submit_result: crate::error::Result<String> = match route {
+        crate::wallet::ExecutionRoute::Local => {
+            // Resolve the EXACT local signer for this wallet: primary keypair or a
+            // recovery MultiWallet signer. No fallback (INV-WALLET-003).
+            if execution_wallet == keypair.pubkey() {
+                info!("Manual sell: local submission via primary keypair");
+                pumpportal_local_trader()
+                    .sell_local(
+                        token,
+                        amount,
+                        slippage_pct,
+                        priority_fee,
+                        &keypair,
+                        &rpc_client,
+                    )
+                    .await
+            } else {
+                match recovery_multi_wallet
+                    .as_ref()
+                    .and_then(|mw| mw.find_by_address(&execution_wallet.to_string()))
+                {
+                    Some(tw) => {
+                        info!(
+                            "Manual sell: local submission via recovery wallet {}",
+                            execution_wallet
                         );
-                        0.0 // Force fallback to estimate
-                    } else {
-                        raw_received
-                    };
-
-                    // Use actual received SOL, fallback to estimate if balance query failed
-                    let received = if actual_received > 0.0 {
-                        actual_received
-                    } else {
-                        // Estimate based on position price (use current_price if available, else entry_price)
-                        let price = if pos.current_price > 0.0 { pos.current_price } else { pos.entry_price };
-                        let estimated = (tokens_sold as f64 * price) * 0.98;
-                        warn!("Balance query returned 0 or anomaly detected, using estimated received: {:.4} SOL", estimated);
-                        estimated
-                    };
-
-                    let _ = position_manager
-                        .close_position(token, tokens_sold, received)
-                        .await;
-
-                    // Persist position state immediately
-                    if let Err(e) = position_manager.save().await {
-                        warn!("Failed to persist position state: {}", e);
+                        pumpportal_local_trader()
+                            .sell_local(
+                                token,
+                                amount,
+                                slippage_pct,
+                                priority_fee,
+                                &tw.keypair,
+                                &rpc_client,
+                            )
+                            .await
                     }
-
-                    let cost_portion = if is_full_sell {
-                        pos.total_cost_sol
-                    } else {
-                        pos.total_cost_sol * amount_value / 100.0
-                    };
-                    let pnl_sol = received - cost_portion;
-                    let pnl_pct = (pnl_sol / cost_portion) * 100.0;
-
-                    println!("\n=== TRADE CLOSED ===");
-                    println!("  Cost: {:.4} SOL | Received: {:.4} SOL | P&L: {:+.4} SOL ({:+.1}%)",
-                            cost_portion, received, pnl_sol, pnl_pct);
-
-                    // Clean up bought_mints if position is fully closed
-                    // Check if position still exists after close_position
-                    let position_closed = position_manager.get_position(token).await.is_none();
-                    if position_closed {
-                        let _ = remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
-                        info!("Removed {} from bought_mints cache", token);
-                    }
-                } else {
-                    // No position tracked - still clean up bought_mints
-                    let removed = remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
-                    if removed {
-                        info!("Removed {} from bought_mints cache", token);
+                    None => {
+                        anyhow::bail!(
+                            "No exact local signer for wallet {}; refusing manual sell (no fallback).",
+                            execution_wallet
+                        );
                     }
                 }
             }
-            Err(e) => {
-                error!("Sell failed: {}", e);
-                anyhow::bail!("Sell transaction failed: {}", e);
+        }
+        crate::wallet::ExecutionRoute::Lightning => {
+            // Lightning requires an API key AND the exact configured Lightning
+            // wallet. No Local fallback (INV-WALLET-001/002).
+            if config.pumpportal.api_key.is_empty() {
+                anyhow::bail!("PumpPortal API key required for a Lightning manual sell.");
+            }
+            info!("Manual sell: Lightning submission (wallet {})", execution_wallet);
+            PumpPortalTrader::lightning(config.pumpportal.api_key.clone())
+                .sell(token, amount, slippage_pct, priority_fee)
+                .await
+        }
+    };
+
+    // === H5: submit => pending => reconcile ===
+    let signature = match submit_result {
+        Ok(sig) => sig,
+        Err(e) => {
+            // Provider error before a signature: nothing to reconcile, no pending,
+            // tracked position unchanged.
+            error!("Manual sell submission failed: {}", e);
+            anyhow::bail!("Manual sell submission failed: {}", e);
+        }
+    };
+
+    info!("SELL SUBMITTED: {} (sig {})", token, signature);
+    println!("\nSELL SUBMITTED");
+    println!("Signature: {}", signature);
+    println!("View on Solscan: https://solscan.io/tx/{}", signature);
+
+    // Persist the pending record BEFORE treating the trade as filled (INV-TX-001).
+    let pending = PendingExecution::sell(
+        signature.clone(),
+        token.to_string(),
+        execution_wallet.to_string(),
+        PendingSellContext {
+            requested_amount: amount.to_string(), // exact user input preserved (H5)
+            intent: PendingSellIntent::Manual,
+            reason: "manual".to_string(),
+        },
+    );
+    pending_store.upsert(pending).await?;
+
+    // Reconcile: exact wallet/mint/Sell. No sleep, no balance polling, no estimate.
+    let outcome = trade_reconciler
+        .reconcile(
+            &signature,
+            &execution_wallet.to_string(),
+            token,
+            ReconciliationSide::Sell,
+        )
+        .await;
+
+    match outcome {
+        Ok(ReconciliationOutcome::ConfirmedFailure {
+            error,
+            observed_after_ms,
+            ..
+        }) => {
+            // Remove pending; report failure; tracked position unchanged.
+            pending_store.remove(&signature).await?;
+            error!(
+                "Manual sell CONFIRMED FAILED (sig {}): {} ({}ms observed)",
+                signature, error, observed_after_ms
+            );
+            anyhow::bail!(
+                "Manual sell transaction confirmed FAILED on-chain (signature {}): {}",
+                signature,
+                error
+            );
+        }
+        Ok(ReconciliationOutcome::Unresolved { reason, .. }) => {
+            // KEEP pending; report UNRESOLVED including the signature; no Position
+            // mutation; do NOT tell the user to immediately retry.
+            error!(
+                "Manual sell UNRESOLVED (sig {}): {} - pending kept, position unchanged",
+                signature, reason
+            );
+            anyhow::bail!(
+                "Manual sell outcome is UNRESOLVED for signature {}. The transaction was submitted \
+                 but its on-chain result could not be confirmed. It remains recorded as pending; \
+                 do NOT resubmit. Investigate the signature before taking further action. Reason: {}",
+                signature,
+                reason
+            );
+        }
+        Err(e) => {
+            // A structural observer error is NOT tx-failure proof. Keep pending.
+            error!(
+                "Manual sell reconciliation error (sig {}): {} - pending kept, position unchanged",
+                signature, e
+            );
+            anyhow::bail!(
+                "Manual sell outcome is UNRESOLVED for signature {} (reconciliation observer error): {}. \
+                 It remains recorded as pending; do NOT resubmit.",
+                signature,
+                e
+            );
+        }
+        Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+            // Identity validation at the live boundary.
+            if fill.side != ReconciliationSide::Sell
+                || fill.wallet != execution_wallet.to_string()
+                || fill.mint != token
+            {
+                anyhow::bail!(
+                    "Reconciled manual sell fill identity mismatch for signature {}; pending kept, \
+                     position unchanged.",
+                    signature
+                );
+            }
+
+            let actual_sold_raw = fill.token_amount_raw().ok_or_else(|| {
+                anyhow::anyhow!("Reconciled sell raw token amount does not fit in u64")
+            })?;
+            if actual_sold_raw == 0 {
+                anyhow::bail!("Reconciled manual sell reported zero raw tokens sold; pending kept.");
+            }
+            let net_sol = fill.wallet_sol_delta_sol();
+            if !net_sol.is_finite() {
+                anyhow::bail!("Reconciled manual sell net SOL delta is not finite; pending kept.");
+            }
+            let ui_sold = fill.token_amount_ui();
+            // Economic (effective) price; a fee-dominated sale may be zero/negative.
+            let effective_price = fill.effective_price_sol_per_token().unwrap_or(0.0);
+
+            if let Some(pos) = tracked_position {
+                // === H6: tracked Position application ===
+                // Validate fill decimals vs Position before mutation.
+                let (validated_sold_raw, validated_net_sol, validated_price) =
+                    primary_sell_fill_values(&fill, &pos).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Reconciled sell fill validation failed (sig {}): {}; pending kept.",
+                            signature,
+                            e
+                        )
+                    })?;
+
+                let close_result = position_manager
+                    .close_position_reconciled(
+                        token,
+                        &signature,
+                        validated_sold_raw,
+                        validated_net_sol,
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Reconciled close failed (sig {}): {}; pending kept.",
+                            signature,
+                            e
+                        )
+                    })?;
+
+                // Remove pending LAST, after durable application.
+                pending_store.remove(&signature).await?;
+
+                println!("\n=== MANUAL SELL CONFIRMED ===");
+                println!("  Signature: {}", signature);
+                println!("  Raw sold: {}", validated_sold_raw);
+                println!("  UI sold: {:.6}", ui_sold);
+                println!("  Net SOL (wallet delta): {:+.6} SOL", validated_net_sol);
+                println!("  Effective price: {:.10} SOL/token", validated_price);
+                println!("  Realized P&L: {:+.6} SOL", close_result.pnl_sol);
+                if close_result.fully_closed {
+                    println!("  Position fully closed.");
+                    // Remove bought_mint only on a full close.
+                    let _ = remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
+                } else {
+                    println!(
+                        "  Partial exit — remaining tracked raw: {}, remaining cost: {:.6} SOL",
+                        close_result.remaining_amount, close_result.remaining_cost_sol
+                    );
+                }
+            } else {
+                // === H7: untracked token application ===
+                // No authoritative cost basis: do NOT create fake P&L, do NOT call
+                // PositionManager close. Report actuals and state P&L unavailable.
+                println!("\n=== MANUAL SELL CONFIRMED (untracked) ===");
+                println!("  Signature: {}", signature);
+                println!("  Raw sold: {}", actual_sold_raw);
+                println!("  UI sold: {:.6}", ui_sold);
+                println!("  Net SOL (wallet delta): {:+.6} SOL", net_sol);
+                println!("  Effective price: {:.10} SOL/token", effective_price);
+                println!(
+                    "Realized P&L unavailable: token was not tracked with a canonical cost basis."
+                );
+
+                // Probe the EXACT wallet's current balance. If proven zero, the
+                // bought_mints cache entry may be removed; if nonzero, leave it.
+                // Pending may still be removed after a confirmed fill even if this
+                // probe fails (the cache is noncanonical metadata).
+                match ownership_probe.probe(execution_wallet, token_pubkey).await {
+                    Ok(state) if state.raw_amount == 0 => {
+                        let _ =
+                            remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
+                        info!("Untracked sell: proven zero balance, removed {} from bought_mints", token);
+                    }
+                    Ok(state) => {
+                        info!(
+                            "Untracked sell: {} raw remains in wallet {} - leaving bought_mints cache",
+                            state.raw_amount, execution_wallet
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Untracked sell: post-fill balance probe failed: {} - leaving bought_mints cache",
+                            e
+                        );
+                    }
+                }
+
+                // Remove pending LAST (confirmed fill is durable regardless of cache).
+                pending_store.remove(&signature).await?;
             }
         }
-    } else {
-        // Use Jito bundles
-        warn!("Jito sell not yet implemented - use PumpPortal Lightning API");
-        anyhow::bail!("Jito sell not implemented. Set pumpportal.use_for_trading = true in config.toml");
     }
 
     Ok(())
+}
+
+/// The Local-API PumpPortal trader used for manual local submission. Kept as a
+/// tiny constructor so the manual-sell route reads clearly; it holds no key
+/// material (the exact signer keypair is passed per call to `sell_local`).
+fn pumpportal_local_trader() -> PumpPortalTrader {
+    PumpPortalTrader::local()
 }
 
 /// Show current positions and P&L
@@ -6401,5 +6815,152 @@ mod tests {
         );
         // Unknown wallet => None => no sell, halt new entries.
         assert_eq!(reg.route_for(&Pubkey::new_unique()), None);
+    }
+
+    // ===================================================================
+    // AGENT H — manual sell helper tests (H9)
+    // ===================================================================
+
+    fn wts(wallet: Pubkey, mint: Pubkey, raw: u64) -> crate::wallet::WalletTokenState {
+        crate::wallet::WalletTokenState {
+            wallet,
+            mint,
+            raw_amount: raw,
+            decimals: Some(6),
+            token_account_count: 1,
+        }
+    }
+
+    /// H9: a tracked canonical Position selects its EXACT recorded wallet even
+    /// when a global Lightning wallet is configured — there is no Lightning
+    /// preference. The tracked wallet routes Local because an exact local signer
+    /// exists for it.
+    #[test]
+    fn test_manual_sell_tracked_wallet_over_global_lightning() {
+        let primary = Pubkey::new_unique();
+        let lightning = Pubkey::new_unique();
+        let registry = ExecutionWalletRegistry::new(primary, &[], Some(lightning));
+
+        let mut pos = recovery_test_position();
+        pos.wallet_pubkey = primary.to_string();
+        pos.token_decimals = Some(6);
+
+        // Canonical (not recovery-required) => exact tracked wallet chosen.
+        assert!(!position_requires_recovery(&pos));
+        let wallet: Pubkey = pos.wallet_pubkey.parse().unwrap();
+        let choice = ManualSellWalletChoice::Tracked(wallet);
+        assert_eq!(choice.wallet(), primary);
+        assert!(choice.is_tracked());
+        // The tracked wallet is Local (not the configured Lightning wallet).
+        assert_eq!(
+            registry.route_for(&choice.wallet()),
+            Some(crate::wallet::ExecutionRoute::Local)
+        );
+        assert_ne!(choice.wallet(), lightning);
+    }
+
+    /// H9: an untracked token held by exactly one controlled wallet resolves to
+    /// that exact wallet.
+    #[test]
+    fn test_manual_sell_untracked_single_holder_resolves() {
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let resolution =
+            crate::wallet::OwnedHolderResolution::Single(wts(wallet, mint, 500));
+        assert_eq!(
+            manual_untracked_resolution(&resolution),
+            ManualUntrackedResolution::Single(wallet)
+        );
+    }
+
+    /// H9: an untracked token held in multiple controlled wallets is ambiguous
+    /// and rejected (no wallet chosen, no cost-basis merge).
+    #[test]
+    fn test_manual_sell_untracked_multiple_holders_rejected() {
+        let w1 = Pubkey::new_unique();
+        let w2 = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let resolution = crate::wallet::OwnedHolderResolution::Multiple(vec![
+            wts(w1, mint, 100),
+            wts(w2, mint, 200),
+        ]);
+        match manual_untracked_resolution(&resolution) {
+            ManualUntrackedResolution::Ambiguous(wallets) => {
+                assert_eq!(wallets.len(), 2);
+                assert!(wallets.contains(&w1) && wallets.contains(&w2));
+            }
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+    }
+
+    /// H9: an untracked token with no positive holder refuses the sell.
+    #[test]
+    fn test_manual_sell_untracked_no_holder_refused() {
+        let resolution = crate::wallet::OwnedHolderResolution::None;
+        assert_eq!(
+            manual_untracked_resolution(&resolution),
+            ManualUntrackedResolution::NoHolder
+        );
+    }
+
+    /// H9: the untracked confirmed-fill path is the `Untracked` wallet choice,
+    /// which carries no cost basis — the caller therefore takes the explicit
+    /// "Realized P&L unavailable" branch (no PositionManager close).
+    #[test]
+    fn test_manual_sell_untracked_choice_has_no_pnl_basis() {
+        let wallet = Pubkey::new_unique();
+        let choice = ManualSellWalletChoice::Untracked(wallet);
+        assert_eq!(choice.wallet(), wallet);
+        assert!(
+            !choice.is_tracked(),
+            "an untracked choice must not be treated as tracked (no cost basis => no P&L)"
+        );
+    }
+
+    /// H9: an unresolved pending Sell for the same mint blocks another manual
+    /// sell, and the blocking signature is surfaced.
+    #[test]
+    fn test_manual_sell_pending_sell_blocks() {
+        let sell = PendingExecution::sell(
+            "sellsig".to_string(),
+            "mint".to_string(),
+            "wallet".to_string(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::Manual,
+                reason: "manual".to_string(),
+            },
+        );
+        assert_eq!(
+            manual_sell_pending_block(None, Some(&sell)),
+            Some("sellsig".to_string())
+        );
+    }
+
+    /// H9: an unresolved pending Buy for the same mint also blocks a manual sell.
+    #[test]
+    fn test_manual_sell_pending_buy_blocks() {
+        let buy = PendingExecution::buy(
+            "buysig".to_string(),
+            "mint".to_string(),
+            "wallet".to_string(),
+            PendingBuyContext {
+                requested_sol: 0.05,
+                name: "n".to_string(),
+                symbol: "s".to_string(),
+                bonding_curve: "bc".to_string(),
+                entry_type: crate::position::manager::EntryType::Opportunity,
+            },
+        );
+        assert_eq!(
+            manual_sell_pending_block(Some(&buy), None),
+            Some("buysig".to_string())
+        );
+    }
+
+    /// H9: no pending Buy or Sell => not blocked.
+    #[test]
+    fn test_manual_sell_no_pending_not_blocked() {
+        assert_eq!(manual_sell_pending_block(None, None), None);
     }
 }
