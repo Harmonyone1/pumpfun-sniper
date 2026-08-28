@@ -264,11 +264,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         }
     };
 
-    let recovery_registry = ExecutionWalletRegistry::new(
+    // Arc so the primary auto-sell monitor (spawned) can share the exact same
+    // route authority the synchronous startup recovery and event kill-switch use.
+    let recovery_registry_arc = Arc::new(ExecutionWalletRegistry::new(
         keypair.pubkey(),
         &recovery_local_wallets,
         recovery_lightning_wallet,
-    );
+    ));
+    let recovery_registry: &ExecutionWalletRegistry = &recovery_registry_arc;
     let recovery_probe = WalletOwnershipProbe::new(rpc_client.clone());
 
     // Initialize the persistent pending-execution journal. A submitted signature is
@@ -307,7 +310,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let legacy_summary = recover_legacy_positions(
         &trade_reconciler,
         &recovery_probe,
-        &recovery_registry,
+        recovery_registry,
         &position_manager,
     )
     .await?;
@@ -321,7 +324,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let post_recovery_positions = position_manager.get_all_positions().await;
     let residual_blocked = post_recovery_positions
         .iter()
-        .filter(|p| legacy_recovery_required(p, &recovery_registry))
+        .filter(|p| legacy_recovery_required(p, recovery_registry))
         .count();
 
     if !pending_summary.fully_resolved()
@@ -466,7 +469,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let mut restored = 0usize;
         let mut unrestorable = 0usize;
         for position in position_manager.get_all_positions().await {
-            if position_is_canonical_for_restore(&position, &recovery_registry) {
+            if position_is_canonical_for_restore(&position, recovery_registry) {
                 let strategy_position = manager_position_to_strategy_position(
                     &position,
                     config.strategy.default_strategy.clone(),
@@ -499,15 +502,83 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let trader_arc: Option<std::sync::Arc<PumpPortalTrader>> =
         pumpportal_trader.map(std::sync::Arc::new);
 
+    // === B4: INDEPENDENT PER-POSITION EXIT TRADER HANDLES ===
+    // `trader_arc` above encodes the NEW-BUY execution mode (force_local_api etc).
+    // Exits must NOT be governed by the new-buy mode: an existing Lightning-owned
+    // position must be able to exit via Lightning even when force_local_api routes
+    // new buys Local, and an additional-local recovered wallet must be able to
+    // exit Local even when new buys use Lightning. So we build exit trader handles
+    // keyed purely on which credentials exist (INV-WALLET-001/003):
+    //   - Local exit available iff PumpPortal trading is enabled;
+    //   - Lightning exit available iff PumpPortal trading is enabled AND an API
+    //     key is configured (non-empty).
+    let primary_exit_local_trader: Option<Arc<PumpPortalTrader>> =
+        if config.pumpportal.use_for_trading {
+            Some(Arc::new(PumpPortalTrader::local()))
+        } else {
+            None
+        };
+    let primary_exit_lightning_trader: Option<Arc<PumpPortalTrader>> =
+        if config.pumpportal.use_for_trading && !config.pumpportal.api_key.trim().is_empty() {
+            Some(Arc::new(PumpPortalTrader::lightning(
+                config.pumpportal.api_key.clone(),
+            )))
+        } else {
+            None
+        };
+
+    // === B7: shared same-mint primary sell coordinator ===
+    // ONE instance, cloned into BOTH the primary auto-sell monitor and the event
+    // kill-switch so those two concurrent sell producers cannot race and submit
+    // two sells for the same mint before either signature is journaled.
+    let active_sell_mints: ActiveSellMints =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    // === B6: halt NEW entries when any canonical position is operationally
+    // unexitable with the CURRENT exit credentials/routes. Strategy exposure was
+    // already restored above for canonical positions (D6); this is an independent
+    // count that does not touch exposure. Log mint + public wallet + reason only.
+    {
+        let local_exit_available = primary_exit_local_trader.is_some();
+        let lightning_exit_available = primary_exit_lightning_trader.is_some();
+        let mut unexitable = 0usize;
+        for position in position_manager.get_all_positions().await {
+            if !position_has_operational_exit_route(
+                &position,
+                recovery_registry,
+                local_exit_available,
+                lightning_exit_available,
+            ) {
+                unexitable += 1;
+                let reason = if position.token_decimals.is_none() {
+                    "unknown token decimals"
+                } else if position.wallet_pubkey.parse::<Pubkey>().is_err() {
+                    "invalid recorded wallet"
+                } else {
+                    "no routable exit trader for wallet's route"
+                };
+                error!(
+                    "Operationally unexitable position: mint {} wallet {} - {}",
+                    position.mint, position.wallet_pubkey, reason
+                );
+            }
+        }
+        if unexitable > 0 {
+            error!(
+                "New entries HALTED: {} canonical position(s) cannot be exited with current credentials/routes",
+                unexitable
+            );
+            new_entries_halted.store(true, Ordering::SeqCst);
+        }
+    }
+
     // === IMPROVED POSITION MONITOR WITH LOCAL FALLBACK ===
     // Features: Trailing stop, no-movement exit, quick profit, retry with local fallback
     if config.auto_sell.enabled && !dry_run {
         let monitor_config = config.clone();
         let monitor_positions = position_manager.clone();
-        let monitor_trader = trader_arc.clone();
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
-        let monitor_use_local_api = use_local_api;
         // Transaction-truth wiring (§51): clone the already-initialized reconciler,
         // pending journal, halt flag and strategy engine into the monitor. No new
         // RPC/reconciler is constructed inside the loop.
@@ -515,8 +586,16 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let monitor_pending = pending_executions.clone();
         let monitor_entry_halt = new_entries_halted.clone();
         let monitor_engine = strategy_engine.clone();
-        // Exact Lightning execution wallet, read-only. Local mode does not use this.
-        let monitor_lightning_wallet: Option<Pubkey> = primary_execution_wallet;
+        // B11: EXACT per-position routing handles. The monitor no longer uses the
+        // new-buy execution mode as authority for an existing position. It clones
+        // the recovery registry (route authority), the recovery multi-wallet
+        // (additional-local signers), the primary keypair, the independent exit
+        // trader handles, and the shared same-mint sell coordinator.
+        let monitor_registry = recovery_registry_arc.clone();
+        let monitor_multi_wallet = recovery_multi_wallet.clone();
+        let monitor_exit_local = primary_exit_local_trader.clone();
+        let monitor_exit_lightning = primary_exit_lightning_trader.clone();
+        let monitor_active_sells = active_sell_mints.clone();
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
@@ -645,20 +724,28 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             position.symbol, position.mint, reason, current_price
                         );
 
-                        if let Some(ref trader) = monitor_trader {
+                        {
                             let slippage = monitor_config.trading.slippage_bps / 100;
                             let priority_fee =
                                 monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
-                            // §53 PENDING GUARD: never submit a second sell for a mint that
-                            // already has an unresolved submitted sell in the journal.
-                            if let Some(pending) = monitor_pending
+                            // B9 step (1): pending Buy AND Sell block an automatic exit. If a
+                            // confirmed buy mutated in-memory state but its durable save failed,
+                            // the pending Buy remains alongside the Position; selling now could
+                            // close it and let restart recovery re-open the stale pending buy.
+                            let pending_buy = monitor_pending
+                                .get_for_mint(&position.mint, ReconciliationSide::Buy)
+                                .await;
+                            let pending_sell = monitor_pending
                                 .get_for_mint(&position.mint, ReconciliationSide::Sell)
-                                .await
-                            {
+                                .await;
+                            if let Some(sig) = pending_blocks_automatic_sell(
+                                pending_buy.as_ref(),
+                                pending_sell.as_ref(),
+                            ) {
                                 error!(
-                                    "Sell remains pending for {}: signature {}. Not submitting another sell (001C reconciliation required).",
-                                    position.mint, pending.signature
+                                    "Automatic sell blocked for {}: pending Buy/Sell in flight (sig {}). Not submitting (001C reconciliation required).",
+                                    position.mint, sig
                                 );
                                 continue;
                             }
@@ -674,48 +761,47 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 continue;
                             }
 
-                            // §55 EXACT WALLET GUARD: the position's recorded wallet must parse
-                            // and must match the wallet controlled by THIS execution route.
+                            // §55 EXACT WALLET GUARD: the position's recorded wallet must parse.
                             let position_wallet = match Pubkey::from_str(position.wallet_pubkey.trim()) {
-                                Ok(pk) => pk,
-                                Err(e) => {
+                                Ok(pk) if !position.wallet_pubkey.trim().is_empty() => pk,
+                                _ => {
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
                                     error!(
-                                        "Position wallet_pubkey empty/invalid for {} ({:?}): {} - no sell, new entries HALTED",
-                                        position.mint, position.wallet_pubkey, e
+                                        "Position wallet_pubkey empty/invalid for {} ({:?}) - no sell, new entries HALTED",
+                                        position.mint, position.wallet_pubkey
                                     );
                                     continue;
                                 }
                             };
-                            if monitor_use_local_api {
-                                if position_wallet != monitor_keypair.pubkey() {
-                                    monitor_entry_halt.store(true, Ordering::SeqCst);
-                                    error!(
-                                        "Local sell wallet mismatch for {}: position {} != local {} - no sell, new entries HALTED",
-                                        position.mint, position_wallet, monitor_keypair.pubkey()
-                                    );
-                                    continue;
-                                }
-                            } else {
-                                match monitor_lightning_wallet {
-                                    Some(lw) if lw == position_wallet => {}
-                                    Some(lw) => {
-                                        monitor_entry_halt.store(true, Ordering::SeqCst);
-                                        error!(
-                                            "Lightning sell wallet mismatch for {}: position {} != lightning {} - no sell, new entries HALTED",
-                                            position.mint, position_wallet, lw
-                                        );
-                                        continue;
-                                    }
-                                    None => {
-                                        monitor_entry_halt.store(true, Ordering::SeqCst);
-                                        error!(
-                                            "Lightning execution wallet unresolved; cannot validate sell route for {} - no sell, new entries HALTED",
-                                            position.mint
-                                        );
-                                        continue;
-                                    }
-                                }
+
+                            // B9 step (2)/(3): reserve the mint for a primary sell. If another
+                            // producer (kill-switch) already holds it, skip this cycle.
+                            if !try_reserve_sell_mint(&monitor_active_sells, &position.mint) {
+                                info!(
+                                    "Auto-sell skipped for {}: another primary sell reservation is active for this mint",
+                                    position.mint
+                                );
+                                continue;
+                            }
+
+                            // B9 step (4): re-check pending Buy/Sell AFTER reserving. If one
+                            // appeared in the window, release + skip (no submission).
+                            let recheck_buy = monitor_pending
+                                .get_for_mint(&position.mint, ReconciliationSide::Buy)
+                                .await;
+                            let recheck_sell = monitor_pending
+                                .get_for_mint(&position.mint, ReconciliationSide::Sell)
+                                .await;
+                            if let Some(sig) = pending_blocks_automatic_sell(
+                                recheck_buy.as_ref(),
+                                recheck_sell.as_ref(),
+                            ) {
+                                release_sell_mint(&monitor_active_sells, &position.mint);
+                                error!(
+                                    "Automatic sell aborted for {} after reservation: pending Buy/Sell appeared (sig {}) - reservation released",
+                                    position.mint, sig
+                                );
+                                continue;
                             }
 
                             // Retry counter behavior preserved.
@@ -724,37 +810,105 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                             if *attempts > 5 {
                                 // Retry exhaustion: never close/remove wallet-owned risk. Leave
-                                // OPEN/TRACKED, reset counter, let a later cycle try again.
+                                // OPEN/TRACKED, reset counter, release reservation, let a later
+                                // cycle try again.
                                 error!(
                                     "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
                                     position.symbol
                                 );
                                 sell_attempts.remove(&position.mint);
+                                release_sell_mint(&monitor_active_sells, &position.mint);
                                 continue;
                             }
 
-                            // §56 ROUTE: no Lightning->Local fallback in the primary monitor.
-                            // Local mode always sell_local with the local keypair; Lightning mode
-                            // always sell() via Lightning for every attempt.
+                            // B9 step (5)/(6) + B11: resolve the EXACT route/signer for THIS
+                            // position's recorded wallet via the recovery registry (not the
+                            // new-buy mode), then submit through the matching independent exit
+                            // trader ONLY. No Lightning->Local fallback. Unknown route / missing
+                            // signer / missing trader => no sell + release + halt new entries.
                             let sell_start = std::time::Instant::now();
-                            let sell_result: Result<String, crate::error::Error> = if monitor_use_local_api {
-                                info!("Attempting LOCAL API sell for {} (attempt {})", position.mint, attempts);
-                                trader
-                                    .sell_local(
-                                        &position.mint,
-                                        sell_pct,
-                                        slippage,
-                                        priority_fee,
-                                        &monitor_keypair,
-                                        &monitor_rpc,
-                                    )
-                                    .await
-                            } else {
-                                info!("Attempting Lightning API sell for {} (attempt {})", position.mint, attempts);
-                                trader
-                                    .sell(&position.mint, sell_pct, slippage, priority_fee)
-                                    .await
-                            };
+                            let sell_result: Result<String, crate::error::Error> =
+                                match monitor_registry.route_for(&position_wallet) {
+                                    Some(crate::wallet::ExecutionRoute::Local) => {
+                                        // Exact local signer: primary keypair if its pubkey matches,
+                                        // else the recovery multi-wallet's wallet for that address.
+                                        let local_trader = match monitor_exit_local {
+                                            Some(ref t) => t,
+                                            None => {
+                                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                                release_sell_mint(&monitor_active_sells, &position.mint);
+                                                error!(
+                                                    "Local exit unavailable (no Local trader) for {} wallet {} - no sell, reservation released, new entries HALTED",
+                                                    position.mint, position_wallet
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        if monitor_keypair.pubkey() == position_wallet {
+                                            info!("Attempting LOCAL sell for {} via primary keypair (attempt {})", position.mint, attempts);
+                                            local_trader
+                                                .sell_local(
+                                                    &position.mint,
+                                                    sell_pct,
+                                                    slippage,
+                                                    priority_fee,
+                                                    &monitor_keypair,
+                                                    &monitor_rpc,
+                                                )
+                                                .await
+                                        } else if let Some(tw) = monitor_multi_wallet
+                                            .as_ref()
+                                            .and_then(|mw| mw.find_by_address(&position.wallet_pubkey))
+                                        {
+                                            info!("Attempting LOCAL sell for {} via recovery wallet {} (attempt {})", position.mint, position.wallet_pubkey, attempts);
+                                            local_trader
+                                                .sell_local(
+                                                    &position.mint,
+                                                    sell_pct,
+                                                    slippage,
+                                                    priority_fee,
+                                                    &tw.keypair,
+                                                    &monitor_rpc,
+                                                )
+                                                .await
+                                        } else {
+                                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                                            release_sell_mint(&monitor_active_sells, &position.mint);
+                                            error!(
+                                                "No exact Local signer for {} wallet {} - no sell, reservation released, new entries HALTED",
+                                                position.mint, position_wallet
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    Some(crate::wallet::ExecutionRoute::Lightning) => {
+                                        let lightning_trader = match monitor_exit_lightning {
+                                            Some(ref t) => t,
+                                            None => {
+                                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                                release_sell_mint(&monitor_active_sells, &position.mint);
+                                                error!(
+                                                    "Lightning exit unavailable (no Lightning trader/API key) for {} wallet {} - no sell, reservation released, new entries HALTED",
+                                                    position.mint, position_wallet
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        info!("Attempting Lightning sell for {} (attempt {})", position.mint, attempts);
+                                        lightning_trader
+                                            .sell(&position.mint, sell_pct, slippage, priority_fee)
+                                            .await
+                                    }
+                                    None => {
+                                        monitor_entry_halt.store(true, Ordering::SeqCst);
+                                        release_sell_mint(&monitor_active_sells, &position.mint);
+                                        error!(
+                                            "No exact route for {} wallet {} - no sell, reservation released, new entries HALTED",
+                                            position.mint, position_wallet
+                                        );
+                                        continue;
+                                    }
+                                };
 
                             let signature = match sell_result {
                                 Ok(sig) => sig,
@@ -775,6 +929,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             &e.to_string(),
                                         ).await;
                                     }
+                                    // B10: provider error / no signature => release reservation.
+                                    release_sell_mint(&monitor_active_sells, &position.mint);
                                     continue;
                                 }
                             };
@@ -845,24 +1001,29 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     }
                                     // Do not mark quick profit; do not record_exit/partial. Later
                                     // monitor cycle may retry.
+                                    // B10: ConfirmedFailure => pending removed, release reservation.
+                                    release_sell_mint(&monitor_active_sells, &position.mint);
                                     continue;
                                 }
                                 Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
                                     // §61: KEEP pending, keep position + flags, halt new entries.
                                     // Do NOT clear sell-attempt state (pending guard prevents a
                                     // second submission on the next cycle).
+                                    // B10: Unresolved => KEEP the reservation (do NOT release);
+                                    // the same-mint sell stays owned until the signature resolves.
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
                                     error!(
-                                        "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, position kept, new entries HALTED",
+                                        "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, reservation kept, position kept, new entries HALTED",
                                         position.mint, signature, position.wallet_pubkey, unresolved_reason
                                     );
                                     continue;
                                 }
                                 Err(e) => {
                                     // §61: structural observer failure is not tx-failure proof.
+                                    // B10: structural reconciler Err => KEEP the reservation.
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
                                     error!(
-                                        "CRITICAL: sell reconciliation error for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
+                                        "CRITICAL: sell reconciliation error for {} (sig {}): {} - pending kept, reservation kept, position kept, new entries HALTED",
                                         position.symbol, signature, e
                                     );
                                     continue;
@@ -1017,6 +1178,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             signature, e
                                         );
                                     }
+                                    // B10: ConfirmedFill applied + pending removed LAST => release
+                                    // the same-mint reservation.
+                                    release_sell_mint(&monitor_active_sells, &position.mint);
                                 }
                             }
                         }
@@ -1721,22 +1885,28 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 &trade.mint[..12], alert.reason
                                             );
                                         } else {
-                                            // §E2 PENDING GUARD: if a Sell for this mint is already
-                                            // in flight, do NOT submit a second emergency sell. Keep
-                                            // the kill-switch alert active and log the pending sig.
-                                            if let Some(existing) = pending_executions
+                                            // §E2 / B8 PENDING GUARD: a pending Buy OR Sell for this
+                                            // mint blocks an emergency sell. Keep the alert active.
+                                            let ks_pending_buy = pending_executions
+                                                .get_for_mint(&trade.mint, ReconciliationSide::Buy)
+                                                .await;
+                                            let ks_pending_sell = pending_executions
                                                 .get_for_mint(&trade.mint, ReconciliationSide::Sell)
-                                                .await
-                                            {
+                                                .await;
+                                            if let Some(sig) = pending_blocks_automatic_sell(
+                                                ks_pending_buy.as_ref(),
+                                                ks_pending_sell.as_ref(),
+                                            ) {
                                                 warn!(
-                                                    "KILL-SWITCH: pending sell already in flight for {} (sig {}) - not submitting a second emergency sell; alert remains active",
-                                                    &trade.mint[..12], existing.signature
+                                                    "KILL-SWITCH: pending Buy/Sell already in flight for {} (sig {}) - not submitting a second emergency sell; alert remains active",
+                                                    &trade.mint[..12], sig
                                                 );
-                                            } else if let Some(ref trader) = trader_arc {
-                                                // §E3 EXACT ROUTE: resolve the exact execution route
-                                                // and signer for the position's recorded wallet.
+                                            } else {
+                                                // §E3 / B12 EXACT ROUTE: resolve the exact execution
+                                                // route and signer for the position's recorded wallet
+                                                // via the recovery registry — NOT the new-buy mode.
                                                 // Empty/invalid wallet, unknown route, or missing
-                                                // Local signer => no sell + halt new entries. No
+                                                // trader/signer => no sell + halt new entries. No
                                                 // Lightning->Local fallback (INV-WALLET-001/003).
                                                 let position_wallet = match Pubkey::from_str(
                                                     position.wallet_pubkey.trim(),
@@ -1752,6 +1922,36 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                     }
                                                 };
 
+                                                // B9 step (2)/(3): reserve the mint via the SHARED
+                                                // coordinator. If the primary monitor already owns an
+                                                // in-flight sell for this mint, skip (no second sell).
+                                                if !try_reserve_sell_mint(&active_sell_mints, &trade.mint) {
+                                                    warn!(
+                                                        "KILL-SWITCH: primary sell reservation already active for {} - not submitting a second emergency sell",
+                                                        &trade.mint[..12]
+                                                    );
+                                                    continue;
+                                                }
+
+                                                // B9 step (4): re-check pending Buy/Sell after reserving.
+                                                let ks_recheck_buy = pending_executions
+                                                    .get_for_mint(&trade.mint, ReconciliationSide::Buy)
+                                                    .await;
+                                                let ks_recheck_sell = pending_executions
+                                                    .get_for_mint(&trade.mint, ReconciliationSide::Sell)
+                                                    .await;
+                                                if let Some(sig) = pending_blocks_automatic_sell(
+                                                    ks_recheck_buy.as_ref(),
+                                                    ks_recheck_sell.as_ref(),
+                                                ) {
+                                                    release_sell_mint(&active_sell_mints, &trade.mint);
+                                                    warn!(
+                                                        "KILL-SWITCH: pending Buy/Sell appeared for {} after reservation (sig {}) - reservation released, no sell",
+                                                        &trade.mint[..12], sig
+                                                    );
+                                                    continue;
+                                                }
+
                                                 let slippage_pct = config.trading.slippage_bps / 100;
                                                 let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
 
@@ -1759,54 +1959,60 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 let routed_sell: Option<Result<String, crate::error::Error>> =
                                                     match recovery_registry.route_for(&position_wallet) {
                                                         Some(crate::wallet::ExecutionRoute::Local) => {
-                                                            // Exact local signer: primary keypair if its
-                                                            // pubkey matches, else recovery multi-wallet.
-                                                            if keypair.pubkey() == position_wallet {
-                                                                info!(
-                                                                    "KILL-SWITCH: Local sell for {} via primary keypair",
-                                                                    &trade.mint[..12]
-                                                                );
-                                                                Some(trader.sell_local(
-                                                                    &trade.mint,
-                                                                    "100%",
-                                                                    slippage_pct,
-                                                                    priority_fee,
-                                                                    &keypair,
-                                                                    &rpc_client,
-                                                                ).await)
-                                                            } else if let Some(ref mw) = recovery_multi_wallet {
-                                                                match mw.find_by_address(&position.wallet_pubkey) {
-                                                                    Some(tw) => {
+                                                            // Exact local signer + independent Local exit
+                                                            // trader ONLY.
+                                                            match primary_exit_local_trader {
+                                                                None => None,
+                                                                Some(ref local_trader) => {
+                                                                    if keypair.pubkey() == position_wallet {
                                                                         info!(
-                                                                            "KILL-SWITCH: Local sell for {} via recovery wallet {}",
-                                                                            &trade.mint[..12], position.wallet_pubkey
+                                                                            "KILL-SWITCH: Local sell for {} via primary keypair",
+                                                                            &trade.mint[..12]
                                                                         );
-                                                                        Some(trader.sell_local(
+                                                                        Some(local_trader.sell_local(
                                                                             &trade.mint,
                                                                             "100%",
                                                                             slippage_pct,
                                                                             priority_fee,
-                                                                            &tw.keypair,
+                                                                            &keypair,
                                                                             &rpc_client,
                                                                         ).await)
+                                                                    } else if let Some(ref mw) = recovery_multi_wallet {
+                                                                        match mw.find_by_address(&position.wallet_pubkey) {
+                                                                            Some(tw) => {
+                                                                                info!(
+                                                                                    "KILL-SWITCH: Local sell for {} via recovery wallet {}",
+                                                                                    &trade.mint[..12], position.wallet_pubkey
+                                                                                );
+                                                                                Some(local_trader.sell_local(
+                                                                                    &trade.mint,
+                                                                                    "100%",
+                                                                                    slippage_pct,
+                                                                                    priority_fee,
+                                                                                    &tw.keypair,
+                                                                                    &rpc_client,
+                                                                                ).await)
+                                                                            }
+                                                                            None => None,
+                                                                        }
+                                                                    } else {
+                                                                        None
                                                                     }
-                                                                    None => None,
                                                                 }
-                                                            } else {
-                                                                None
                                                             }
                                                         }
                                                         Some(crate::wallet::ExecutionRoute::Lightning) => {
-                                                            // Require a Lightning trader / API key. No
-                                                            // Local fallback.
-                                                            if config.pumpportal.api_key.is_empty() || use_local_api {
-                                                                None
-                                                            } else {
-                                                                info!(
-                                                                    "KILL-SWITCH: Lightning sell for {}",
-                                                                    &trade.mint[..12]
-                                                                );
-                                                                Some(trader.sell(&trade.mint, "100%", slippage_pct, priority_fee).await)
+                                                            // Independent Lightning exit trader ONLY.
+                                                            // No Local fallback.
+                                                            match primary_exit_lightning_trader {
+                                                                None => None,
+                                                                Some(ref lightning_trader) => {
+                                                                    info!(
+                                                                        "KILL-SWITCH: Lightning sell for {}",
+                                                                        &trade.mint[..12]
+                                                                    );
+                                                                    Some(lightning_trader.sell(&trade.mint, "100%", slippage_pct, priority_fee).await)
+                                                                }
                                                             }
                                                         }
                                                         None => None,
@@ -1816,8 +2022,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                     Some(r) => r,
                                                     None => {
                                                         new_entries_halted.store(true, Ordering::SeqCst);
+                                                        release_sell_mint(&active_sell_mints, &trade.mint);
                                                         error!(
-                                                            "KILL-SWITCH: no exact signer/route for position {} wallet {} - no sell, new entries HALTED",
+                                                            "KILL-SWITCH: no exact signer/route/trader for position {} wallet {} - no sell, reservation released, new entries HALTED",
                                                             &trade.mint[..12], position.wallet_pubkey
                                                         );
                                                         continue;
@@ -1844,6 +2051,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                                 &e.to_string(),
                                                             ).await;
                                                         }
+                                                        // B10: provider error / no signature => release.
+                                                        release_sell_mint(&active_sell_mints, &trade.mint);
                                                         continue;
                                                     }
                                                 };
@@ -1904,22 +2113,26 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                                 &error,
                                                             ).await;
                                                         }
+                                                        // B10: ConfirmedFailure => pending removed, release.
+                                                        release_sell_mint(&active_sell_mints, &trade.mint);
                                                         continue;
                                                     }
                                                     Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
-                                                        // Keep pending, halt new entries, keep position.
+                                                        // B10: Unresolved => KEEP pending AND KEEP the
+                                                        // reservation; halt new entries, keep position.
                                                         new_entries_halted.store(true, Ordering::SeqCst);
                                                         error!(
-                                                            "KILL-SWITCH SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, position kept, new entries HALTED",
+                                                            "KILL-SWITCH SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, reservation kept, position kept, new entries HALTED",
                                                             position.mint, signature, position.wallet_pubkey, unresolved_reason
                                                         );
                                                         continue;
                                                     }
                                                     Err(e) => {
-                                                        // Structural observer failure is not tx-failure proof.
+                                                        // B10: structural reconciler Err => KEEP the
+                                                        // reservation (not tx-failure proof).
                                                         new_entries_halted.store(true, Ordering::SeqCst);
                                                         error!(
-                                                            "CRITICAL: kill-switch sell reconciliation error for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
+                                                            "CRITICAL: kill-switch sell reconciliation error for {} (sig {}): {} - pending kept, reservation kept, position kept, new entries HALTED",
                                                             &trade.mint[..12], signature, e
                                                         );
                                                         continue;
@@ -2050,6 +2263,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                                 signature, e
                                                             );
                                                         }
+                                                        // B10: ConfirmedFill applied + pending removed
+                                                        // LAST => release the same-mint reservation.
+                                                        release_sell_mint(&active_sell_mints, &trade.mint);
                                                     }
                                                 }
                                             }
@@ -5554,7 +5770,13 @@ async fn recover_pending_store(
 
     let mut summary = RecoverySummary::default();
 
-    for pending in pending_store.all().await {
+    // B1: deterministic recovery order. `all()` is HashMap-backed and returns an
+    // arbitrary order; process oldest-submitted first (signature tie-break) so
+    // recovery is reproducible.
+    let mut pending_items = pending_store.all().await;
+    sort_pending_for_recovery(&mut pending_items);
+
+    for pending in pending_items {
         let plan = match reconcile_pending_execution(reconciler, &pending).await {
             Ok(plan) => plan,
             Err(e) => {
@@ -5612,6 +5834,7 @@ async fn recover_pending_store(
 
             PendingRecoveryPlan::ConfirmedSell {
                 pending,
+                fill,
                 sold_amount_raw,
                 received_sol,
                 intent,
@@ -5620,6 +5843,7 @@ async fn recover_pending_store(
                 match apply_recovered_sell(
                     positions,
                     &pending,
+                    fill.token_decimals,
                     sold_amount_raw,
                     received_sol,
                     intent,
@@ -5670,10 +5894,29 @@ async fn recover_pending_store(
 async fn apply_recovered_sell(
     positions: &crate::position::manager::PositionManager,
     pending: &PendingExecution,
+    fill_token_decimals: u8,
     sold_amount_raw: u64,
     received_sol: f64,
     intent: PendingSellIntent,
 ) -> crate::error::Result<()> {
+    // B2: if an open Position exists, its confirmed entry decimals MUST equal the
+    // recovered sell fill decimals BEFORE we close it. A mismatch or unknown
+    // decimals means the tracked cost basis and the on-chain fill disagree; fail
+    // closed and KEEP the pending so restart recovery retries (never close on
+    // ambiguous accounting). If the Position is absent, the durable full-exit
+    // receipt replay is allowed (close_position_reconciled is idempotent).
+    if let Some(open) = positions.get_position(&pending.mint).await {
+        match open.token_decimals {
+            Some(d) if d == fill_token_decimals => {}
+            other => {
+                return Err(crate::error::Error::PositionAccounting(format!(
+                    "recovered sell decimals mismatch for mint {} (sig {}): position decimals {:?} != fill decimals {}",
+                    pending.mint, pending.signature, other, fill_token_decimals
+                )));
+            }
+        }
+    }
+
     let close_result = positions
         .close_position_reconciled(&pending.mint, &pending.signature, sold_amount_raw, received_sol)
         .await?;
@@ -5965,10 +6208,20 @@ async fn recover_legacy_positions(
         }
 
         // 0 < current <= original: canonicalize with prorated remaining cost.
-        let decimals = match current.decimals.or(Some(fill.token_decimals)) {
-            Some(d) => d,
-            None => {
+        //
+        // B3: the CURRENT probed account decimals must EXACTLY equal the original
+        // confirmed-entry fill decimals. No fallback to the entry decimals when
+        // the probe reports None or a different value — that would migrate an
+        // account whose on-chain decimals disagree with the tracked cost basis.
+        // Mismatch/None => keep recovery-required, do NOT migrate.
+        let decimals = match current.decimals {
+            Some(d) if d == fill.token_decimals => d,
+            other => {
                 summary.still_recovery_required += 1;
+                warn!(
+                    "Legacy recovery: mint {} current account decimals {:?} != confirmed entry decimals {} - keeping recovery-required, not migrating",
+                    position.mint, other, fill.token_decimals
+                );
                 continue;
             }
         };
@@ -6047,6 +6300,93 @@ fn position_is_canonical_for_restore(
     match position.wallet_pubkey.parse::<Pubkey>() {
         Ok(pk) => registry.route_for(&pk).is_some(),
         Err(_) => false,
+    }
+}
+
+// ===========================================================================
+// AGENT B — shared primary startup / exit coordination helpers (B1/B5/B7/B8)
+// ===========================================================================
+
+/// B1: deterministically order pending recovery items by submission time, then
+/// signature. `PendingExecutionStore::all()` is HashMap-backed and returns an
+/// arbitrary order; startup recovery must be reproducible so that same-mint or
+/// same-wallet in-flight submissions are always resolved oldest-first.
+fn sort_pending_for_recovery(items: &mut [PendingExecution]) {
+    items.sort_by(|a, b| {
+        a.submitted_at
+            .cmp(&b.submitted_at)
+            .then_with(|| a.signature.cmp(&b.signature))
+    });
+}
+
+/// B8: pure predicate mirroring the "pending Buy OR Sell blocks an automatic
+/// exit" decision for a mint. Either an unresolved Buy or an unresolved Sell for
+/// the same mint must prevent a new automatic sell submission. Returns the
+/// blocking signature (Sell preferred for logging) when blocked.
+fn pending_blocks_automatic_sell(
+    pending_buy: Option<&PendingExecution>,
+    pending_sell: Option<&PendingExecution>,
+) -> Option<String> {
+    if let Some(p) = pending_sell {
+        return Some(p.signature.clone());
+    }
+    if let Some(p) = pending_buy {
+        return Some(p.signature.clone());
+    }
+    None
+}
+
+/// B5: pure operational-exit-route predicate. A position can actually be exited
+/// by an automatic producer iff ALL hold:
+/// - decimals are known (canonical accounting);
+/// - the recorded wallet parses to a valid pubkey;
+/// - the recovery registry has a route for that wallet;
+/// - the route's execution trader handle is actually available
+///   (Local => `local_trader_available`, Lightning => `lightning_trader_available`).
+fn position_has_operational_exit_route(
+    position: &crate::position::manager::Position,
+    registry: &crate::wallet::ExecutionWalletRegistry,
+    local_trader_available: bool,
+    lightning_trader_available: bool,
+) -> bool {
+    if position.token_decimals.is_none() {
+        return false;
+    }
+    let wallet = match position.wallet_pubkey.parse::<Pubkey>() {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+    match registry.route_for(&wallet) {
+        Some(crate::wallet::ExecutionRoute::Local) => local_trader_available,
+        Some(crate::wallet::ExecutionRoute::Lightning) => lightning_trader_available,
+        None => false,
+    }
+}
+
+// --- B7: shared same-mint primary sell coordinator -------------------------
+
+/// B7: process-wide set of mints with an in-flight primary sell reservation.
+/// Shared (cloned) into BOTH the primary auto-sell monitor and the event
+/// kill-switch so the two concurrent sell producers cannot submit two sells for
+/// the same mint before either signature is journaled.
+type ActiveSellMints = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// B7: attempt to reserve `mint` for a primary sell. Returns true iff the mint
+/// was newly reserved. A mint already reserved returns false (another producer
+/// owns the in-flight sell). A poisoned lock fails closed (false): we never
+/// submit a sell we cannot coordinate.
+fn try_reserve_sell_mint(active: &ActiveSellMints, mint: &str) -> bool {
+    match active.lock() {
+        Ok(mut set) => set.insert(mint.to_string()),
+        Err(_) => false,
+    }
+}
+
+/// B7: release a mint's primary sell reservation. A poisoned lock is ignored
+/// (the reservation cannot be observed as free again, which is fail-closed).
+fn release_sell_mint(active: &ActiveSellMints, mint: &str) {
+    if let Ok(mut set) = active.lock() {
+        set.remove(mint);
     }
 }
 
@@ -6575,13 +6915,13 @@ mod tests {
 
         let pending = sell_pending(T_MINT, &wallet, "exit-full", PendingSellIntent::Full);
         // Sell the ENTIRE 100 raw => full close.
-        apply_recovered_sell(&mgr, &pending, 100, 0.5, PendingSellIntent::Full)
+        apply_recovered_sell(&mgr, &pending, 6, 100, 0.5, PendingSellIntent::Full)
             .await
             .unwrap();
         assert!(mgr.get_position(T_MINT).await.is_none(), "position should be fully closed");
 
         // Idempotent replay of the same exit signature must not error / double-count.
-        apply_recovered_sell(&mgr, &pending, 100, 0.5, PendingSellIntent::Full)
+        apply_recovered_sell(&mgr, &pending, 6, 100, 0.5, PendingSellIntent::Full)
             .await
             .unwrap();
         assert!(mgr.get_position(T_MINT).await.is_none());
@@ -6598,7 +6938,7 @@ mod tests {
             .unwrap();
 
         let pending = sell_pending(T_MINT, &wallet, "exit-quick", PendingSellIntent::QuickProfit);
-        apply_recovered_sell(&mgr, &pending, 40, 0.3, PendingSellIntent::QuickProfit)
+        apply_recovered_sell(&mgr, &pending, 6, 40, 0.3, PendingSellIntent::QuickProfit)
             .await
             .unwrap();
         let pos = mgr.get_position(T_MINT).await.expect("partial remains");
@@ -6607,7 +6947,7 @@ mod tests {
         assert_eq!(pos.token_amount, 60);
 
         // Idempotent replay: still no error, flag stays set.
-        apply_recovered_sell(&mgr, &pending, 40, 0.3, PendingSellIntent::QuickProfit)
+        apply_recovered_sell(&mgr, &pending, 6, 40, 0.3, PendingSellIntent::QuickProfit)
             .await
             .unwrap();
         assert!(mgr.get_position(T_MINT).await.unwrap().quick_profit_taken);
@@ -6623,7 +6963,7 @@ mod tests {
             .unwrap();
 
         let pending = sell_pending(T_MINT, &wallet, "exit-second", PendingSellIntent::SecondProfit);
-        apply_recovered_sell(&mgr, &pending, 25, 0.2, PendingSellIntent::SecondProfit)
+        apply_recovered_sell(&mgr, &pending, 6, 25, 0.2, PendingSellIntent::SecondProfit)
             .await
             .unwrap();
         let pos = mgr.get_position(T_MINT).await.expect("partial remains");
@@ -6640,7 +6980,7 @@ mod tests {
             .await
             .unwrap();
         let pending = sell_pending(T_MINT, &wallet, "exit-manual", PendingSellIntent::Manual);
-        apply_recovered_sell(&mgr, &pending, 40, 0.3, PendingSellIntent::Manual)
+        apply_recovered_sell(&mgr, &pending, 6, 40, 0.3, PendingSellIntent::Manual)
             .await
             .unwrap();
         let pos = mgr.get_position(T_MINT).await.unwrap();
@@ -6962,5 +7302,217 @@ mod tests {
     #[test]
     fn test_manual_sell_no_pending_not_blocked() {
         assert_eq!(manual_sell_pending_block(None, None), None);
+    }
+
+    // ===================================================================
+    // AGENT B — primary startup / exit coordination tests (B13)
+    // ===================================================================
+
+    fn new_active_sell_mints() -> ActiveSellMints {
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    /// B7: the shared same-mint sell coordinator lets exactly one producer reserve
+    /// a mint. A second reservation of the SAME mint fails until it is released.
+    #[test]
+    fn test_primary_sell_reservation_blocks_second_same_mint() {
+        let active = new_active_sell_mints();
+        // First producer reserves the mint.
+        assert!(try_reserve_sell_mint(&active, T_MINT));
+        // Second producer (e.g. kill-switch) for the same mint is blocked.
+        assert!(!try_reserve_sell_mint(&active, T_MINT));
+        // A DIFFERENT mint is independently reservable.
+        let other_mint = "Mint2222222222222222222222222222222222222222";
+        assert!(try_reserve_sell_mint(&active, other_mint));
+    }
+
+    /// B7: releasing a mint's reservation allows a later retry to reserve it again.
+    #[test]
+    fn test_primary_sell_reservation_release_allows_retry() {
+        let active = new_active_sell_mints();
+        assert!(try_reserve_sell_mint(&active, T_MINT));
+        assert!(!try_reserve_sell_mint(&active, T_MINT));
+        release_sell_mint(&active, T_MINT);
+        // After release the mint is free to reserve again.
+        assert!(try_reserve_sell_mint(&active, T_MINT));
+    }
+
+    /// B5: an additional-local (multi-wallet) position has an operational exit
+    /// route iff a Local exit trader is available. Registry routes the wallet
+    /// Local because it is in the local set.
+    #[test]
+    fn test_operational_exit_route_additional_local_wallet() {
+        let primary = Pubkey::new_unique();
+        let additional = Pubkey::new_unique();
+        // Registry recognizes an ADDITIONAL local wallet (multi-wallet recovery).
+        let registry = ExecutionWalletRegistry::new(primary, &[additional], None);
+        let pos = canonical_position(T_MINT, &additional.to_string(), "s", 100);
+        assert_eq!(
+            registry.route_for(&additional),
+            Some(crate::wallet::ExecutionRoute::Local)
+        );
+        // Local trader available => operational.
+        assert!(position_has_operational_exit_route(&pos, &registry, true, false));
+        // No Local trader => NOT operational (cannot actually sign/submit).
+        assert!(!position_has_operational_exit_route(&pos, &registry, false, false));
+
+        // An unknown wallet has no route => never operational.
+        let unknown = canonical_position(T_MINT, &Pubkey::new_unique().to_string(), "s", 100);
+        assert!(!position_has_operational_exit_route(&unknown, &registry, true, true));
+    }
+
+    /// B5: a Lightning-route position has an operational exit route iff a Lightning
+    /// exit trader is available. A local trader does NOT satisfy a Lightning route.
+    #[test]
+    fn test_operational_exit_route_lightning_requires_trader() {
+        let primary = Pubkey::new_unique();
+        let lightning = Pubkey::new_unique();
+        let registry = ExecutionWalletRegistry::new(primary, &[], Some(lightning));
+        let pos = canonical_position(T_MINT, &lightning.to_string(), "s", 100);
+        assert_eq!(
+            registry.route_for(&lightning),
+            Some(crate::wallet::ExecutionRoute::Lightning)
+        );
+        // Lightning trader available => operational.
+        assert!(position_has_operational_exit_route(&pos, &registry, false, true));
+        // No Lightning trader (even with a local trader) => NOT operational; no
+        // Lightning->Local fallback.
+        assert!(!position_has_operational_exit_route(&pos, &registry, true, false));
+
+        // Unknown decimals => never operational even with a trader.
+        let mut no_dec = pos.clone();
+        no_dec.token_decimals = None;
+        assert!(!position_has_operational_exit_route(&no_dec, &registry, true, true));
+    }
+
+    /// B1: pending recovery is ordered by submission time, then signature. Build
+    /// records out of order and confirm the sort is chronological with a signature
+    /// tie-break.
+    #[test]
+    fn test_pending_recovery_sort_is_chronological() {
+        use chrono::{Duration, Utc};
+        let base = Utc::now();
+        let mk = |sig: &str, offset_ms: i64| {
+            let mut p = PendingExecution::sell(
+                sig.to_string(),
+                T_MINT.to_string(),
+                "wallet".to_string(),
+                PendingSellContext {
+                    requested_amount: "100%".to_string(),
+                    intent: PendingSellIntent::Full,
+                    reason: "r".to_string(),
+                },
+            );
+            p.submitted_at = base + Duration::milliseconds(offset_ms);
+            p
+        };
+        // Two share a submitted_at (tie => signature order "sig-a" < "sig-b").
+        let mut items = vec![
+            mk("sig-late", 100),
+            mk("sig-b", 0),
+            mk("sig-a", 0),
+        ];
+        sort_pending_for_recovery(&mut items);
+        let order: Vec<&str> = items.iter().map(|p| p.signature.as_str()).collect();
+        assert_eq!(order, vec!["sig-a", "sig-b", "sig-late"]);
+    }
+
+    /// B1 explicit tie-break naming coverage (submission time first, then signature).
+    #[test]
+    fn test_pending_recovery_order_is_submission_time_then_signature() {
+        use chrono::{Duration, Utc};
+        let base = Utc::now();
+        let mk = |sig: &str, offset_ms: i64| {
+            let mut p = PendingExecution::sell(
+                sig.to_string(),
+                T_MINT.to_string(),
+                "wallet".to_string(),
+                PendingSellContext {
+                    requested_amount: "100%".to_string(),
+                    intent: PendingSellIntent::Full,
+                    reason: "r".to_string(),
+                },
+            );
+            p.submitted_at = base + Duration::milliseconds(offset_ms);
+            p
+        };
+        // Earlier submitted_at wins even when its signature sorts later.
+        let mut items = vec![mk("zzz-earlier", -10), mk("aaa-later", 10)];
+        sort_pending_for_recovery(&mut items);
+        assert_eq!(items[0].signature, "zzz-earlier");
+        assert_eq!(items[1].signature, "aaa-later");
+    }
+
+    /// B2: a recovered confirmed SELL must be rejected BEFORE close when the open
+    /// Position's decimals disagree with the fill decimals. The position is NOT
+    /// closed (kept for restart recovery). If the Position is absent, the durable
+    /// full-exit receipt replay is still allowed.
+    #[tokio::test]
+    async fn test_recovered_sell_decimal_mismatch_is_rejected_before_close() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        // Position tracked with decimals Some(6).
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+
+        let pending = sell_pending(T_MINT, &wallet, "exit-mismatch", PendingSellIntent::Full);
+        // Fill decimals 9 != position decimals 6 => must fail closed, no close.
+        let res = apply_recovered_sell(&mgr, &pending, 9, 100, 0.5, PendingSellIntent::Full).await;
+        assert!(res.is_err(), "decimal mismatch must be rejected");
+        assert!(
+            mgr.get_position(T_MINT).await.is_some(),
+            "position must NOT be closed on decimal mismatch"
+        );
+
+        // Matching decimals (6) proceed to a full close.
+        apply_recovered_sell(&mgr, &pending, 6, 100, 0.5, PendingSellIntent::Full)
+            .await
+            .unwrap();
+        assert!(mgr.get_position(T_MINT).await.is_none());
+    }
+
+    /// B8: a pending Buy (or Sell) for the mint blocks a primary automatic sell
+    /// submission — exercised via the pure predicate both producers use.
+    #[test]
+    fn test_primary_pending_buy_blocks_sell_submission() {
+        let buy = PendingExecution::buy(
+            "buysig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingBuyContext {
+                requested_sol: 0.05,
+                name: "n".to_string(),
+                symbol: "s".to_string(),
+                bonding_curve: "bc".to_string(),
+                entry_type: crate::position::manager::EntryType::Opportunity,
+            },
+        );
+        // Pending Buy alone blocks (surfaces the buy signature).
+        assert_eq!(
+            pending_blocks_automatic_sell(Some(&buy), None),
+            Some("buysig".to_string())
+        );
+        let sell = PendingExecution::sell(
+            "sellsig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::Full,
+                reason: "r".to_string(),
+            },
+        );
+        // Pending Sell alone blocks (Sell signature preferred when both present).
+        assert_eq!(
+            pending_blocks_automatic_sell(None, Some(&sell)),
+            Some("sellsig".to_string())
+        );
+        assert_eq!(
+            pending_blocks_automatic_sell(Some(&buy), Some(&sell)),
+            Some("sellsig".to_string())
+        );
+        // Neither => not blocked.
+        assert_eq!(pending_blocks_automatic_sell(None, None), None);
     }
 }
