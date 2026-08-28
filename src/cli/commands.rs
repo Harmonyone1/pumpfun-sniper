@@ -30,72 +30,10 @@ use crate::trading::{
 };
 use crate::wallet::{ExecutionWalletRegistry, WalletOwnershipProbe};
 
-/// Query actual token balance for a wallet and mint
-/// Returns the token balance or 0 if not found
-fn query_token_balance(
-    rpc_client: &solana_client::rpc_client::RpcClient,
-    wallet: &Pubkey,
-    mint: &str,
-) -> u64 {
-    use solana_client::rpc_request::TokenAccountsFilter;
-
-    let mint_pubkey = match Pubkey::from_str(mint) {
-        Ok(pk) => pk,
-        Err(_) => return 0,
-    };
-
-    // Try SPL Token program with Mint filter (works for both SPL and Token2022)
-    if let Ok(accounts) =
-        rpc_client.get_token_accounts_by_owner(wallet, TokenAccountsFilter::Mint(mint_pubkey))
-    {
-        for account in &accounts {
-            if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
-                if let Some(info) = parsed.parsed.get("info") {
-                    if let Some(token_amount) = info.get("tokenAmount") {
-                        if let Some(amount_str) = token_amount.get("amount") {
-                            if let Some(amount) = amount_str.as_str() {
-                                let bal = amount.parse::<u64>().unwrap_or(0);
-                                if bal > 0 {
-                                    return bal;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: Try Token2022 program explicitly (pump.fun tokens use this)
-    let token2022_program =
-        Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
-    if let Ok(accounts) = rpc_client
-        .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token2022_program))
-    {
-        for account in &accounts {
-            if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
-                if let Some(info) = parsed.parsed.get("info") {
-                    if let Some(account_mint) = info.get("mint") {
-                        if account_mint.as_str() == Some(mint) {
-                            if let Some(token_amount) = info.get("tokenAmount") {
-                                if let Some(amount_str) = token_amount.get("amount") {
-                                    if let Some(amount) = amount_str.as_str() {
-                                        let bal = amount.parse::<u64>().unwrap_or(0);
-                                        if bal > 0 {
-                                            return bal;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    0
-}
+// G10: `query_token_balance` (the old first-nonzero balance-poll helper) has been
+// deleted. After Agents F/G and primary 001B, no live path derives fill truth from
+// a balance poll; canonical exposure comes from reconciled fills and the exact
+// wallet ownership probe (crate::wallet::WalletOwnershipProbe).
 
 fn persist_bought_mints(path: &str, map: &std::collections::HashMap<String, i64>) {
     match serde_json::to_string_pretty(map) {
@@ -3366,11 +3304,11 @@ pub async fn hot_scan(
         }
     };
 
-    let hotscan_registry = ExecutionWalletRegistry::new(
+    let hotscan_registry = std::sync::Arc::new(ExecutionWalletRegistry::new(
         keypair.pubkey(),
         &hotscan_local_wallets,
         hotscan_lightning_wallet,
-    );
+    ));
     let hotscan_probe = WalletOwnershipProbe::new(rpc_client.clone());
 
     // Shared pending-execution journal at the SAME credentials path as start().
@@ -3403,7 +3341,7 @@ pub async fn hot_scan(
     let hotscan_legacy_summary = recover_legacy_positions(
         &trade_reconciler,
         &hotscan_probe,
-        &hotscan_registry,
+        hotscan_registry.as_ref(),
         &position_manager,
     )
     .await?;
@@ -3418,7 +3356,7 @@ pub async fn hot_scan(
     let hotscan_post_recovery_positions = position_manager.get_all_positions().await;
     let hotscan_residual_blocked = hotscan_post_recovery_positions
         .iter()
-        .filter(|p| legacy_recovery_required(p, &hotscan_registry))
+        .filter(|p| legacy_recovery_required(p, hotscan_registry.as_ref()))
         .count();
 
     if !hotscan_pending_summary.fully_resolved()
@@ -3576,32 +3514,31 @@ pub async fn hot_scan(
     if config.auto_sell.enabled && !dry_run {
         let monitor_config = config.clone();
         let monitor_positions = position_manager.clone();
-        let monitor_trader = trader.clone();
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
         let monitor_dex = DexScreenerClient::new();
         let monitor_bought_mints = bought_mints.clone();
         let monitor_bought_mints_path = bought_mints_path.clone();
         let monitor_sold_mints = sold_mints.clone();
-        let monitor_failed_mints = failed_mints.clone();
         let monitor_kill_switch = kill_switch_evaluator.clone();
-        let monitor_helius = helius_client.clone();
-        let monitor_use_local_api = use_local_api;
         let monitor_multi_wallet = multi_wallet.clone();
-        // Determine which wallet to query for token balances
-        let monitor_wallet = if use_local_api {
-            keypair.pubkey()
-        } else if !config.pumpportal.lightning_wallet.is_empty() {
-            Pubkey::from_str(&config.pumpportal.lightning_wallet)
-                .unwrap_or_else(|_| keypair.pubkey())
-        } else {
-            keypair.pubkey()
-        };
+        // === AGENT G: transaction-truth wiring for the HotScan SELL path ===
+        // Clone the already-initialized reconciler, shared pending journal, exact
+        // wallet registry, route-capable trader handles (Agent F), and the
+        // new-entry halt flag into the monitor task. The monitor now resolves the
+        // EXACT execution route per position (no global route, no Lightning->Local
+        // fallback) and reconciles every exit before touching position state.
+        let monitor_reconciler = trade_reconciler.clone();
+        let monitor_pending = pending_executions.clone();
+        let monitor_registry = hotscan_registry.clone();
+        let monitor_local_trader = hotscan_local_trader.clone();
+        let monitor_lightning_trader = hotscan_lightning_trader.clone();
+        let monitor_entry_halt = new_entries_halted.clone();
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
             let poll_interval_ms = monitor_config.auto_sell.price_poll_interval_ms;
-            info!("Features: Dynamic Trailing ({}%-{}%), Layered Exits ({}%/{}%/{}%), Kill-Switch, LOCAL FALLBACK",
+            info!("Features: Dynamic Trailing ({}%-{}%), Layered Exits ({}%/{}%/{}%), Kill-Switch, exact-wallet reconciled exits",
                 monitor_config.auto_sell.trailing_stop_base_pct,
                 monitor_config.auto_sell.trailing_stop_tight_pct,
                 monitor_config.auto_sell.quick_profit_pct,
@@ -3609,18 +3546,9 @@ pub async fn hot_scan(
                 monitor_config.auto_sell.take_profit_pct
             );
             info!("Poll interval: {}ms", poll_interval_ms);
-            if !monitor_use_local_api {
-                info!(
-                    "Using Lightning wallet for balance queries: {}",
-                    monitor_wallet
-                );
-            }
 
             let mut sell_attempts: std::collections::HashMap<String, u32> =
                 std::collections::HashMap::new();
-            // Track confirmed positions (tx landed and ATA exists)
-            let mut confirmed_positions: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
@@ -3698,58 +3626,12 @@ pub async fn hot_scan(
                         None => continue,
                     };
 
-                    // TX CONFIRMATION CHECK: Verify buy tx confirmed before allowing sells
-                    if !confirmed_positions.contains(&position.mint) {
-                        let position_age_secs = (chrono::Utc::now() - position.entry_time)
-                            .num_seconds()
-                            .max(0) as u64;
-
-                        // First 5 seconds: just wait
-                        if position_age_secs < 5 {
-                            continue;
-                        }
-
-                        // After 5 seconds: check if we have tokens
-                        // Use position's wallet_pubkey if available (multi-wallet), fallback to monitor_wallet
-                        let check_wallet = if !position.wallet_pubkey.is_empty() {
-                            Pubkey::from_str(&position.wallet_pubkey).unwrap_or(monitor_wallet)
-                        } else {
-                            monitor_wallet
-                        };
-                        let token_balance =
-                            query_token_balance(&monitor_rpc, &check_wallet, &position.mint);
-
-                        if token_balance > 0 {
-                            info!(
-                                "[{}] TX CONFIRMED - token balance: {}",
-                                position.symbol, token_balance
-                            );
-                            confirmed_positions.insert(position.mint.clone());
-                        } else if position_age_secs > 30 {
-                            // After 30 seconds with no tokens, assume tx failed
-                            warn!(
-                                "[{}] TX LIKELY FAILED - no tokens after 30s, removing position (30min cooldown)",
-                                position.symbol
-                            );
-                            let _ = monitor_positions.abandon_position(&position.mint).await;
-                            let _ = remove_bought_mint(
-                                &monitor_bought_mints,
-                                &monitor_bought_mints_path,
-                                &position.mint,
-                            )
-                            .await;
-                            // Add to failed_mints with 30 minute cooldown to prevent repeated failures
-                            {
-                                let mut failed = monitor_failed_mints.lock().await;
-                                failed.insert(position.mint.clone(), chrono::Utc::now().timestamp());
-                                info!("[{}] Added to failed_mints blacklist (30min cooldown)", position.symbol);
-                            }
-                            continue;
-                        } else {
-                            // Still waiting for confirmation
-                            continue;
-                        }
-                    }
+                    // G1: The old post-buy TX-confirmation polling (the tracking
+                    // HashSet, the 5s wait, the token-balance poll, and the 30s
+                    // likely-failed abandon path) is GONE. After Agent F, a real
+                    // HotScan position exists ONLY after a ConfirmedFill; legacy
+                    // positions are handled by startup recovery or remain blocked.
+                    // The monitor never re-derives fill truth from a balance poll.
 
                     // Calculate P&L from entry
                     let pnl_pct = if position.entry_price > 0.0 {
@@ -3904,27 +3786,28 @@ pub async fn hot_scan(
                         }
                     }
 
-                    // Execute sell
+                    // === AGENT G: reconciled HotScan exit with EXACT wallet route ===
+                    // The kill-switch trigger already funnels into this same
+                    // `should_sell` block (G9), so it receives the identical
+                    // reconciled path — there is no separate estimated kill-switch
+                    // exit.
                     if should_sell {
                         warn!(
                             "AUTO-SELL TRIGGERED: {} ({}) - {}",
                             position.symbol, position.mint, reason
                         );
 
-                        if let Some(ref trader) = monitor_trader {
-                            let slippage = monitor_config.trading.slippage_bps / 100;
-                            let priority_fee =
-                                monitor_config.trading.priority_fee_lamports as f64 / 1e9;
+                        let slippage = monitor_config.trading.slippage_bps / 100;
+                        let priority_fee =
+                            monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
+                        // Keep the existing max retry count (5). Exceeding it leaves the
+                        // position OPEN/TRACKED (INV-POS-001); a failed submission must
+                        // never make a wallet-owned position disappear.
+                        {
                             let attempts = sell_attempts.entry(position.mint.clone()).or_insert(0);
                             *attempts += 1;
-
                             if *attempts > 5 {
-                                // INV-POS-002: a failed sell must never make a wallet-owned
-                                // position disappear from tracking. Do NOT abandon the position
-                                // or drop it from bought-mints. Leave it OPEN/TRACKED, reset the
-                                // retry counter, and let a later cycle retry. Reconciliation is a
-                                // later packet.
                                 error!(
                                     "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
                                     position.symbol
@@ -3932,220 +3815,354 @@ pub async fn hot_scan(
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
+                        }
+                        let attempt_no = *sell_attempts.get(&position.mint).unwrap_or(&1);
 
-                            // Query SOL balance BEFORE sell for real P&L tracking
-                            // Use position's wallet if available (multi-wallet), fallback to monitor_wallet
-                            let position_wallet = if !position.wallet_pubkey.is_empty() {
-                                Pubkey::from_str(&position.wallet_pubkey).unwrap_or(monitor_wallet)
-                            } else {
-                                monitor_wallet
-                            };
-                            let sol_before = monitor_rpc
-                                .get_balance(&position_wallet)
-                                .unwrap_or(0) as f64
-                                / 1_000_000_000.0;
+                        // G2 PENDING SELL GUARD: if a Sell for this mint is already in
+                        // flight, do NOT submit a second sell. Keep the position.
+                        if let Some(existing) = monitor_pending
+                            .get_for_mint(&position.mint, ReconciliationSide::Sell)
+                            .await
+                        {
+                            warn!(
+                                "[{}] pending sell already in flight (sig {}) - not submitting a second exit; position kept",
+                                position.symbol, existing.signature
+                            );
+                            continue;
+                        }
 
-                            // Determine the correct keypair for this position
-                            // For multi-wallet, look up keypair by position's wallet_pubkey
-                            let sell_keypair: std::sync::Arc<solana_sdk::signature::Keypair> = if !position.wallet_pubkey.is_empty() {
-                                if let Some(ref mw) = monitor_multi_wallet {
-                                    // Find wallet matching position's pubkey
-                                    if let Some(wallet) = mw.find_by_address(&position.wallet_pubkey) {
-                                        std::sync::Arc::new(
-                                            solana_sdk::signature::Keypair::from_bytes(&wallet.keypair.to_bytes()).unwrap()
-                                        )
-                                    } else {
-                                        warn!("[{}] Position wallet {} not found in multi-wallet, using primary",
-                                              position.symbol, &position.wallet_pubkey[..8]);
-                                        monitor_keypair.clone()
+                        // G3 CANONICAL POSITION REQUIREMENT: token_decimals Some, wallet
+                        // Pubkey valid, and an exact registry route. No wallet fallback.
+                        if position.token_decimals.is_none() {
+                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                            error!(
+                                "[{}] position has unknown token_decimals - no sell, HotScan new entries HALTED",
+                                position.symbol
+                            );
+                            continue;
+                        }
+                        let position_wallet = match Pubkey::from_str(position.wallet_pubkey.trim()) {
+                            Ok(pk) if !position.wallet_pubkey.trim().is_empty() => pk,
+                            _ => {
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] empty/invalid wallet_pubkey '{}' - no sell, HotScan new entries HALTED",
+                                    position.symbol, position.wallet_pubkey
+                                );
+                                continue;
+                            }
+                        };
+                        let route = match monitor_registry.route_for(&position_wallet) {
+                            Some(r) => r,
+                            None => {
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] wallet {} has no route in registry - no sell, HotScan new entries HALTED",
+                                    position.symbol, position.wallet_pubkey
+                                );
+                                continue;
+                            }
+                        };
+
+                        // G5 INTENT MAPPING (does NOT change the requested "25%" amount).
+                        let intent = hotscan_sell_intent_for_layer(sell_pct);
+
+                        // G4 EXACT ROUTE per position. Ignore any global route. NO
+                        // Lightning-attempts-1-3-then-Local, NO primary signer fallback,
+                        // NO unwrap_or(monitor_wallet).
+                        let routed_sell: Option<Result<String, crate::error::Error>> = match route {
+                            crate::wallet::ExecutionRoute::Local => {
+                                // Local position => use the Local trader + EXACT local
+                                // signer (primary keypair if its pubkey matches, else the
+                                // recovery MultiWalletManager). Missing signer => no sell.
+                                match monitor_local_trader {
+                                    Some(ref local_trader) => {
+                                        if monitor_keypair.pubkey() == position_wallet {
+                                            info!(
+                                                "[{}] Local sell (attempt {}) via primary keypair",
+                                                position.symbol, attempt_no
+                                            );
+                                            Some(
+                                                local_trader
+                                                    .sell_local(
+                                                        &position.mint,
+                                                        sell_pct,
+                                                        slippage,
+                                                        priority_fee,
+                                                        &monitor_keypair,
+                                                        &monitor_rpc,
+                                                    )
+                                                    .await,
+                                            )
+                                        } else if let Some(ref mw) = monitor_multi_wallet {
+                                            match mw.find_by_address(&position.wallet_pubkey) {
+                                                Some(tw) => {
+                                                    info!(
+                                                        "[{}] Local sell (attempt {}) via recovery wallet {}",
+                                                        position.symbol, attempt_no, position.wallet_pubkey
+                                                    );
+                                                    Some(
+                                                        local_trader
+                                                            .sell_local(
+                                                                &position.mint,
+                                                                sell_pct,
+                                                                slippage,
+                                                                priority_fee,
+                                                                &tw.keypair,
+                                                                &monitor_rpc,
+                                                            )
+                                                            .await,
+                                                    )
+                                                }
+                                                None => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
                                     }
-                                } else {
-                                    monitor_keypair.clone()
+                                    None => None,
                                 }
-                            } else {
-                                monitor_keypair.clone()
-                            };
-
-                            // For Local API mode, use local signing directly
-                            // For Lightning mode, try Lightning first then fall back to local
-                            let sell_result: std::result::Result<String, crate::error::Error> =
-                                if monitor_use_local_api {
-                                    // Local API mode: use local signing with correct wallet
-                                    info!("Attempting Local API sell (attempt {}, wallet: {})",
-                                          attempts, &sell_keypair.pubkey().to_string()[..8]);
-                                    trader
-                                        .sell_local(
-                                            &position.mint,
-                                            sell_pct,
-                                            slippage,
-                                            priority_fee,
-                                            &sell_keypair,
-                                            &monitor_rpc,
-                                        )
-                                        .await
-                                } else if *attempts <= 3 {
-                                    info!("Attempting Lightning API sell (attempt {})", attempts);
-                                    trader
-                                        .sell(&position.mint, sell_pct, slippage, priority_fee)
-                                        .await
-                                } else {
-                                    warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
-                                    trader
-                                        .sell_local(
-                                            &position.mint,
-                                            sell_pct,
-                                            slippage,
-                                            priority_fee,
-                                            &sell_keypair,
-                                            &monitor_rpc,
-                                        )
-                                        .await
-                                };
-
-                            match sell_result {
-                                Ok(sig) => {
-                                    info!("AUTO-SELL EXECUTED: {} - {}", position.symbol, sig);
-                                    sell_attempts.remove(&position.mint);
-
-                                    // Wait for tx confirmation then query actual SOL received
-                                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                                    let sol_after = monitor_rpc
-                                        .get_balance(&position_wallet)
-                                        .unwrap_or(0) as f64
-                                        / 1_000_000_000.0;
-                                    let raw_received = (sol_after - sol_before).max(0.0);
-
-                                    // Sanity check: received SOL shouldn't be more than 10x position cost
-                                    // If it is, the balance query likely failed - use estimate instead
-                                    let max_reasonable = position.total_cost_sol * 10.0;
-                                    let actual_received = if raw_received > max_reasonable {
-                                        warn!(
-                                            "[{}] Balance query anomaly: before={:.4}, after={:.4}, diff={:.4} - using estimate",
-                                            position.symbol, sol_before, sol_after, raw_received
+                            }
+                            crate::wallet::ExecutionRoute::Lightning => {
+                                // Lightning position => Lightning trader ONLY. No Local
+                                // fallback (INV-WALLET-001/003).
+                                match monitor_lightning_trader {
+                                    Some(ref lightning_trader) => {
+                                        info!(
+                                            "[{}] Lightning sell (attempt {})",
+                                            position.symbol, attempt_no
                                         );
-                                        0.0 // Force fallback to estimate
-                                    } else {
-                                        raw_received
+                                        Some(
+                                            lightning_trader
+                                                .sell(&position.mint, sell_pct, slippage, priority_fee)
+                                                .await,
+                                        )
+                                    }
+                                    None => None,
+                                }
+                            }
+                        };
+
+                        let sell_result = match routed_sell {
+                            Some(r) => r,
+                            None => {
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] no exact signer/trader for wallet {} route {:?} - no sell, HotScan new entries HALTED",
+                                    position.symbol, position.wallet_pubkey, route
+                                );
+                                continue;
+                            }
+                        };
+
+                        // G5 SUBMISSION: on provider error keep the position; on signature
+                        // log SUBMITTED (not EXECUTED), persist pending, then reconcile.
+                        let signature = match sell_result {
+                            Ok(sig) => sig,
+                            Err(e) => {
+                                error!(
+                                    "AUTO-SELL SUBMISSION FAILED for {} (attempt {}): {} - position remains OPEN/TRACKED",
+                                    position.symbol, attempt_no, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        info!("AUTO-SELL SUBMITTED: {} (sig {})", position.symbol, signature);
+
+                        let pending_sell = PendingExecution::sell(
+                            signature.clone(),
+                            position.mint.clone(),
+                            position.wallet_pubkey.clone(),
+                            PendingSellContext {
+                                requested_amount: sell_pct.to_string(),
+                                intent,
+                                reason: reason.clone(),
+                            },
+                        );
+                        if let Err(e) = monitor_pending.upsert(pending_sell).await {
+                            // Signature already exists chain-side; persistence failed.
+                            // Halt new entries but STILL reconcile the submitted signature.
+                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                            error!(
+                                "[{}] failed to persist pending sell (sig {}): {} - HotScan new entries HALTED, still reconciling",
+                                position.symbol, signature, e
+                            );
+                        }
+
+                        // Reconcile: no fixed sleep, no estimated-proceeds fallback.
+                        let outcome = monitor_reconciler
+                            .reconcile(
+                                &signature,
+                                &position.wallet_pubkey,
+                                &position.mint,
+                                ReconciliationSide::Sell,
+                            )
+                            .await;
+
+                        match outcome {
+                            Ok(ReconciliationOutcome::ConfirmedFailure {
+                                error, observed_after_ms, ..
+                            }) => {
+                                // Remove pending, keep position, do NOT mark any layer.
+                                if let Err(e) = monitor_pending.remove(&signature).await {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "[{}] failed to remove pending sell after ConfirmedFailure (sig {}): {} - HotScan new entries HALTED",
+                                        position.symbol, signature, e
+                                    );
+                                }
+                                error!(
+                                    "AUTO-SELL CONFIRMED FAILED for {} (sig {}): {} ({}ms observed) - position remains OPEN/TRACKED",
+                                    position.symbol, signature, error, observed_after_ms
+                                );
+                                continue;
+                            }
+                            Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
+                                // KEEP pending, keep position + flags, halt new entries.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, position kept, HotScan new entries HALTED",
+                                    position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                // Structural observer failure is not tx-failure proof.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "CRITICAL: HotScan sell reconciliation error for {} (sig {}): {} - pending kept, position kept, HotScan new entries HALTED",
+                                    position.symbol, signature, e
+                                );
+                                continue;
+                            }
+                            Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+                                // Identity validation at the live boundary.
+                                if fill.side != ReconciliationSide::Sell
+                                    || fill.wallet != position.wallet_pubkey
+                                    || fill.mint != position.mint
+                                {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "CRITICAL: reconciled HotScan sell fill identity mismatch for sig {} - pending kept, position kept, HotScan new entries HALTED",
+                                        signature
+                                    );
+                                    continue;
+                                }
+
+                                // G6 economics via the pure fill validator (decimals match,
+                                // nonzero raw, finite delta/price, no oversell). Negative net
+                                // proceeds are allowed.
+                                let (actual_sold_raw, actual_received_sol, actual_exit_price) =
+                                    match primary_sell_fill_values(&fill, &position) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                                            error!(
+                                                "[{}] reconciled sell fill validation failed (sig {}): {} - pending kept, position kept, HotScan new entries HALTED",
+                                                position.symbol, signature, e
+                                            );
+                                            continue;
+                                        }
                                     };
 
-                                    // Calculate trade metrics
-                                    let hold_secs =
-                                        (chrono::Utc::now() - position.entry_time).num_seconds();
-                                    let price_change_pct = ((current_price - position.entry_price)
-                                        / position.entry_price)
-                                        * 100.0;
-
-                                    if sell_pct == "50%" {
-                                        // LAYER 1: Quick profit - sell 50%
-                                        let sell_amount = position.token_amount / 2;
-                                        // Use actual received SOL (fallback to estimate if 0)
-                                        let received = if actual_received > 0.0 {
-                                            actual_received
-                                        } else {
-                                            (sell_amount as f64 * current_price) * 0.98
-                                        };
-                                        let pnl_sol = received - (position.total_cost_sol / 2.0);
-                                        let _ = monitor_positions
-                                            .close_position(
-                                                &position.mint,
-                                                sell_amount,
-                                                received,
-                                            )
-                                            .await;
-                                        let _ = monitor_positions
-                                            .mark_quick_profit_taken(&position.mint)
-                                            .await;
-                                        info!("=== LAYER 1 PROFIT TAKEN (50%) ===");
-                                        info!(
-                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                            position.symbol,
-                                            position.entry_price,
-                                            current_price,
-                                            price_change_pct
+                                // G6 actual reconciled close (idempotent via receipt ledger).
+                                let close_result = match monitor_positions
+                                    .close_position_reconciled(
+                                        &position.mint,
+                                        &signature,
+                                        actual_sold_raw,
+                                        actual_received_sol,
+                                    )
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        monitor_entry_halt.store(true, Ordering::SeqCst);
+                                        error!(
+                                            "[{}] reconciled close failed (sig {}): {} - pending kept, HotScan new entries HALTED",
+                                            position.symbol, signature, e
                                         );
-                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
-                                              sell_amount, received, pnl_sol, hold_secs);
-                                    } else if sell_pct == "25%" {
-                                        // LAYER 2: Second profit - sell 25% of original (50% of remaining)
-                                        let sell_amount = position.token_amount / 2; // Half of what's left
-                                        let received = if actual_received > 0.0 {
-                                            actual_received
-                                        } else {
-                                            (sell_amount as f64 * current_price) * 0.98
-                                        };
-                                        // Cost basis is proportional to remaining position
-                                        let cost_ratio = sell_amount as f64 / position.token_amount as f64;
-                                        let cost_basis = position.total_cost_sol * cost_ratio;
-                                        let pnl_sol = received - cost_basis;
-                                        let _ = monitor_positions
-                                            .close_position(
-                                                &position.mint,
-                                                sell_amount,
-                                                received,
-                                            )
-                                            .await;
-                                        let _ = monitor_positions
-                                            .mark_second_profit_taken(&position.mint)
-                                            .await;
-                                        info!("=== LAYER 2 PROFIT TAKEN (25%) ===");
-                                        info!(
-                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                            position.symbol,
-                                            position.entry_price,
-                                            current_price,
-                                            price_change_pct
-                                        );
-                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
-                                              sell_amount, received, pnl_sol, hold_secs);
-                                    } else {
-                                        // Use actual received SOL (fallback to estimate if 0)
-                                        let received = if actual_received > 0.0 {
-                                            actual_received
-                                        } else {
-                                            (position.token_amount as f64 * current_price) * 0.98
-                                        };
-                                        let pnl_sol = received - position.total_cost_sol;
-                                        let pnl_pct = (pnl_sol / position.total_cost_sol) * 100.0;
-                                        let _ = monitor_positions
-                                            .close_position(
-                                                &position.mint,
-                                                position.token_amount,
-                                                received,
-                                            )
-                                            .await;
+                                        continue;
+                                    }
+                                };
 
-                                        // Clean up bought_mints on successful full sell
-                                        let _ = remove_bought_mint(
-                                            &monitor_bought_mints,
-                                            &monitor_bought_mints_path,
-                                            &position.mint,
-                                        )
-                                        .await;
+                                sell_attempts.remove(&position.mint);
 
-                                        // Add to sold_mints with 5-minute cooldown before re-entry
-                                        // This prevents immediate re-buy at the top
-                                        {
-                                            let mut sold = monitor_sold_mints.lock().await;
-                                            sold.insert(position.mint.clone(), chrono::Utc::now().timestamp());
-                                            info!("[{}] Added to sold_mints (5min cooldown before re-entry)", position.symbol);
+                                // G7/G8 full vs partial comes from the ACTUAL fill.
+                                let fully_closed = close_result.fully_closed;
+                                let already_applied = close_result.already_applied;
+                                let hold_secs =
+                                    (chrono::Utc::now() - position.entry_time).num_seconds();
+
+                                // G7 LAYER MARKERS: after a confirmed actual PARTIAL close,
+                                // apply the intent's marker. Even on idempotent replay a
+                                // missing marker may be applied while the position remains.
+                                // Never mark on failure/unresolved (handled above).
+                                if !fully_closed {
+                                    match intent {
+                                        PendingSellIntent::QuickProfit => {
+                                            let _ = monitor_positions
+                                                .mark_quick_profit_taken(&position.mint)
+                                                .await;
                                         }
-
-                                        info!("=== TRADE CLOSED (Full) ===");
-                                        info!(
-                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                            position.symbol,
-                                            position.entry_price,
-                                            current_price,
-                                            price_change_pct
-                                        );
-                                        info!("  Cost: {:.4} SOL | Received: {:.4} SOL (actual) | P&L: {:+.4} SOL ({:+.1}%) | Hold: {}s",
-                                              position.total_cost_sol, received, pnl_sol, pnl_pct, hold_secs);
+                                        PendingSellIntent::SecondProfit => {
+                                            let _ = monitor_positions
+                                                .mark_second_profit_taken(&position.mint)
+                                                .await;
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                Err(e) => {
+
+                                // G8 FULL-EXIT CACHE/COOLDOWN: only when the ACTUAL close is
+                                // fully_closed. A requested "100%" that only partially fills
+                                // must NOT remove bought_mint or mark the sold cooldown.
+                                if hotscan_full_exit_removes_cache(fully_closed) {
+                                    let _ = remove_bought_mint(
+                                        &monitor_bought_mints,
+                                        &monitor_bought_mints_path,
+                                        &position.mint,
+                                    )
+                                    .await;
+                                    {
+                                        let mut sold = monitor_sold_mints.lock().await;
+                                        sold.insert(
+                                            position.mint.clone(),
+                                            chrono::Utc::now().timestamp(),
+                                        );
+                                        info!(
+                                            "[{}] Added to sold_mints (5min cooldown before re-entry)",
+                                            position.symbol
+                                        );
+                                    }
+                                }
+
+                                if fully_closed {
+                                    info!("=== AUTO-SELL CONFIRMED (Full) ===");
+                                } else {
+                                    info!("=== AUTO-SELL CONFIRMED (Partial) ===");
+                                }
+                                info!(
+                                    "  {} (sig {}) | sold_raw={} decimals={} net_sol_delta={:+.9} exit_price={:.12} SOL/token | realized P&L: {:+.9} SOL | recon_wait={}ms | hold={}s{}",
+                                    position.symbol,
+                                    signature,
+                                    actual_sold_raw,
+                                    fill.token_decimals,
+                                    actual_received_sol,
+                                    actual_exit_price,
+                                    close_result.pnl_sol,
+                                    fill.reconciliation_wait_ms,
+                                    hold_secs,
+                                    if already_applied { " (already applied; idempotent)" } else { "" }
+                                );
+
+                                // Remove pending LAST, after durable position application.
+                                if let Err(e) = monitor_pending.remove(&signature).await {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
                                     error!(
-                                        "AUTO-SELL FAILED for {} (attempt {}): {}",
-                                        position.symbol, attempts, e
+                                        "[{}] failed to remove pending sell after confirmed fill (sig {}): {} - HotScan new entries HALTED; position state already applied",
+                                        position.symbol, signature, e
                                     );
                                 }
                             }
@@ -4989,6 +5006,82 @@ fn primary_sell_fill_values(
 /// market-price input is involved.
 fn kill_switch_unwatch_on_close(fully_closed: bool) -> bool {
     fully_closed
+}
+
+/// AGENT G — pure mapping of a HotScan requested layer string to the durable
+/// `PendingSellIntent` (G5). "50%" => QuickProfit, "25%" => SecondProfit, and any
+/// full/"100%"/other request => Full. This does NOT change the requested amount
+/// that is actually submitted; reconciliation accounts what was ACTUALLY sold.
+fn hotscan_sell_intent_for_layer(sell_pct: &str) -> PendingSellIntent {
+    match sell_pct {
+        "50%" => PendingSellIntent::QuickProfit,
+        "25%" => PendingSellIntent::SecondProfit,
+        _ => PendingSellIntent::Full,
+    }
+}
+
+/// AGENT G — pure full-exit cache/cooldown decision (G8). The bought-mint cache
+/// is removed and the sold-mint cooldown is added ONLY when the ACTUAL reconciled
+/// close fully closed the position. A requested "100%" that only partially fills
+/// must NOT remove the bought-mint or mark a full-exit cooldown. Actual fill
+/// controls; the requested amount is irrelevant here.
+fn hotscan_full_exit_removes_cache(fully_closed: bool) -> bool {
+    fully_closed
+}
+
+/// AGENT G — the exact-route action chosen for a HotScan exit (G4). Mirrors the
+/// live routing decision so it can be tested purely. A `Local` position resolves
+/// to the Local trader with an exact signer (primary or recovery multi-wallet); a
+/// `Lightning` position resolves to the Lightning trader ONLY. There is NO
+/// Lightning->Local fallback, NO primary-signer fallback, and an unknown/absent
+/// route or missing signer yields `NoRoute` (no sell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotScanSellAction {
+    LocalPrimary,
+    LocalRecovery,
+    Lightning,
+    NoRoute,
+}
+
+/// Pure classifier for the HotScan exit route (G4).
+///
+/// - `route` is the registry route for the position's EXACT recorded wallet.
+/// - `local_trader_available` / `lightning_trader_available` reflect which
+///   route-capable trader handles exist.
+/// - `primary_signer_matches` is true iff the primary local keypair's pubkey is
+///   the position wallet.
+/// - `recovery_signer_present` is true iff the recovery MultiWalletManager owns an
+///   exact signer for the position wallet.
+///
+/// A Lightning route NEVER maps to a Local action (no fallback), and a Local route
+/// NEVER maps to Lightning.
+fn hotscan_sell_action(
+    route: crate::wallet::ExecutionRoute,
+    local_trader_available: bool,
+    lightning_trader_available: bool,
+    primary_signer_matches: bool,
+    recovery_signer_present: bool,
+) -> HotScanSellAction {
+    match route {
+        crate::wallet::ExecutionRoute::Local => {
+            if !local_trader_available {
+                HotScanSellAction::NoRoute
+            } else if primary_signer_matches {
+                HotScanSellAction::LocalPrimary
+            } else if recovery_signer_present {
+                HotScanSellAction::LocalRecovery
+            } else {
+                HotScanSellAction::NoRoute
+            }
+        }
+        crate::wallet::ExecutionRoute::Lightning => {
+            if lightning_trader_available {
+                HotScanSellAction::Lightning
+            } else {
+                HotScanSellAction::NoRoute
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -5868,6 +5961,133 @@ mod tests {
         fill.token_delta_raw = -101;
         let position = synthetic_sell_position();
         assert!(primary_sell_fill_values(&fill, &position).is_err());
+    }
+
+    // ======================================================================
+    // AGENT G — HotScan SELL transaction-truth helper tests (G11)
+    // ======================================================================
+
+    #[test]
+    fn test_g_route_local_exact_signer() {
+        // G4: a Local-route position with the primary signer resolves to the Local
+        // trader via the primary keypair; a Local route with only a recovery signer
+        // resolves via the recovery multi-wallet. Neither ever becomes Lightning.
+        assert_eq!(
+            hotscan_sell_action(
+                crate::wallet::ExecutionRoute::Local,
+                true,  // local trader available
+                true,  // lightning trader available (irrelevant for Local)
+                true,  // primary signer matches
+                false, // recovery signer absent
+            ),
+            HotScanSellAction::LocalPrimary
+        );
+        assert_eq!(
+            hotscan_sell_action(
+                crate::wallet::ExecutionRoute::Local,
+                true,
+                true,
+                false, // primary does NOT match
+                true,  // recovery signer present
+            ),
+            HotScanSellAction::LocalRecovery
+        );
+        // Local route but no exact signer anywhere => no sell.
+        assert_eq!(
+            hotscan_sell_action(
+                crate::wallet::ExecutionRoute::Local,
+                true,
+                true,
+                false,
+                false,
+            ),
+            HotScanSellAction::NoRoute
+        );
+    }
+
+    #[test]
+    fn test_g_route_lightning_no_local_fallback() {
+        // G4/INV-WALLET-001/003: a Lightning-route position uses the Lightning
+        // trader ONLY. Even when a local trader and local signers are available,
+        // the action is NEVER a Local one, and with no Lightning trader it is
+        // NoRoute (never a silent Local fallback).
+        assert_eq!(
+            hotscan_sell_action(
+                crate::wallet::ExecutionRoute::Lightning,
+                true, // local trader available — must be ignored
+                true, // lightning trader available
+                true, // primary signer matches — must be ignored
+                true, // recovery signer present — must be ignored
+            ),
+            HotScanSellAction::Lightning
+        );
+        let no_lightning = hotscan_sell_action(
+            crate::wallet::ExecutionRoute::Lightning,
+            true,  // local trader available
+            false, // NO lightning trader
+            true,  // primary signer matches
+            true,  // recovery signer present
+        );
+        assert_eq!(no_lightning, HotScanSellAction::NoRoute);
+        assert_ne!(no_lightning, HotScanSellAction::LocalPrimary);
+        assert_ne!(no_lightning, HotScanSellAction::LocalRecovery);
+    }
+
+    #[test]
+    fn test_g_registry_routes_match_recorded_wallet() {
+        // The registry itself decides the route from the EXACT recorded wallet.
+        use crate::wallet::ExecutionRoute;
+        let local = f_local_signer();
+        let lightning = f_lightning_wallet();
+        let registry = ExecutionWalletRegistry::new(local, &[], Some(lightning));
+        assert_eq!(registry.route_for(&local), Some(ExecutionRoute::Local));
+        assert_eq!(registry.route_for(&lightning), Some(ExecutionRoute::Lightning));
+        // An unknown wallet has no route => the live path halts, no sell.
+        let unknown =
+            Pubkey::from_str("Stake11111111111111111111111111111111111111").unwrap();
+        assert_eq!(registry.route_for(&unknown), None);
+    }
+
+    #[test]
+    fn test_g_intent_mapping() {
+        // G5: "50%" => QuickProfit, "25%" => SecondProfit, full/"100%"/other => Full.
+        assert_eq!(
+            hotscan_sell_intent_for_layer("50%"),
+            PendingSellIntent::QuickProfit
+        );
+        assert_eq!(
+            hotscan_sell_intent_for_layer("25%"),
+            PendingSellIntent::SecondProfit
+        );
+        assert_eq!(hotscan_sell_intent_for_layer("100%"), PendingSellIntent::Full);
+        assert_eq!(hotscan_sell_intent_for_layer("full"), PendingSellIntent::Full);
+    }
+
+    #[test]
+    fn test_g_requested_full_but_partial_fill_keeps_bought_mints() {
+        // G8: the ACTUAL close result controls the full-exit cache/cooldown. A
+        // requested "100%" that only partially fills (fully_closed == false) must
+        // NOT remove the bought-mint or mark a full-exit cooldown. Only an actual
+        // full close does.
+        assert!(!hotscan_full_exit_removes_cache(false));
+        assert!(hotscan_full_exit_removes_cache(true));
+        // Intent mapping of the requested "100%" is still Full; the amount is
+        // irrelevant to the cache decision — actual fill controls.
+        assert_eq!(hotscan_sell_intent_for_layer("100%"), PendingSellIntent::Full);
+    }
+
+    #[test]
+    fn test_g_confirmed_negative_net_sell_accepted() {
+        // G6: a confirmed fee-dominated HotScan sale (negative net wallet SOL
+        // delta) is accepted by the exact fill validator and is NOT clamped.
+        let mut fill = synthetic_sell_fill();
+        fill.wallet_sol_delta_lamports = -2_000; // net negative proceeds
+        let position = synthetic_sell_position();
+        let (sold_raw, net_sol, price) =
+            primary_sell_fill_values(&fill, &position).expect("negative net sell accepted");
+        assert_eq!(sold_raw, 100);
+        assert!(net_sol < 0.0, "net_sol was {}", net_sol);
+        assert!(price.is_finite());
     }
 
     // ======================================================================
