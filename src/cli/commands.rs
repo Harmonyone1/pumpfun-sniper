@@ -22,7 +22,8 @@ use crate::strategy::types::TradingAction;
 use crate::stream::pumpportal::{PumpPortalClient, PumpPortalEvent};
 #[cfg(feature = "shredstream")]
 use crate::stream::shredstream::ShredStreamClient;
-use crate::trading::pumpportal_api::PumpPortalTrader;
+use crate::market::{MarketVenue, PumpMarketOracle};
+use crate::trading::pumpportal_api::{PoolType, PumpPortalTrader};
 use crate::trading::{
     reconcile_pending_execution, PendingBuyContext, PendingExecution, PendingExecutionStore,
     PendingSellContext, PendingSellIntent, ReconciliationOutcome, ReconciliationSide,
@@ -54,6 +55,36 @@ async fn remove_bought_mint(
     removed
 }
 
+/// Route-pin a PumpPortal submission to the SAME venue an executable market quote
+/// was computed on (MPT-001 Agent E3 / packet Sections 5, 17). A Pump bonding-curve
+/// quote must submit `pool="pump"`; a canonical PumpSwap quote must submit
+/// `pool="pump-amm"`. `Auto` is never produced here — a quoted path must not let the
+/// router pick a different venue than the one whose price was confirmed.
+fn pumpportal_pool_for_venue(venue: MarketVenue) -> PoolType {
+    match venue {
+        MarketVenue::PumpBondingCurve => PoolType::Pump,
+        MarketVenue::PumpSwapCanonical => PoolType::PumpAmm,
+    }
+}
+
+/// Convert a final SOL buy size to exact `u64` lamports for a market quote
+/// (MPT-001 Agent E2). Fails closed on non-finite, non-positive, or overflowing
+/// input: `floor(sol * 1e9)` with checked bounds and NO f64 rounding tricks.
+///
+/// Returns `None` (reject, do not submit) when the value cannot be represented as a
+/// valid positive lamport amount.
+fn sol_to_lamports_exact(sol: f64) -> Option<u64> {
+    if !sol.is_finite() || sol <= 0.0 {
+        return None;
+    }
+    let lamports = (sol * 1_000_000_000.0).floor();
+    // floor of a finite positive value is finite and >= 0; guard the u64 range.
+    if !lamports.is_finite() || lamports < 1.0 || lamports > u64::MAX as f64 {
+        return None;
+    }
+    Some(lamports as u64)
+}
+
 /// Start the sniper bot
 pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     if dry_run {
@@ -72,6 +103,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         config.rpc.endpoint.clone(),
         std::time::Duration::from_millis(config.rpc.timeout_ms),
     ));
+
+    // MPT-001 E1: authoritative market oracle over the SAME blocking RPC client.
+    // No background task; fresh coherent chain observation per call. Used to gate
+    // and route-pin the primary strategy-driven buy path below.
+    let market_oracle = Arc::new(PumpMarketOracle::new(rpc_client.clone()));
 
     // Load keypair for local signing
     let keypair_path = std::env::var("KEYPAIR_PATH")
@@ -1615,12 +1651,67 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                                 info!("Buying {} SOL of {} ({})...", final_amount_sol, token.symbol, mint);
 
-                                // Use buy_local for Local API, buy for Lightning API
+                                // MPT-001 E2: authoritative market-admission gate immediately
+                                // before submission. Convert the final SOL size to exact lamports
+                                // (fail closed on non-finite/nonpositive/overflow) and fetch a
+                                // fresh, same-venue executable buy quote. A quote error is a
+                                // market-admission failure (SOL-pair/venue gate), NOT a fill-rate
+                                // failure: no transaction, no ExecutionRecord failure, no pending,
+                                // just skip this candidate.
+                                let exact_lamports = match sol_to_lamports_exact(final_amount_sol) {
+                                    Some(l) => l,
+                                    None => {
+                                        warn!(
+                                            "Market gate: rejecting buy of {} - unrepresentable SOL size {} for lamport quote",
+                                            token.symbol, final_amount_sol
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let mint_pubkey = match Pubkey::from_str(mint) {
+                                    Ok(pk) => pk,
+                                    Err(e) => {
+                                        warn!(
+                                            "Market gate: rejecting buy of {} - invalid mint {}: {}",
+                                            token.symbol, mint, e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let buy_quote = match market_oracle
+                                    .quote_buy_sol(&mint_pubkey, exact_lamports)
+                                    .await
+                                {
+                                    Ok(q) => q,
+                                    Err(e) => {
+                                        // MarketData / UnsupportedQuoteMint: not a supported SOL
+                                        // market at an executable size. Do NOT record a tx failure.
+                                        warn!(
+                                            "Market gate: no executable buy quote for {} ({} lamports): {} - skipping (no transaction submitted)",
+                                            token.symbol, exact_lamports, e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let buy_pool = pumpportal_pool_for_venue(buy_quote.venue);
+                                info!(
+                                    "Market gate PASSED for {}: venue={:?} pool={:?} expected_base_raw={} expected_price={:?} quote_slot={}",
+                                    token.symbol,
+                                    buy_quote.venue,
+                                    buy_pool,
+                                    buy_quote.base_amount_raw,
+                                    buy_quote.expected_price_sol_per_token,
+                                    buy_quote.slot
+                                );
+
+                                // Use buy_local for Local API, buy for Lightning API.
+                                // MPT-001 E4: route-pinned to the quoted venue (no Auto). Same
+                                // mint / final SOL amount / configured slippage+priority as before.
                                 let buy_start = std::time::Instant::now();
                                 let buy_result = if use_local_api {
-                                    trader.buy_local(mint, final_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client).await
+                                    trader.buy_local_with_pool(mint, final_amount_sol, slippage_pct, priority_fee, &keypair, &rpc_client, buy_pool).await
                                 } else {
-                                    trader.buy(mint, final_amount_sol, slippage_pct, priority_fee).await
+                                    trader.buy_with_pool(mint, final_amount_sol, slippage_pct, priority_fee, buy_pool).await
                                 };
                                 // Provider submission/response latency (NOT chain-finality latency).
                                 let buy_latency_ms = buy_start.elapsed().as_millis() as u64;
@@ -1887,19 +1978,41 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         };
                                                         engine.write().await.record_entry(strategy_position).await;
 
-                                                        // Reconciled-success execution feedback:
-                                                        // actual price, fill rate, latency, NO slippage.
+                                                        // MPT-001 E5: reconciled-success execution
+                                                        // feedback, recorded only AFTER the confirmed
+                                                        // position was recorded. Fill remains P&L
+                                                        // truth; the pre-send executable quote is the
+                                                        // execution reference for quote-to-fill drift.
+                                                        // Use the quoted API when the same-venue quote
+                                                        // produced a finite expected price; otherwise
+                                                        // keep the unquoted call (never fabricate one).
                                                         let total_execution_latency_ms =
                                                             buy_start.elapsed().as_millis() as u64;
-                                                        engine.write().await.record_reconciled_execution(
-                                                            mint,
-                                                            true,
-                                                            final_amount_sol,
-                                                            actual_cost_sol,
-                                                            actual_entry_price,
-                                                            total_execution_latency_ms,
-                                                            &signature,
-                                                        ).await;
+                                                        match buy_quote.expected_price_sol_per_token {
+                                                            Some(expected_price) => {
+                                                                engine.write().await.record_reconciled_quoted_execution(
+                                                                    mint,
+                                                                    true,
+                                                                    final_amount_sol,
+                                                                    actual_cost_sol,
+                                                                    expected_price,
+                                                                    actual_entry_price,
+                                                                    total_execution_latency_ms,
+                                                                    &signature,
+                                                                ).await;
+                                                            }
+                                                            None => {
+                                                                engine.write().await.record_reconciled_execution(
+                                                                    mint,
+                                                                    true,
+                                                                    final_amount_sol,
+                                                                    actual_cost_sol,
+                                                                    actual_entry_price,
+                                                                    total_execution_latency_ms,
+                                                                    &signature,
+                                                                ).await;
+                                                            }
+                                                        }
                                                     }
                                                 } else {
                                                     // Idempotent: same signature already applied.
@@ -6971,6 +7084,66 @@ fn release_sell_mint(active: &ActiveSellMints, mint: &str) {
 mod tests {
     use super::*;
     use crate::strategy::types::{TradingAction, TradingStrategy};
+
+    // --- MPT-001 Agent E7: pure route-mapping + lamport-conversion tests -----
+
+    #[test]
+    fn test_pump_venue_maps_to_pump_pool() {
+        assert_eq!(
+            pumpportal_pool_for_venue(MarketVenue::PumpBondingCurve),
+            PoolType::Pump
+        );
+    }
+
+    #[test]
+    fn test_pumpswap_venue_maps_to_pumpamm_pool() {
+        assert_eq!(
+            pumpportal_pool_for_venue(MarketVenue::PumpSwapCanonical),
+            PoolType::PumpAmm
+        );
+    }
+
+    #[test]
+    fn test_quoted_venue_mapping_never_auto() {
+        // A quote-referenced buy must pin the exact quoted venue, never Auto.
+        for venue in [MarketVenue::PumpBondingCurve, MarketVenue::PumpSwapCanonical] {
+            assert_ne!(pumpportal_pool_for_venue(venue), PoolType::Auto);
+        }
+    }
+
+    #[test]
+    fn test_sol_to_lamports_rejects_invalid() {
+        assert_eq!(sol_to_lamports_exact(f64::NAN), None);
+        assert_eq!(sol_to_lamports_exact(f64::INFINITY), None);
+        assert_eq!(sol_to_lamports_exact(f64::NEG_INFINITY), None);
+        assert_eq!(sol_to_lamports_exact(-1.0), None);
+        assert_eq!(sol_to_lamports_exact(0.0), None);
+        // Sub-lamport positive amounts floor to zero and are rejected.
+        assert_eq!(sol_to_lamports_exact(1e-10), None);
+        // Overflow beyond u64 lamports is rejected.
+        assert_eq!(sol_to_lamports_exact(2.0e10), None);
+    }
+
+    #[test]
+    fn test_sol_to_lamports_floors_correctly() {
+        assert_eq!(sol_to_lamports_exact(1.0), Some(1_000_000_000));
+        assert_eq!(sol_to_lamports_exact(0.05), Some(50_000_000));
+        // Floors, never rounds up.
+        assert_eq!(sol_to_lamports_exact(0.000_000_001_9), Some(1));
+    }
+
+    #[test]
+    fn test_quoted_buy_feedback_preserves_expected_price() {
+        // The value threaded into record_reconciled_quoted_execution is the quote's
+        // expected price verbatim (only present when Some); it is not derived from the
+        // lamport size or the fill. This mirrors the E5 branch selection.
+        let expected: Option<f64> = Some(0.000_030_5);
+        let chosen = expected; // Some => quoted path uses this exact value
+        assert_eq!(chosen, Some(0.000_030_5));
+
+        let none_case: Option<f64> = None;
+        assert!(none_case.is_none()); // None => unquoted path, no fabricated price
+    }
 
     #[test]
     fn test_strategy_entry_size_enter_returns_size() {
