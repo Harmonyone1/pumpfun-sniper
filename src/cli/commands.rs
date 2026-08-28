@@ -255,9 +255,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         config.safety.clone(),
         Some(format!("{}/positions.json", config.wallet.credentials_dir)),
     ));
-    if let Err(e) = position_manager.load().await {
-        warn!("Could not load positions: {} (starting fresh)", e);
-    }
+    position_manager
+        .load()
+        .await
+        .map_err(|e| anyhow::anyhow!(
+            "Failed to load persisted positions; refusing to start with unknown ownership state: {}",
+            e
+        ))?;
 
     // Initialize the trade reconciler (001A). Uses the default reviewed config
     // (250ms polling / 15s timeout) - do not change here.
@@ -272,6 +276,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     );
     let pending_executions = Arc::new(PendingExecutionStore::new(pending_path));
     pending_executions.load().await?;
+    pending_executions.ensure_writable().await?;
 
     // Fail-closed halt flag for NEW entries. Set when unresolved transaction state
     // exists; 001C owns recovery/unhalt semantics.
@@ -286,6 +291,27 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
             "Found {} unresolved submitted execution(s).\nNew entries are HALTED.\nP0-TRANSACTION-TRUTH-001C startup reconciliation is required.",
             pending_at_startup
         );
+        new_entries_halted.store(true, Ordering::SeqCst);
+    }
+
+    // Halt new entries if ANY loaded position is legacy/unmigrated (missing
+    // token_decimals, empty wallet, or an unparseable wallet pubkey). We do NOT
+    // mutate/guess these values here; we only refuse to open NEW risk while
+    // existing ownership state is not canonical. Independent of the pending-journal
+    // halt above (either may set the flag).
+    let loaded_positions = position_manager.get_all_positions().await;
+    let mut legacy_position_found = false;
+    for position in &loaded_positions {
+        if position_requires_recovery(position) {
+            legacy_position_found = true;
+            error!(
+                "Loaded position requires recovery (missing decimals / invalid wallet): mint {}",
+                position.mint
+            );
+        }
+    }
+    if legacy_position_found {
+        error!("New entries are HALTED due to legacy/unmigrated loaded position(s).");
         new_entries_halted.store(true, Ordering::SeqCst);
     }
 
@@ -4008,6 +4034,19 @@ fn strategy_entry_size(action: &TradingAction) -> Option<f64> {
     }
 }
 
+/// Pure predicate: does this loaded position lack canonical ownership state and
+/// therefore require recovery before NEW entries may resume? True when
+/// `token_decimals` is unknown, the wallet pubkey is empty, or the wallet pubkey
+/// does not parse as a Solana `Pubkey`. Does not mutate the position.
+fn position_requires_recovery(position: &crate::position::manager::Position) -> bool {
+    position.token_decimals.is_none()
+        || position.wallet_pubkey.is_empty()
+        || position
+            .wallet_pubkey
+            .parse::<solana_sdk::pubkey::Pubkey>()
+            .is_err()
+}
+
 /// Pure fill-validation boundary for the primary buy path. Extracts the canonical
 /// economics from a reconciled BUY fill without mutating any state.
 ///
@@ -4185,6 +4224,57 @@ mod tests {
             }),
             None
         );
+    }
+
+    fn recovery_test_position() -> crate::position::manager::Position {
+        crate::position::manager::Position {
+            mint: "Mint1111111111111111111111111111111111111111".to_string(),
+            name: "Test Token".to_string(),
+            symbol: "TEST".to_string(),
+            bonding_curve: "Curve111111111111111111111111111111111111111".to_string(),
+            token_amount: 1_000_000,
+            token_decimals: Some(6),
+            entry_price: 0.00000001,
+            total_cost_sol: 0.01,
+            entry_time: chrono::Utc::now(),
+            entry_signature: "sig".to_string(),
+            entry_type: crate::position::manager::EntryType::Legacy,
+            quick_profit_taken: false,
+            second_profit_taken: false,
+            peak_price: 0.00000001,
+            current_price: 0.0,
+            kill_switch_triggered: false,
+            kill_switch_reason: None,
+            wallet_pubkey: "So11111111111111111111111111111111111111112".to_string(),
+            applied_exit_signatures: vec![],
+        }
+    }
+
+    #[test]
+    fn test_position_requires_recovery_canonical_is_false() {
+        let p = recovery_test_position();
+        assert!(!position_requires_recovery(&p));
+    }
+
+    #[test]
+    fn test_position_requires_recovery_none_decimals_is_true() {
+        let mut p = recovery_test_position();
+        p.token_decimals = None;
+        assert!(position_requires_recovery(&p));
+    }
+
+    #[test]
+    fn test_position_requires_recovery_empty_wallet_is_true() {
+        let mut p = recovery_test_position();
+        p.wallet_pubkey = String::new();
+        assert!(position_requires_recovery(&p));
+    }
+
+    #[test]
+    fn test_position_requires_recovery_invalid_wallet_is_true() {
+        let mut p = recovery_test_position();
+        p.wallet_pubkey = "not-a-pubkey".to_string();
+        assert!(position_requires_recovery(&p));
     }
 
     fn synthetic_buy_fill() -> crate::trading::ReconciledFill {
