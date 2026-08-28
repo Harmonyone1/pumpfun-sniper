@@ -87,6 +87,9 @@ pub enum Error {
     #[error("Position persistence failed: {0}")]
     PositionPersistence(String),
 
+    #[error("Position accounting error: {0}")]
+    PositionAccounting(String),
+
     // Safety limit errors
     #[error("Safety limit exceeded: {0}")]
     SafetyLimitExceeded(String),

@@ -6,6 +6,7 @@
 //! - Direct RPC (standard)
 
 pub mod jito;
+pub mod pending;
 pub mod pumpportal_api;
 pub mod reconciliation;
 pub mod simulation;
@@ -13,6 +14,10 @@ pub mod tips;
 pub mod transaction;
 
 pub use jito::JitoClient;
+pub use pending::{
+    PendingBuyContext, PendingExecution, PendingExecutionContext,
+    PendingExecutionStore, PendingSellContext, PendingSellIntent,
+};
 pub use pumpportal_api::PumpPortalTrader;
 pub use reconciliation::{
     ReconcileConfig, ReconciledFill, ReconciliationOutcome, ReconciliationSide, TradeReconciler,

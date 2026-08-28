@@ -187,6 +187,7 @@ mod tests {
             symbol: "TEST".to_string(),
             bonding_curve: "curve".to_string(),
             token_amount: 1_000_000,
+            token_decimals: None,
             entry_price,
             total_cost_sol: 0.01,
             entry_time: chrono::Utc::now(),
@@ -199,6 +200,7 @@ mod tests {
             kill_switch_reason: None,
             wallet_pubkey: "test_wallet".to_string(),
             current_price,
+            applied_exit_signatures: vec![],
         }
     }
 

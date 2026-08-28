@@ -172,6 +172,31 @@ impl ExecutionFeedback {
         ));
     }
 
+    /// Record a reconciled successful execution whose actual fill price is KNOWN
+    /// but whose reference/expected price is not. Records success + latency +
+    /// fill-rate and the actual price, but NO slippage sample.
+    pub fn record_reconciled_success(
+        &mut self,
+        mint: &str,
+        side: super::types::Side,
+        requested_size_sol: f64,
+        filled_size_sol: f64,
+        actual_price: f64,
+        latency_ms: u64,
+        tx_sig: &str,
+    ) {
+        let rec = ExecutionRecord::success_reconciled_unquoted(
+            mint.to_string(),
+            side,
+            requested_size_sol,
+            filled_size_sol,
+            actual_price,
+            latency_ms,
+            tx_sig.to_string(),
+        );
+        self.record(rec);
+    }
+
     /// Record a failed execution
     pub fn record_failure(
         &mut self,
@@ -378,6 +403,36 @@ mod tests {
         assert_eq!(quality.recent_avg_slippage, None);
         assert_eq!(feedback.avg_slippage(), None);
         assert!((feedback.get_size_factor() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_reconciled_success_records_actual_price_without_slippage() {
+        let mut feedback = ExecutionFeedback::default();
+
+        feedback.record_reconciled_success(
+            "mint",
+            super::super::types::Side::Buy,
+            0.1,
+            0.09,
+            0.00123,
+            150,
+            "sig1",
+        );
+
+        assert_eq!(feedback.execution_count(), 1);
+
+        let rec = feedback.recent_executions().front().unwrap();
+        assert!(rec.success);
+        assert_eq!(rec.expected_price, None);
+        assert_eq!(rec.actual_price, Some(0.00123));
+        assert_eq!(rec.slippage_pct, None);
+        assert!((rec.requested_size_sol - 0.1).abs() < f64::EPSILON);
+        assert!((rec.filled_size_sol - 0.09).abs() < f64::EPSILON);
+
+        let quality = feedback.get_quality();
+        assert_eq!(quality.recent_fill_rate, Some(1.0));
+        assert_eq!(quality.recent_avg_slippage, None);
+        assert_eq!(feedback.avg_slippage(), None);
     }
 
     #[test]

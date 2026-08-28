@@ -237,10 +237,46 @@ impl PortfolioRiskGovernor {
         self.positions.insert(position.mint.clone(), position);
     }
 
-    /// Close a position and record PnL
-    pub fn close_position(&mut self, mint: &str, pnl_sol: f64) {
-        self.positions.remove(mint);
-        self.record_pnl(pnl_sol);
+    /// Close a position and record PnL.
+    ///
+    /// Returns true when the position existed and was removed (PnL recorded
+    /// exactly once). Returns false when no position was tracked for `mint`; in
+    /// that case NO PnL is recorded, preventing duplicate/untracked P&L.
+    pub fn close_position(&mut self, mint: &str, pnl_sol: f64) -> bool {
+        if self.positions.remove(mint).is_some() {
+            self.record_pnl(pnl_sol);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a partial exit: reduce a position's size/tokens in place and
+    /// record the realized PnL from the sold portion exactly once. The position
+    /// is NOT removed.
+    ///
+    /// Returns false (and records no PnL) when the position is absent or when
+    /// `remaining_size_sol` is not a finite, non-negative value.
+    pub fn record_partial_exit(
+        &mut self,
+        mint: &str,
+        remaining_size_sol: f64,
+        remaining_tokens: u64,
+        realized_pnl_sol: f64,
+    ) -> bool {
+        if !(remaining_size_sol.is_finite() && remaining_size_sol >= 0.0) {
+            return false;
+        }
+
+        match self.positions.get_mut(mint) {
+            Some(position) => {
+                position.size_sol = remaining_size_sol;
+                position.tokens_held = remaining_tokens;
+                self.record_pnl(realized_pnl_sol);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Record PnL from a closed position
@@ -502,9 +538,65 @@ mod tests {
         governor.open_position(make_position("mint1", 0.1));
         assert_eq!(governor.positions.len(), 1);
 
-        governor.close_position("mint1", 0.05);
+        assert!(governor.close_position("mint1", 0.05));
         assert_eq!(governor.positions.len(), 0);
         assert!(governor.daily_pnl > 0.0);
+    }
+
+    #[test]
+    fn test_close_position_missing_mint_does_not_record_pnl() {
+        let mut governor = PortfolioRiskGovernor::new(PortfolioRiskConfig::default());
+
+        assert!(!governor.close_position("missing", 0.05));
+        assert_eq!(governor.positions.len(), 0);
+        assert_eq!(governor.daily_pnl, 0.0);
+    }
+
+    #[test]
+    fn test_close_position_double_application_records_pnl_once() {
+        let mut governor = PortfolioRiskGovernor::new(PortfolioRiskConfig::default());
+
+        governor.open_position(make_position("mint1", 0.1));
+
+        assert!(governor.close_position("mint1", 0.05));
+        assert!((governor.daily_pnl - 0.05).abs() < 1e-9);
+
+        // Second close on an already-removed mint must not record PnL again.
+        assert!(!governor.close_position("mint1", 0.05));
+        assert!((governor.daily_pnl - 0.05).abs() < 1e-9);
+        assert_eq!(governor.positions.len(), 0);
+    }
+
+    #[test]
+    fn test_partial_exit_updates_exposure_and_records_pnl() {
+        let mut governor = PortfolioRiskGovernor::new(PortfolioRiskConfig::default());
+
+        // Open 1.0 SOL / 100 tokens
+        governor.open_position(make_position("mint1", 1.0));
+
+        // Partial exit: remaining 0.6 SOL / 60 tokens, realized pnl +0.2
+        assert!(governor.record_partial_exit("mint1", 0.6, 60, 0.2));
+
+        // Position still exists and is updated
+        let pos = governor.get_position("mint1").expect("position present");
+        assert!((pos.size_sol - 0.6).abs() < 1e-9);
+        assert_eq!(pos.tokens_held, 60);
+
+        // Exposure reflects remaining size
+        assert!((governor.remaining_capacity() - (2.0 - 0.6)).abs() < 1e-9);
+        assert_eq!(governor.get_state().total_exposure_sol, 0.6);
+
+        // Realized PnL recorded once
+        assert!((governor.daily_pnl - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_partial_exit_missing_position_is_noop() {
+        let mut governor = PortfolioRiskGovernor::new(PortfolioRiskConfig::default());
+
+        assert!(!governor.record_partial_exit("missing", 0.6, 60, 0.2));
+        assert_eq!(governor.positions.len(), 0);
+        assert_eq!(governor.daily_pnl, 0.0);
     }
 
     #[test]
