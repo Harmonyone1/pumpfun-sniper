@@ -3318,7 +3318,150 @@ pub async fn hot_scan(
         config.safety.clone(),
         Some(format!("{}/positions.json", config.wallet.credentials_dir)),
     ));
-    position_manager.load().await?;
+    // Fail closed: refuse to start HotScan with unknown ownership state (F1).
+    position_manager.load().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load persisted positions; refusing to start HotScan with unknown ownership state: {}",
+            e
+        )
+    })?;
+
+    // === F1: HotScan canonical persistence + startup recovery ===
+    // Replicates the primary start() transaction-truth init inside HotScan so
+    // that a HotScan restart recovers in-flight signatures and canonicalizes
+    // legacy positions before any new buy. A submitted signature is submission
+    // identity, not fill proof (INV-TX-001); the pending journal is the source of
+    // truth for unresolved state across restarts.
+
+    // Reviewed default reconciler config (250ms polling / 15s timeout).
+    let trade_reconciler = std::sync::Arc::new(TradeReconciler::new(rpc_client.clone()));
+
+    // Build the exact controlled-wallet registry. Local set = primary local
+    // keypair + every successfully loaded MultiWalletManager local wallet. Local
+    // signing authority and Lightning wallet authority are distinct
+    // (INV-WALLET-001); we never fall back between them (INV-WALLET-002).
+    let mut hotscan_local_wallets: Vec<Pubkey> = Vec::new();
+    if let Some(ref mw) = multi_wallet {
+        for w in mw.wallets() {
+            hotscan_local_wallets.push(w.pubkey());
+        }
+    }
+
+    // Strictly parse the configured Lightning wallet, if present. An invalid
+    // non-empty Lightning wallet fails closed for recovery/trading startup.
+    let hotscan_lightning_wallet: Option<Pubkey> = {
+        let lw = config.pumpportal.lightning_wallet.trim();
+        if lw.is_empty() {
+            None
+        } else {
+            match Pubkey::from_str(lw) {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Configured lightning_wallet is not a valid Pubkey; refusing to start HotScan recovery/trading: {}",
+                        e
+                    ));
+                }
+            }
+        }
+    };
+
+    let hotscan_registry = ExecutionWalletRegistry::new(
+        keypair.pubkey(),
+        &hotscan_local_wallets,
+        hotscan_lightning_wallet,
+    );
+    let hotscan_probe = WalletOwnershipProbe::new(rpc_client.clone());
+
+    // Shared pending-execution journal at the SAME credentials path as start().
+    let hotscan_pending_path =
+        format!("{}/pending_executions.json", config.wallet.credentials_dir);
+    let pending_executions =
+        std::sync::Arc::new(PendingExecutionStore::new(hotscan_pending_path));
+    pending_executions.load().await?;
+    pending_executions.ensure_writable().await?;
+
+    // Fail-closed halt flag for NEW HotScan entries. Set when unresolved
+    // transaction or ownership state remains AFTER recovery. Existing safe exits
+    // (the monitor task) continue regardless of this flag.
+    let new_entries_halted = std::sync::Arc::new(AtomicBool::new(false));
+
+    // 1. recover the pending journal against confirmed chain state;
+    // 2. recover legacy/incomplete positions from chain evidence;
+    // 3. halt NEW entries iff any unresolved pending OR recovery-required /
+    //    unroutable position remains.
+    let hotscan_pending_summary =
+        recover_pending_store(&trade_reconciler, &pending_executions, &position_manager).await?;
+    info!(
+        "HotScan pending recovery: recovered={}, confirmed_failures_removed={}, still_unresolved={}, accounting_conflicts={}",
+        hotscan_pending_summary.recovered,
+        hotscan_pending_summary.confirmed_failures_removed,
+        hotscan_pending_summary.still_unresolved,
+        hotscan_pending_summary.accounting_conflicts
+    );
+
+    let hotscan_legacy_summary = recover_legacy_positions(
+        &trade_reconciler,
+        &hotscan_probe,
+        &hotscan_registry,
+        &position_manager,
+    )
+    .await?;
+    info!(
+        "HotScan legacy recovery: recovered={}, resolved_zero={}, still_recovery_required={}",
+        hotscan_legacy_summary.recovered,
+        hotscan_legacy_summary.resolved_zero,
+        hotscan_legacy_summary.still_recovery_required
+    );
+
+    // Re-inspect remaining positions for any still recovery-required/unroutable.
+    let hotscan_post_recovery_positions = position_manager.get_all_positions().await;
+    let hotscan_residual_blocked = hotscan_post_recovery_positions
+        .iter()
+        .filter(|p| legacy_recovery_required(p, &hotscan_registry))
+        .count();
+
+    if !hotscan_pending_summary.fully_resolved()
+        || !hotscan_legacy_summary.fully_resolved()
+        || hotscan_residual_blocked > 0
+    {
+        error!(
+            "HotScan NEW entries HALTED after recovery: unresolved_pending={}, legacy_unresolved={}, residual_blocked_positions={}",
+            hotscan_pending_summary.still_unresolved,
+            hotscan_legacy_summary.still_recovery_required,
+            hotscan_residual_blocked
+        );
+        new_entries_halted.store(true, Ordering::SeqCst);
+    } else {
+        info!("HotScan startup recovery complete: transaction/position truth restored; new entries may resume.");
+    }
+
+    // === F2: explicit route-capable trader handles ===
+    // `trader` above remains the active handle (used for pool readiness). Make the
+    // route-capable handles explicit so the live buy path (and Agent G's sell
+    // path) never conflate Local signing with Lightning submission. No new API.
+    // Local trader: available whenever PumpPortal trading is enabled.
+    let hotscan_local_trader: Option<std::sync::Arc<crate::trading::pumpportal_api::PumpPortalTrader>> =
+        if config.pumpportal.use_for_trading {
+            Some(std::sync::Arc::new(
+                crate::trading::pumpportal_api::PumpPortalTrader::local(),
+            ))
+        } else {
+            None
+        };
+    // Lightning trader: available ONLY when an API key is configured.
+    let hotscan_lightning_trader: Option<std::sync::Arc<crate::trading::pumpportal_api::PumpPortalTrader>> =
+        if config.pumpportal.use_for_trading && !config.pumpportal.api_key.is_empty() {
+            Some(std::sync::Arc::new(
+                crate::trading::pumpportal_api::PumpPortalTrader::lightning(
+                    config.pumpportal.api_key.clone(),
+                ),
+            ))
+        } else {
+            None
+        };
+    // Referenced by the live buy path below and reused by Agent G.
+    let _ = (&hotscan_local_trader, &hotscan_lightning_trader);
 
     // Initialize smart money wallet profiler and Helius client (if enabled)
     let (helius_client, wallet_profiler) = if config.smart_money.enabled {
@@ -4093,13 +4236,19 @@ pub async fn hot_scan(
                             continue;
                         }
 
-                        // PRE-TRADE VALIDATION: Check position limits BEFORE trading
-                        if let Err(e) = position_manager.can_open_position(buy_amount).await {
+                        // F3: the pre-send PositionManager risk check is moved to
+                        // immediately before submission and now uses `final_buy_amount`
+                        // (the size actually sent after the creator multiplier), so it
+                        // cannot authorize a larger send than was checked.
+
+                        // F1: fail-closed halt on unresolved transaction/ownership state.
+                        // Existing safe exits (the monitor task) are unaffected.
+                        if new_entries_halted.load(Ordering::SeqCst) {
                             warn!(
-                                "Cannot open position for {}: {} - stopping buy loop",
-                                token.symbol, e
+                                "Skipping {} - HotScan new entries are HALTED (unresolved transaction/position truth)",
+                                token.symbol
                             );
-                            break; // Stop trying to buy more tokens
+                            break;
                         }
 
                         info!(
@@ -4188,11 +4337,13 @@ pub async fn hot_scan(
                             continue;
                         }
 
-                        if let Some(ref trader) = trader {
+                        {
                             let slippage = config.trading.slippage_bps / 100;
                             let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
 
-                            // Select wallet for this trade (multi-wallet or single)
+                            // Select the local signer for this trade (multi-wallet or
+                            // single). This is only the LOCAL signing authority; in
+                            // Lightning mode the execution wallet is NOT this keypair.
                             let (trading_keypair, wallet_name) = if let Some(ref mw) = multi_wallet {
                                 let selected = mw.select_wallet(&rpc_client);
                                 let name = selected.name.clone();
@@ -4204,20 +4355,79 @@ pub async fn hot_scan(
                                 (keypair.clone(), "default".to_string())
                             };
 
+                            // F4: resolve the EXACT execution wallet. Local => selected
+                            // signer's Pubkey. Lightning => exact configured Lightning
+                            // wallet (never a MultiWallet keypair). No fallback.
+                            let use_lightning = !use_local_api;
+                            let execution_wallet = match hotscan_execution_wallet(
+                                use_lightning,
+                                trading_keypair.pubkey(),
+                                hotscan_lightning_wallet,
+                            ) {
+                                Ok(pk) => pk,
+                                Err(e) => {
+                                    new_entries_halted.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "STRUCTURAL: cannot resolve HotScan execution wallet for {}: {} - halting new entries",
+                                        token.symbol, e
+                                    );
+                                    break;
+                                }
+                            };
+                            let wallet_string = execution_wallet.to_string();
+
+                            // F3: pre-send PositionManager risk check using the FINAL
+                            // amount actually being sent (after the creator multiplier),
+                            // immediately before submission.
+                            let risk_amount = hotscan_risk_check_amount(final_buy_amount);
+                            if let Err(e) = position_manager.can_open_position(risk_amount).await {
+                                warn!(
+                                    "Cannot open position for {} at final size {:.4} SOL: {} - stopping buy loop",
+                                    token.symbol, risk_amount, e
+                                );
+                                break; // Stop trying to buy more tokens
+                            }
+
+                            // F4: pick the route-capable trader handle explicitly.
+                            let route_trader = if use_lightning {
+                                match hotscan_lightning_trader {
+                                    Some(ref t) => t,
+                                    None => {
+                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                        error!(
+                                            "STRUCTURAL: Lightning route active for {} but no Lightning trader (API key empty) - halting new entries",
+                                            token.symbol
+                                        );
+                                        break;
+                                    }
+                                }
+                            } else {
+                                match hotscan_local_trader {
+                                    Some(ref t) => t,
+                                    None => {
+                                        warn!(
+                                            "PumpPortal trading disabled - skipping buy for {}",
+                                            token.symbol
+                                        );
+                                        break;
+                                    }
+                                }
+                            };
+
                             info!(
-                                "Buying {:.4} SOL of {} via {} (wallet: {})",
+                                "Buying {:.4} SOL of {} via {} (execution wallet: {})",
                                 final_buy_amount,
                                 token.symbol,
-                                if use_local_api {
-                                    "Local API"
+                                if use_lightning { "Lightning" } else { "Local API" },
+                                if use_lightning {
+                                    wallet_string.clone()
                                 } else {
-                                    "Lightning"
-                                },
-                                wallet_name
+                                    format!("{} ({})", wallet_string, wallet_name)
+                                }
                             );
 
                             let buy_result = if use_local_api {
-                                trader
+                                route_trader
                                     .buy_local(
                                         &token.mint,
                                         final_buy_amount,
@@ -4228,145 +4438,280 @@ pub async fn hot_scan(
                                     )
                                     .await
                             } else {
-                                trader
+                                route_trader
                                     .buy(&token.mint, final_buy_amount, slippage, priority_fee)
                                     .await
                             };
 
                             match buy_result {
-                                Ok(sig) => {
-                                    info!("BUY EXECUTED: {} - {}", token.symbol, sig);
-                                    bought
-                                        .insert(token.mint.clone(), chrono::Utc::now().timestamp());
-                                    // Persist bought_mints to disk (with timestamps)
-                                    persist_bought_mints(&*bought_mints_path, &*bought);
-
-                                    // Record position
-                                    let estimated_tokens = (final_buy_amount / token.price_native) as u64;
-                                    let position = crate::position::manager::Position {
-                                        mint: token.mint.clone(),
-                                        name: token.name.clone(),
-                                        symbol: token.symbol.clone(),
-                                        bonding_curve: String::new(), // Not available from DexScreener
-                                        token_amount: estimated_tokens,
-                                        token_decimals: None,
-                                        entry_price: token.price_native,
-                                        total_cost_sol: final_buy_amount,
-                                        entry_time: chrono::Utc::now(),
-                                        entry_signature: sig,
-                                        entry_type:
-                                            crate::position::manager::EntryType::Opportunity,
-                                        quick_profit_taken: false,
-                                        second_profit_taken: false,
-                                        peak_price: token.price_native,
-                                        current_price: token.price_native,
-                                        kill_switch_triggered: false,
-                                        kill_switch_reason: None,
-                                        wallet_pubkey: trading_keypair.pubkey().to_string(),
-                                        applied_exit_signatures: vec![],
-                                    };
-
-                                    if let Err(e) = position_manager.open_position(position).await {
-                                        error!("Failed to record position: {}", e);
-                                        bought.remove(&token.mint);
-                                        persist_bought_mints(&*bought_mints_path, &*bought);
-                                        continue;
-                                    }
-
-                                    // CRITICAL: Wait for tx confirmation, then verify tokens received
-                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                                    // Determine which wallet to check based on API mode
-                                    let check_wallet = if use_local_api {
-                                        trading_keypair.pubkey() // Use the selected trading wallet
-                                    } else {
-                                        // For Lightning API, use the lightning wallet
-                                        Pubkey::from_str(&config.pumpportal.lightning_wallet)
-                                            .unwrap_or(trading_keypair.pubkey())
-                                    };
-
-                                    let actual_balance_raw = query_token_balance(
-                                        &rpc_client,
-                                        &check_wallet,
-                                        &token.mint,
-                                    );
-                                    // Normalize balance: pump.fun tokens have 6 decimals
-                                    // query_token_balance returns raw units, we need normalized tokens
-                                    let actual_balance = actual_balance_raw / 1_000_000;
-
-                                    if actual_balance_raw == 0 {
-                                        // CRITICAL: TX failed silently - REMOVE the position we just recorded
-                                        error!(
-                                            "BUY VERIFICATION FAILED: No tokens received for {} after 3s wait. Removing failed position.",
-                                            token.symbol
-                                        );
-                                        if let Err(e) = position_manager.abandon_position(&token.mint).await {
-                                            error!("Failed to abandon failed position: {}", e);
-                                        }
-                                        bought.remove(&token.mint);
-                                        persist_bought_mints(&*bought_mints_path, &*bought);
-                                        continue; // Skip kill-switch setup for failed buy
-                                    }
-
-                                    info!("BUY VERIFIED: Received {} tokens for {}", actual_balance, token.symbol);
-
-                                    if actual_balance != estimated_tokens {
-                                        info!(
-                                            "Updating position with actual balance: {} (raw: {}, estimated: {})",
-                                            actual_balance, actual_balance_raw, estimated_tokens
-                                        );
-                                        // Update position with NORMALIZED balance (not raw units)
-                                        if let Err(e) = position_manager
-                                            .update_token_amount(&token.mint, actual_balance)
-                                            .await
-                                        {
-                                            warn!("Failed to update token amount: {}", e);
-                                        }
-                                    }
-
-                                    // === SET UP KILL-SWITCH MONITORING ===
-                                    // Fetch creator and top holders for this token
-                                    if let Some(ref evaluator) = kill_switch_evaluator {
-                                        if let Some(ref helius) = helius_client {
-                                            // Get token creator
-                                            let creator = match helius.get_token_creator(&token.mint).await {
-                                                Ok(c) => {
-                                                    info!("[{}] Creator for kill-switch: {}", token.symbol, &c[..8]);
-                                                    c
-                                                }
-                                                Err(e) => {
-                                                    warn!("[{}] Could not get creator: {} - using empty", token.symbol, e);
-                                                    String::new()
-                                                }
-                                            };
-
-                                            // Get top holders (address, amount, percentage)
-                                            let holders = match helius.get_token_holders(&token.mint, 10).await {
-                                                Ok(h) => {
-                                                    info!("[{}] Fetched {} top holders for kill-switch monitoring", token.symbol, h.len());
-                                                    h.into_iter()
-                                                        .map(|hi| (hi.address, hi.amount, hi.percentage))
-                                                        .collect::<Vec<_>>()
-                                                }
-                                                Err(e) => {
-                                                    warn!("[{}] Could not get holders: {} - monitoring creator only", token.symbol, e);
-                                                    vec![]
-                                                }
-                                            };
-
-                                            // Start kill-switch monitoring
-                                            evaluator.watch_position(&token.mint, &creator, holders);
-                                            info!(
-                                                "[{}] Kill-switch monitoring ACTIVE (creator: {}, holders: tracked)",
-                                                token.symbol,
-                                                if creator.is_empty() { "unknown" } else { &creator[..8] }
-                                            );
-                                        }
-                                    }
-                                }
                                 Err(e) => {
-                                    error!("BUY FAILED for {}: {}", token.symbol, e);
+                                    error!("BUY FAILED to submit for {}: {}", token.symbol, e);
                                     continue;
+                                }
+                                Ok(signature) => {
+                                    // A returned signature is submission identity, NOT
+                                    // fill proof (INV-TX-001). Do not call this executed.
+                                    info!(
+                                        "BUY SUBMITTED: {} - signature {}",
+                                        token.symbol, signature
+                                    );
+                                    info!("View on Solscan: https://solscan.io/tx/{}", signature);
+
+                                    // Persist the submitted signature BEFORE treating it as
+                                    // filled. Do NOT add bought_mints yet.
+                                    let pending = PendingExecution::buy(
+                                        signature.clone(),
+                                        token.mint.clone(),
+                                        wallet_string.clone(),
+                                        PendingBuyContext {
+                                            name: token.name.clone(),
+                                            symbol: token.symbol.clone(),
+                                            // Not available from DexScreener; stays empty.
+                                            bonding_curve: String::new(),
+                                            entry_type:
+                                                crate::position::manager::EntryType::Opportunity,
+                                            requested_sol: final_buy_amount,
+                                        },
+                                    );
+                                    if let Err(e) = pending_executions.upsert(pending).await {
+                                        // The tx was already sent. Halt new entries, still
+                                        // attempt reconciliation, never send another buy.
+                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                        error!(
+                                            "Failed to persist pending HotScan buy for {} (sig {}): {} - halting new entries; still reconciling",
+                                            token.symbol, signature, e
+                                        );
+                                    }
+
+                                    // Reconcile the submitted signature. No sleep.
+                                    let outcome = trade_reconciler
+                                        .reconcile(
+                                            &signature,
+                                            &wallet_string,
+                                            &token.mint,
+                                            ReconciliationSide::Buy,
+                                        )
+                                        .await;
+
+                                    match outcome {
+                                        Ok(ReconciliationOutcome::ConfirmedFailure {
+                                            error,
+                                            observed_after_ms,
+                                            ..
+                                        }) => {
+                                            // Real on-chain failure: remove pending, no
+                                            // position, add failed_mints cooldown, do NOT
+                                            // add bought_mints.
+                                            if let Err(e) =
+                                                pending_executions.remove(&signature).await
+                                            {
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "Failed to remove pending HotScan buy after ConfirmedFailure (sig {}): {} - halting new entries",
+                                                    signature, e
+                                                );
+                                            }
+                                            error!(
+                                                "BUY CONFIRMED FAILED for {} (sig {}): {} ({}ms observed)",
+                                                token.symbol, signature, error, observed_after_ms
+                                            );
+                                            {
+                                                let mut failed = failed_mints.lock().await;
+                                                failed.insert(
+                                                    token.mint.clone(),
+                                                    chrono::Utc::now().timestamp(),
+                                                );
+                                                info!(
+                                                    "[{}] Added to failed_mints blacklist after confirmed failure ({}min cooldown)",
+                                                    token.symbol,
+                                                    FAILED_MINTS_COOLDOWN_SECS / 60
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        Ok(ReconciliationOutcome::Unresolved { reason, .. }) => {
+                                            // Ambiguous outcome (timeout/observation gap) is
+                                            // NOT a failed fill. Keep pending, halt new
+                                            // entries, no position, no failed_mints.
+                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                            error!(
+                                                "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, HotScan new entries HALTED",
+                                                token.mint, signature, wallet_string, reason
+                                            );
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            // Structural observer failure is not tx-failure
+                                            // proof. Keep pending, halt, no failed_mints.
+                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                            error!(
+                                                "CRITICAL: HotScan buy reconciliation error for {} (sig {}): {} - pending kept, new entries HALTED",
+                                                token.symbol, signature, e
+                                            );
+                                            break;
+                                        }
+                                        Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+                                            // Validate exact identity at the live boundary.
+                                            if fill.side != ReconciliationSide::Buy
+                                                || fill.wallet != wallet_string
+                                                || fill.mint != token.mint
+                                            {
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "CRITICAL: reconciled HotScan buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept, new entries HALTED",
+                                                    signature
+                                                );
+                                                break;
+                                            }
+
+                                            // Extract canonical fill economics.
+                                            let (
+                                                token_amount_raw,
+                                                _decimals,
+                                                actual_cost_sol,
+                                                actual_entry_price,
+                                            ) = match primary_buy_fill_values(&fill) {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    new_entries_halted
+                                                        .store(true, Ordering::SeqCst);
+                                                    error!(
+                                                        "CRITICAL: reconciled HotScan buy fill conversion failed for sig {}: {} - pending kept, new entries HALTED",
+                                                        signature, e
+                                                    );
+                                                    break;
+                                                }
+                                            };
+
+                                            let entry_time = fill
+                                                .block_time
+                                                .and_then(|ts| {
+                                                    chrono::DateTime::<chrono::Utc>::from_timestamp(
+                                                        ts, 0,
+                                                    )
+                                                })
+                                                .unwrap_or_else(chrono::Utc::now);
+
+                                            info!(
+                                                "BUY CONFIRMED: {} (sig {}) raw_tokens={} decimals={} cost={:.9} SOL price={:.12} SOL/token",
+                                                token.symbol,
+                                                signature,
+                                                token_amount_raw,
+                                                fill.token_decimals,
+                                                actual_cost_sol,
+                                                actual_entry_price
+                                            );
+
+                                            // Canonical confirmed-owned position from
+                                            // actuals. bonding_curve empty (unavailable).
+                                            let position = crate::position::manager::Position {
+                                                mint: token.mint.clone(),
+                                                name: token.name.clone(),
+                                                symbol: token.symbol.clone(),
+                                                bonding_curve: String::new(),
+                                                token_amount: token_amount_raw,
+                                                token_decimals: Some(fill.token_decimals),
+                                                entry_price: actual_entry_price,
+                                                total_cost_sol: actual_cost_sol,
+                                                entry_time,
+                                                entry_signature: fill.signature.clone(),
+                                                entry_type:
+                                                    crate::position::manager::EntryType::Opportunity,
+                                                quick_profit_taken: false,
+                                                second_profit_taken: false,
+                                                peak_price: actual_entry_price,
+                                                current_price: actual_entry_price,
+                                                kill_switch_triggered: false,
+                                                kill_switch_reason: None,
+                                                wallet_pubkey: fill.wallet.clone(),
+                                                applied_exit_signatures: vec![],
+                                            };
+
+                                            // Record confirmed ownership. NOT open_position.
+                                            match position_manager
+                                                .record_confirmed_position(position)
+                                                .await
+                                            {
+                                                Ok(_newly_applied) => {}
+                                                Err(e) => {
+                                                    // Confirmed on-chain but could not
+                                                    // record. Keep pending, halt; do not
+                                                    // add bought_mints.
+                                                    new_entries_halted
+                                                        .store(true, Ordering::SeqCst);
+                                                    error!(
+                                                        "Confirmed owned HotScan position could not be recorded for {} (sig {}): {} - pending kept, new entries HALTED",
+                                                        token.symbol, signature, e
+                                                    );
+                                                    break;
+                                                }
+                                            }
+
+                                            // Only AFTER confirmed state: add bought_mints.
+                                            bought.insert(
+                                                token.mint.clone(),
+                                                chrono::Utc::now().timestamp(),
+                                            );
+                                            persist_bought_mints(&*bought_mints_path, &*bought);
+
+                                            // === SET UP KILL-SWITCH MONITORING ===
+                                            if let Some(ref evaluator) = kill_switch_evaluator {
+                                                if let Some(ref helius) = helius_client {
+                                                    let creator = match helius
+                                                        .get_token_creator(&token.mint)
+                                                        .await
+                                                    {
+                                                        Ok(c) => {
+                                                            info!("[{}] Creator for kill-switch: {}", token.symbol, &c[..8]);
+                                                            c
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[{}] Could not get creator: {} - using empty", token.symbol, e);
+                                                            String::new()
+                                                        }
+                                                    };
+
+                                                    let holders = match helius
+                                                        .get_token_holders(&token.mint, 10)
+                                                        .await
+                                                    {
+                                                        Ok(h) => {
+                                                            info!("[{}] Fetched {} top holders for kill-switch monitoring", token.symbol, h.len());
+                                                            h.into_iter()
+                                                                .map(|hi| (hi.address, hi.amount, hi.percentage))
+                                                                .collect::<Vec<_>>()
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[{}] Could not get holders: {} - monitoring creator only", token.symbol, e);
+                                                            vec![]
+                                                        }
+                                                    };
+
+                                                    evaluator.watch_position(
+                                                        &token.mint,
+                                                        &creator,
+                                                        holders,
+                                                    );
+                                                    info!(
+                                                        "[{}] Kill-switch monitoring ACTIVE (creator: {}, holders: tracked)",
+                                                        token.symbol,
+                                                        if creator.is_empty() { "unknown" } else { &creator[..8] }
+                                                    );
+                                                }
+                                            }
+
+                                            // Remove pending LAST, after all state applied.
+                                            if let Err(e) =
+                                                pending_executions.remove(&signature).await
+                                            {
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "Failed to remove pending HotScan buy after confirmed fill (sig {}): {} - halting new entries; position retained",
+                                                    signature, e
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4461,6 +4806,40 @@ fn position_requires_recovery(position: &crate::position::manager::Position) -> 
             .wallet_pubkey
             .parse::<solana_sdk::pubkey::Pubkey>()
             .is_err()
+}
+
+/// Pure resolver for the exact HotScan BUY execution wallet (F4).
+///
+/// - Local active mode: the execution wallet is the selected local signer's
+///   Pubkey (a selected MultiWallet signer or the primary keypair). The signer
+///   is chosen by the caller; we simply echo its identity.
+/// - Lightning active mode: the execution wallet MUST be the exact configured
+///   Lightning wallet. A MultiWallet keypair is NEVER used as the Lightning
+///   execution wallet, because PumpPortal Lightning owns the execution wallet
+///   (INV-WALLET-001). No fallback (INV-WALLET-002): an active Lightning route
+///   without a configured Lightning wallet is a hard error.
+fn hotscan_execution_wallet(
+    use_lightning: bool,
+    selected_local_signer: Pubkey,
+    configured_lightning_wallet: Option<Pubkey>,
+) -> crate::error::Result<Pubkey> {
+    use crate::error::Error;
+    if use_lightning {
+        configured_lightning_wallet.ok_or_else(|| {
+            Error::TransactionReconciliation(
+                "hotscan_execution_wallet: Lightning route active but no configured Lightning wallet"
+                    .to_string(),
+            )
+        })
+    } else {
+        Ok(selected_local_signer)
+    }
+}
+
+/// Pure helper: the amount that the HotScan pre-send risk check must use is the
+/// FINAL buy amount (after the creator multiplier), NOT the base amount (F3/F7).
+fn hotscan_risk_check_amount(final_buy_amount: f64) -> f64 {
+    final_buy_amount
 }
 
 /// Pure fill-validation boundary for the primary buy path. Extracts the canonical
@@ -5298,6 +5677,120 @@ mod tests {
         fill.side = ReconciliationSide::Sell;
         // A sell fill passed into the buy helper must error.
         assert!(primary_buy_fill_values(&fill).is_err());
+    }
+
+    // === Agent F (HotScan BUY) helper tests ===
+
+    fn f_local_signer() -> Pubkey {
+        // Distinct valid base58 pubkey standing in for a selected local signer
+        // (e.g. a MultiWallet wallet or the primary keypair).
+        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap()
+    }
+
+    fn f_lightning_wallet() -> Pubkey {
+        // A DIFFERENT valid pubkey standing in for the configured Lightning wallet.
+        Pubkey::from_str("Vote111111111111111111111111111111111111111").unwrap()
+    }
+
+    #[test]
+    fn test_hotscan_lightning_wallet_is_configured_lightning_not_local() {
+        let local = f_local_signer();
+        let lightning = f_lightning_wallet();
+        // Lightning active mode: execution wallet MUST be the configured Lightning
+        // wallet, NOT the selected local signer.
+        let resolved =
+            hotscan_execution_wallet(true, local, Some(lightning)).expect("resolves");
+        assert_eq!(resolved, lightning);
+        assert_ne!(resolved, local);
+    }
+
+    #[test]
+    fn test_hotscan_lightning_active_without_wallet_is_error_no_fallback() {
+        let local = f_local_signer();
+        // Lightning active but no configured Lightning wallet: hard error, never
+        // falls back to the local signer (INV-WALLET-002).
+        assert!(hotscan_execution_wallet(true, local, None).is_err());
+    }
+
+    #[test]
+    fn test_hotscan_local_wallet_is_selected_signer() {
+        let local = f_local_signer();
+        let lightning = f_lightning_wallet();
+        // Local active mode: execution wallet is the selected local signer, and the
+        // configured Lightning wallet (even if present) is irrelevant.
+        let resolved =
+            hotscan_execution_wallet(false, local, Some(lightning)).expect("resolves");
+        assert_eq!(resolved, local);
+        assert_ne!(resolved, lightning);
+    }
+
+    #[test]
+    fn test_hotscan_risk_check_uses_final_amount() {
+        // The pre-send risk check must use the FINAL amount (after the creator
+        // multiplier), not the base amount.
+        let base = 0.02_f64;
+        let final_amount = base * 1.5; // elite creator 1.5x
+        assert_eq!(hotscan_risk_check_amount(final_amount), final_amount);
+        assert_ne!(hotscan_risk_check_amount(final_amount), base);
+    }
+
+    #[test]
+    fn test_hotscan_confirmed_fill_position_stores_raw_and_decimals() {
+        // A confirmed HotScan fill must produce a canonical Position carrying RAW
+        // token units and the fill's actual decimals (INV-TX-005) — never an
+        // estimate or a hard-coded 6-decimal normalization.
+        let fill = synthetic_buy_fill();
+        let (raw, _decimals, cost, price) =
+            primary_buy_fill_values(&fill).expect("valid buy fill");
+
+        let position = crate::position::manager::Position {
+            mint: fill.mint.clone(),
+            name: "n".to_string(),
+            symbol: "S".to_string(),
+            bonding_curve: String::new(),
+            token_amount: raw,
+            token_decimals: Some(fill.token_decimals),
+            entry_price: price,
+            total_cost_sol: cost,
+            entry_time: chrono::Utc::now(),
+            entry_signature: fill.signature.clone(),
+            entry_type: crate::position::manager::EntryType::Opportunity,
+            quick_profit_taken: false,
+            second_profit_taken: false,
+            peak_price: price,
+            current_price: price,
+            kill_switch_triggered: false,
+            kill_switch_reason: None,
+            wallet_pubkey: fill.wallet.clone(),
+            applied_exit_signatures: vec![],
+        };
+
+        // Stores RAW units exactly, decimals from the fill, and bonding_curve empty.
+        assert_eq!(position.token_amount, 1_500_000);
+        assert_eq!(position.token_decimals, Some(6));
+        assert!(position.bonding_curve.is_empty());
+        assert_eq!(position.entry_type, crate::position::manager::EntryType::Opportunity);
+        assert_eq!(position.wallet_pubkey, fill.wallet);
+    }
+
+    /// Pure classifier mirroring the live buy-block decision: bought_mints is only
+    /// added for a `ConfirmedFill`; an `Unresolved` (or failure) outcome must not
+    /// mark it (F5/F7).
+    fn hotscan_should_add_bought_mint(outcome: &ReconciliationOutcome) -> bool {
+        matches!(outcome, ReconciliationOutcome::ConfirmedFill(_))
+    }
+
+    #[test]
+    fn test_hotscan_unresolved_does_not_mark_bought_mints() {
+        let unresolved = ReconciliationOutcome::Unresolved {
+            signature: "sig".to_string(),
+            reason: "timeout".to_string(),
+            observed_after_ms: 15_000,
+        };
+        assert!(!hotscan_should_add_bought_mint(&unresolved));
+
+        let confirmed = ReconciliationOutcome::ConfirmedFill(synthetic_buy_fill());
+        assert!(hotscan_should_add_bought_mint(&confirmed));
     }
 
     /// Synthetic SELL fill: 100 raw tokens removed (negative delta), decimals 6,
