@@ -5106,6 +5106,11 @@ pub async fn hot_scan(
         let monitor_sold_mints = sold_mints.clone();
         let monitor_kill_switch = kill_switch_evaluator.clone();
         let monitor_multi_wallet = multi_wallet.clone();
+        // MPT-001 Agent H: authoritative market oracle for the HotScan price-exit
+        // path. Every monitor cycle fetches a FRESH on-chain mark and, before any
+        // price-based sell, an exact-size same-venue executable quote. DexScreener
+        // is discovery/observation only and never authorizes an exit (H1/H2/H4).
+        let monitor_oracle = market_oracle.clone();
         // === AGENT G: transaction-truth wiring for the HotScan SELL path ===
         // Clone the already-initialized reconciler, shared pending journal, exact
         // wallet registry, route-capable trader handles (Agent F), and the
@@ -5142,73 +5147,83 @@ pub async fn hot_scan(
                     continue;
                 }
 
-                // Fetch current prices from DexScreener with fallback handling
                 for position in positions {
-                    // Get current price from DexScreener with retry
-                    let price_result = monitor_dex.get_token_info(&position.mint).await;
-
-                    let current_price = match price_result {
-                        Ok(Some(token_info)) => {
-                            if token_info.price_native > 0.0 {
-                                token_info.price_native
-                            } else {
-                                // Zero price from API - use last known price if available
-                                if position.current_price > 0.0 {
-                                    warn!("[{}] DexScreener returned 0 price, using last known: {:.10}",
-                                          position.symbol, position.current_price);
-                                    position.current_price
-                                } else {
-                                    continue;
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            // Token not found on DexScreener - use last known price
-                            if position.current_price > 0.0 {
-                                warn!(
-                                    "[{}] Not found on DexScreener, using last known price: {:.10}",
-                                    position.symbol, position.current_price
-                                );
-                                position.current_price
-                            } else {
-                                warn!(
-                                    "[{}] Not found on DexScreener and no last price - skipping",
-                                    position.symbol
-                                );
-                                continue;
-                            }
-                        }
+                    // MPT-001 Agent H1/H2/H4: fetch a FRESH on-chain mark before any
+                    // price logic. DexScreener is discovery/observation ONLY — it may
+                    // be LOGGED but can never authorize an exit or feed the position
+                    // mark / executable price / realized P&L. A valid SOL mark updates
+                    // the Position (mark + peak) via PositionManager::update_price; we
+                    // then re-read the updated Position so peak/trailing reflect it.
+                    //
+                    // On any market error (RPC/decode/unsupported quote) we do NOT fall
+                    // back to the stale persisted `current_price` and we do NOT fall
+                    // back to DexScreener to authorize a price sell (INV-MKT-012 /
+                    // Section 16): skip this position for the cycle and halt NEW entries
+                    // because the position is not operationally priceable.
+                    let mint_pubkey = match Pubkey::from_str(position.mint.trim()) {
+                        Ok(pk) => pk,
                         Err(e) => {
-                            // API error - use last known price as fallback
-                            if position.current_price > 0.0 {
-                                warn!(
-                                    "[{}] DexScreener error: {} - using last known price: {:.10}",
-                                    position.symbol, e, position.current_price
-                                );
-                                position.current_price
-                            } else {
-                                error!(
-                                    "[{}] DexScreener error and no fallback price: {}",
-                                    position.symbol, e
-                                );
-                                continue;
-                            }
+                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                            error!(
+                                "[{}] position mint '{}' does not parse ({}) - no price exit, HotScan new entries HALTED",
+                                position.symbol, position.mint, e
+                            );
+                            continue;
                         }
                     };
 
-                    // Update position price
+                    // DexScreener observation ONLY (non-authoritative). Logged for
+                    // visibility; never used as mark/executable price/P&L (H4).
+                    if let Ok(Some(token_info)) = monitor_dex.get_token_info(&position.mint).await {
+                        if token_info.price_native > 0.0 {
+                            info!(
+                                "[{}] DexScreener observation (non-authoritative): {:.10}",
+                                position.symbol, token_info.price_native
+                            );
+                        }
+                    }
+
+                    let fresh_mark = match monitor_oracle.snapshot(&mint_pubkey).await {
+                        Ok(snap) => match snap.mark_price_sol_per_token {
+                            Some(m) if m.is_finite() && m > 0.0 => m,
+                            _ => {
+                                // Unsupported quote asset / no usable SOL mark. Not
+                                // operationally priceable: halt new entries, keep the
+                                // position, never trigger a price sell on stale data.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                warn!(
+                                    "[{}] no fresh SOL mark for {} - no price exit this cycle, HotScan new entries HALTED",
+                                    position.symbol, position.mint
+                                );
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                            warn!(
+                                "[{}] market snapshot failed for {}: {} - no price exit this cycle (no stale/Dex fallback), HotScan new entries HALTED",
+                                position.symbol, position.mint, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Update position mark/peak from the FRESH on-chain mark (H2).
                     monitor_positions
-                        .update_price(&position.mint, current_price)
+                        .update_price(&position.mint, fresh_mark)
                         .await;
 
-                    // Small delay between API calls to avoid rate limiting
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                    // Get updated position with peak_price tracked
+                    // Get updated position with peak_price tracked.
                     let position = match monitor_positions.get_position(&position.mint).await {
                         Some(p) => p,
                         None => continue,
                     };
+
+                    // `current_price` is now the latest FRESH on-chain mark (H2/H4).
+                    let current_price = position.current_price;
+                    if current_price <= 0.0 {
+                        continue;
+                    }
 
                     // G1: The old post-buy TX-confirmation polling (the tracking
                     // HashSet, the 5s wait, the token-balance poll, and the 30s
@@ -5284,11 +5299,20 @@ pub async fn hot_scan(
                     let mut should_sell = false;
                     let mut sell_pct = "100%";
                     let mut reason = String::new();
+                    // MPT-001 Agent H3/F2: capture WHICH price rule fired so the exact
+                    // same condition can be re-confirmed against the executable-quote
+                    // price before any sell is submitted. Kill-switch triggers leave
+                    // this None: they are NOT price-triggered and follow the F8
+                    // emergency policy (may fall back to unquoted Auto).
+                    let mut exit_category: Option<PriceExitCategory> = None;
+                    // True only for a kill-switch / risk trigger (no price category).
+                    let mut is_kill_switch = false;
 
                     // === KILL-SWITCH CHECK (HIGHEST PRIORITY) ===
                     // First check position flag (set by other systems)
                     if let Some(ks_reason) = monitor_positions.is_kill_switch_triggered(&position.mint).await {
                         should_sell = true;
+                        is_kill_switch = true;
                         reason = format!("KILL-SWITCH: {}", ks_reason);
                         warn!("KILL-SWITCH EXIT: {} - {}", position.symbol, ks_reason);
                     }
@@ -5297,6 +5321,7 @@ pub async fn hot_scan(
                         if let Some(ref evaluator) = monitor_kill_switch {
                             if let KillSwitchDecision::Exit(alert) = evaluator.should_exit(&position.mint) {
                                 should_sell = true;
+                                is_kill_switch = true;
                                 reason = format!("KILL-SWITCH: {} (urgency: {:?})", alert.reason, alert.urgency);
                                 warn!("KILL-SWITCH EXIT: {} - {} [{:?}]", position.symbol, alert.reason, alert.urgency);
                             }
@@ -5307,6 +5332,10 @@ pub async fn hot_scan(
                     if !should_sell && pnl_pct <= -sl_pct {
                         should_sell = true;
                         reason = format!("STOP LOSS at {:.1}% (limit: -{:.0}%)", pnl_pct, sl_pct);
+                        exit_category = Some(PriceExitCategory::StopLoss {
+                            entry_price: position.entry_price,
+                            sl_pct,
+                        });
                     }
 
                     // 2. Trailing stop (only if in profit and dropped from peak)
@@ -5317,12 +5346,21 @@ pub async fn hot_scan(
                             "TRAILING STOP: dropped {:.1}% from peak (P&L: +{:.1}%, trail: {:.0}%)",
                             drop_from_peak_pct, pnl_pct, trailing_stop_pct
                         );
+                        exit_category = Some(PriceExitCategory::TrailingStop {
+                            entry_price: position.entry_price,
+                            peak_price,
+                            trailing_pct: trailing_stop_pct,
+                        });
                     }
 
                     // 3. Take profit (final exit)
                     if !should_sell && pnl_pct >= tp_pct {
                         should_sell = true;
                         reason = format!("TAKE PROFIT at {:.1}% (target: {:.0}%)", pnl_pct, tp_pct);
+                        exit_category = Some(PriceExitCategory::TakeProfit {
+                            entry_price: position.entry_price,
+                            tp_pct,
+                        });
                     }
 
                     // 4. Quick profit - FIRST LAYER (50% sell at quick_profit_pct)
@@ -5334,6 +5372,12 @@ pub async fn hot_scan(
                         should_sell = true;
                         sell_pct = "50%";
                         reason = format!("LAYER 1: Quick profit at {:.1}% - selling 50%", pnl_pct);
+                        // Confirms when pnl >= quick_profit_pct and < second_profit_pct.
+                        exit_category = Some(PriceExitCategory::QuickProfit {
+                            entry_price: position.entry_price,
+                            qp_pct: quick_profit_pct,
+                            tp_pct: second_profit_pct,
+                        });
                     }
 
                     // 5. Second profit - SECOND LAYER (25% sell at second_profit_pct)
@@ -5346,6 +5390,13 @@ pub async fn hot_scan(
                         should_sell = true;
                         sell_pct = "25%";
                         reason = format!("LAYER 2: Second profit at {:.1}% - selling 25%", pnl_pct);
+                        // Reuse the QuickProfit predicate with the second-profit band:
+                        // confirms when pnl >= second_profit_pct and < take_profit_pct.
+                        exit_category = Some(PriceExitCategory::QuickProfit {
+                            entry_price: position.entry_price,
+                            qp_pct: second_profit_pct,
+                            tp_pct,
+                        });
                     }
 
                     // 6. No-movement exit
@@ -5355,6 +5406,7 @@ pub async fn hot_scan(
                     {
                         should_sell = true;
                         reason = format!("NO MOVEMENT: {:.1}% after {}s", pnl_pct, hold_time_secs);
+                        exit_category = Some(PriceExitCategory::TimeBased);
                     }
 
                     // 7. Max hold time
@@ -5366,6 +5418,7 @@ pub async fn hot_scan(
                                     "MAX HOLD TIME ({} secs) P&L: {:.1}%",
                                     max_secs, pnl_pct
                                 );
+                                exit_category = Some(PriceExitCategory::TimeBased);
                             }
                         }
                     }
@@ -5458,8 +5511,161 @@ pub async fn hot_scan(
                             }
                         };
 
-                        // G5 INTENT MAPPING (does NOT change the requested "25%" amount).
+                        // G5 INTENT MAPPING (records QuickProfit/SecondProfit/Full;
+                        // does NOT itself change the size — the exact raw layer amount
+                        // computed below is the authoritative submitted size).
                         let intent = hotscan_sell_intent_for_layer(sell_pct);
+
+                        // MPT-001 Agent H3/F3/F6: compute the EXACT raw amount for the
+                        // intended layer (100%/50%/25% via integer division) and fetch
+                        // the FINAL same-venue executable quote immediately before send.
+                        // For a price-based exit this quote is BOTH the trigger
+                        // re-confirmation (F2) AND the execution reference (F7) — never
+                        // reused across cycles or layers. A quote failure means nothing
+                        // was submitted: keep the position; halt new entries when the
+                        // market is unsupported/unavailable.
+                        //
+                        // Kill-switch (F8): NOT price-triggered. Prefer a fresh quote +
+                        // pinned venue; if the oracle fails, fall back to the existing
+                        // emergency Auto/unquoted route (never blocked by the oracle,
+                        // never fabricating an expected price).
+                        let token_decimals = match position.token_decimals {
+                            Some(d) => d,
+                            None => {
+                                // Already guarded above; defensive re-check before quote.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] position lost token_decimals before quote - no sell, HotScan new entries HALTED",
+                                    position.symbol
+                                );
+                                continue;
+                            }
+                        };
+                        let intended_raw = match layer_raw_amount(position.token_amount, sell_pct) {
+                            Some(r) => r,
+                            None => {
+                                warn!(
+                                    "[{}] exact raw amount for layer {} of raw {} is zero/unknown - no sell",
+                                    position.symbol, sell_pct, position.token_amount
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Extract a usable same-venue SOL executable quote (the ONLY
+                        // carrier of the executable price + pinned venue). `None` when
+                        // the quote is missing, not a SOL pair, or has no usable price:
+                        // fatal for a price exit, degrades to unquoted emergency for a
+                        // kill-switch. `quote_slot` is retained for logging only.
+                        let mut quote_slot: Option<u64> = None;
+                        let exec_quote: Option<HotScanExecQuote> = match monitor_oracle
+                            .quote_sell_raw(&mint_pubkey, intended_raw)
+                            .await
+                        {
+                            Ok(quote) if quote.is_sol_pair() => {
+                                match quote.expected_price_sol_per_token {
+                                    Some(p) if p.is_finite() && p > 0.0 => {
+                                        quote_slot = Some(quote.slot);
+                                        Some(HotScanExecQuote {
+                                            exec_price_sol_per_token: p,
+                                            venue: quote.venue,
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            Ok(_) => None, // quote returned but not a supported SOL pair
+                            Err(e) => {
+                                if is_kill_switch {
+                                    warn!(
+                                        "KILL-SWITCH UNQUOTED EMERGENCY ROUTE: {} - sell quote unavailable ({}); selling {} via Auto (no expected price fabricated)",
+                                        position.symbol, e, sell_pct
+                                    );
+                                } else {
+                                    warn!(
+                                        "[{}] no executable sell quote ({} raw): {} - no price sell, HotScan new entries HALTED",
+                                        position.symbol, intended_raw, e
+                                    );
+                                }
+                                None
+                            }
+                        };
+
+                        // Resolve (submit_amount, sell_pool) via the pure authorizer.
+                        // A PRICE exit MUST be quote-confirmed and venue-pinned
+                        // (H3/F2/F4/F5); a KILL-SWITCH (F8) prefers the quoted+pinned
+                        // exit but degrades to the unquoted Auto route (never blocked).
+                        let (submit_amount, sell_pool) = match hotscan_exit_decision(
+                            is_kill_switch,
+                            exit_category,
+                            exec_quote,
+                            intended_raw,
+                            token_decimals,
+                            sell_pct,
+                        ) {
+                            HotScanExitDecision::QuotedSell { submit_amount, pool } => {
+                                if is_kill_switch {
+                                    info!(
+                                        "KILL-SWITCH quoted exit for {}: venue={:?} pool={:?} raw={} amount={} exec_price={:.12} quote_slot={:?}",
+                                        position.symbol,
+                                        exec_quote.map(|q| q.venue),
+                                        pool,
+                                        intended_raw,
+                                        submit_amount,
+                                        exec_quote.map(|q| q.exec_price_sol_per_token).unwrap_or(0.0),
+                                        quote_slot
+                                    );
+                                } else {
+                                    info!(
+                                        "[{}] exit CONFIRMED: venue={:?} pool={:?} raw={} amount={} exec_price={:.12} quote_slot={:?}",
+                                        position.symbol,
+                                        exec_quote.map(|q| q.venue),
+                                        pool,
+                                        intended_raw,
+                                        submit_amount,
+                                        exec_quote.map(|q| q.exec_price_sol_per_token).unwrap_or(0.0),
+                                        quote_slot
+                                    );
+                                }
+                                (submit_amount, pool)
+                            }
+                            HotScanExitDecision::EmergencyUnquoted { submit_amount, pool } => {
+                                // F8: only reachable for a kill-switch with no usable
+                                // quote. The oracle-Err case was already logged above;
+                                // cover the not-a-SOL-pair / no-price cases here.
+                                warn!(
+                                    "KILL-SWITCH UNQUOTED EMERGENCY ROUTE: {} - no usable executable quote; selling {} via Auto (no expected price fabricated)",
+                                    position.symbol, submit_amount
+                                );
+                                (submit_amount, pool)
+                            }
+                            HotScanExitDecision::NoSell => {
+                                if is_kill_switch {
+                                    // Not reachable (kill-switch never yields NoSell), but
+                                    // fail closed defensively.
+                                    continue;
+                                }
+                                // Price exit not authorized: either no usable executable
+                                // quote, or the executable quote no longer meets the
+                                // trigger. Nothing submitted; keep the position. Halt new
+                                // entries only when the market was not usably priceable.
+                                if exec_quote.is_none() {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    warn!(
+                                        "[{}] no usable executable SOL quote - no price sell, HotScan new entries HALTED",
+                                        position.symbol
+                                    );
+                                } else {
+                                    info!(
+                                        "[{}] exit NOT confirmed: mark triggered '{}' but executable quote price {:.12} SOL/token no longer meets the condition - no sell",
+                                        position.symbol,
+                                        reason,
+                                        exec_quote.map(|q| q.exec_price_sol_per_token).unwrap_or(0.0)
+                                    );
+                                }
+                                continue;
+                            }
+                        };
 
                         // G4 EXACT ROUTE per position. Ignore any global route. NO
                         // Lightning-attempts-1-3-then-Local, NO primary signer fallback,
@@ -5478,13 +5684,14 @@ pub async fn hot_scan(
                                             );
                                             Some(
                                                 local_trader
-                                                    .sell_local(
+                                                    .sell_local_with_pool(
                                                         &position.mint,
-                                                        sell_pct,
+                                                        &submit_amount,
                                                         slippage,
                                                         priority_fee,
                                                         &monitor_keypair,
                                                         &monitor_rpc,
+                                                        sell_pool,
                                                     )
                                                     .await,
                                             )
@@ -5497,13 +5704,14 @@ pub async fn hot_scan(
                                                     );
                                                     Some(
                                                         local_trader
-                                                            .sell_local(
+                                                            .sell_local_with_pool(
                                                                 &position.mint,
-                                                                sell_pct,
+                                                                &submit_amount,
                                                                 slippage,
                                                                 priority_fee,
                                                                 &tw.keypair,
                                                                 &monitor_rpc,
+                                                                sell_pool,
                                                             )
                                                             .await,
                                                     )
@@ -5528,7 +5736,13 @@ pub async fn hot_scan(
                                         );
                                         Some(
                                             lightning_trader
-                                                .sell(&position.mint, sell_pct, slippage, priority_fee)
+                                                .sell_with_pool(
+                                                    &position.mint,
+                                                    &submit_amount,
+                                                    slippage,
+                                                    priority_fee,
+                                                    sell_pool,
+                                                )
                                                 .await,
                                         )
                                     }
@@ -5569,7 +5783,11 @@ pub async fn hot_scan(
                             position.mint.clone(),
                             position.wallet_pubkey.clone(),
                             PendingSellContext {
-                                requested_amount: sell_pct.to_string(),
+                                // MPT-001 Agent H3/F4: the pending context stores the
+                                // EXACT submitted amount string that was actually sent
+                                // (a quoted decimal size, or the emergency percentage on
+                                // an unquoted kill-switch fallback), not a fixed "25%".
+                                requested_amount: submit_amount.clone(),
                                 intent,
                                 reason: reason.clone(),
                             },
@@ -6862,6 +7080,101 @@ fn hotscan_sell_action(
                 HotScanSellAction::Lightning
             } else {
                 HotScanSellAction::NoRoute
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// MPT-001 Agent H — HotScan price-exit market-truth pure decision
+// ===========================================================================
+
+/// The exact-size executable sell quote as consumed by the HotScan exit
+/// authorizer (H3). A price exit is authorized ONLY from a usable same-venue SOL
+/// quote (this is the ONLY carrier of the executable price + pinned venue);
+/// DexScreener / stale `current_price` / the mark can never appear here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HotScanExecQuote {
+    /// Executable expected SOL/token price at the quoted exact size. This is the
+    /// price the exit condition is re-confirmed against (F2) — never the mark.
+    exec_price_sol_per_token: f64,
+    /// Venue the quote came from; the sell is pinned to it (F5), never Auto.
+    venue: MarketVenue,
+}
+
+/// The authoritative outcome of the HotScan price-exit gate (H1/H2/H3/F2/F5/F8).
+#[derive(Debug, Clone, PartialEq)]
+enum HotScanExitDecision {
+    /// Do not submit any sell this cycle (mark unavailable, quote unavailable for
+    /// a price exit, or the executable quote no longer meets the trigger). The
+    /// position is kept.
+    NoSell,
+    /// A quote-confirmed, venue-pinned price exit (or a quoted kill-switch exit):
+    /// submit exactly `submit_amount` decimal tokens via `pool`.
+    QuotedSell { submit_amount: String, pool: PoolType },
+    /// F8 emergency ONLY: kill-switch with no usable executable quote. Submit the
+    /// original percentage string via Auto, unquoted, no fabricated price.
+    EmergencyUnquoted { submit_amount: String, pool: PoolType },
+}
+
+/// Pure HotScan exit authorizer (H3 + F2/F5/F8), extracted so it is unit-testable
+/// with no network. It intentionally has NO access to DexScreener or to a stale
+/// `current_price`: authorization can only flow from `exec_quote`, the fresh
+/// exact-size executable quote.
+///
+/// - `is_kill_switch`: the trigger was a kill-switch/risk exit (not price-based).
+/// - `exit_category`: the price rule that fired against the fresh MARK (None for a
+///   kill-switch). Re-confirmed against the EXECUTABLE quote price here.
+/// - `exec_quote`: `Some` only when a fresh same-venue SOL quote with a usable
+///   price exists; `None` means no usable executable quote this cycle.
+/// - `intended_raw` / `token_decimals`: the exact quoted layer size, formatted for
+///   submission via `raw_token_amount_to_decimal_string`.
+/// - `emergency_pct`: the original layer string ("100%"/"50%"/"25%") used ONLY for
+///   the unquoted kill-switch fallback amount.
+fn hotscan_exit_decision(
+    is_kill_switch: bool,
+    exit_category: Option<PriceExitCategory>,
+    exec_quote: Option<HotScanExecQuote>,
+    intended_raw: u64,
+    token_decimals: u8,
+    emergency_pct: &str,
+) -> HotScanExitDecision {
+    match exec_quote {
+        Some(q) => {
+            let pool = pumpportal_pool_for_venue(q.venue);
+            let amount = raw_token_amount_to_decimal_string(intended_raw, token_decimals);
+            if is_kill_switch {
+                // Kill-switch with a usable quote: quoted + pinned emergency exit.
+                HotScanExitDecision::QuotedSell {
+                    submit_amount: amount,
+                    pool,
+                }
+            } else {
+                // F2: the trigger must STILL hold against the executable quote
+                // price, not merely the mark that identified the candidate.
+                let confirmed = exit_category
+                    .map(|c| c.confirms_at(q.exec_price_sol_per_token))
+                    .unwrap_or(false);
+                if confirmed {
+                    HotScanExitDecision::QuotedSell {
+                        submit_amount: amount,
+                        pool,
+                    }
+                } else {
+                    HotScanExitDecision::NoSell
+                }
+            }
+        }
+        None => {
+            if is_kill_switch {
+                // F8: never blocked by an oracle outage. Unquoted Auto route.
+                HotScanExitDecision::EmergencyUnquoted {
+                    submit_amount: emergency_pct.to_string(),
+                    pool: PoolType::Auto,
+                }
+            } else {
+                // Price exit with no usable executable quote: nothing submitted.
+                HotScanExitDecision::NoSell
             }
         }
     }
@@ -8241,6 +8554,214 @@ mod tests {
         assert_eq!(sold_raw, 100);
         assert!(net_sol < 0.0, "net_sol was {}", net_sol);
         assert!(price.is_finite());
+    }
+
+    // ======================================================================
+    // MPT-001 Agent H — HotScan EXIT market-truth pure tests (H5)
+    // ======================================================================
+
+    // The HotScan exit authorizer takes ONLY the fresh exact-size executable
+    // quote (`HotScanExecQuote`) as the price/venue source. It has no field for
+    // DexScreener or a stale `current_price`, so those observations are
+    // structurally incapable of authorizing an exit. The two tests below assert
+    // that authorization tracks the EXECUTABLE quote, not any external mark.
+
+    #[test]
+    fn test_h_dexscreener_observation_cannot_authorize_exit() {
+        // H5(1): a DexScreener "price" is only an observation. Regardless of how
+        // bullish it looks, with NO usable executable quote a price exit is NOT
+        // authorized (the authorizer never even sees a Dex value).
+        let dexscreener_price_native = 999.0; // wildly optimistic Dex reading
+        let _ = dexscreener_price_native; // never fed to the authorizer
+        let decision = hotscan_exit_decision(
+            false, // price-triggered (not kill-switch)
+            Some(PriceExitCategory::TakeProfit {
+                entry_price: 1.0,
+                tp_pct: 50.0,
+            }),
+            None, // NO executable quote — Dex cannot substitute
+            1_000_000,
+            6,
+            "100%",
+        );
+        assert_eq!(decision, HotScanExitDecision::NoSell);
+    }
+
+    #[test]
+    fn test_h_stale_current_price_cannot_authorize_exit() {
+        // H5(2): even if a stale `current_price` (the mark) would satisfy the
+        // trigger, authorization is re-confirmed against the EXECUTABLE quote. A
+        // quote price that no longer meets the condition => no sell.
+        let stale_mark_would_trigger = 1.60; // +60% on the stale mark
+        let _ = stale_mark_would_trigger; // not an authorizer input
+        let decision = hotscan_exit_decision(
+            false,
+            Some(PriceExitCategory::TakeProfit {
+                entry_price: 1.0,
+                tp_pct: 50.0,
+            }),
+            // Executable quote says only +10% is actually achievable — below TP.
+            Some(HotScanExecQuote {
+                exec_price_sol_per_token: 1.10,
+                venue: MarketVenue::PumpBondingCurve,
+            }),
+            1_000_000,
+            6,
+            "100%",
+        );
+        assert_eq!(decision, HotScanExitDecision::NoSell);
+    }
+
+    #[test]
+    fn test_h_exact_quick_profit_quote_size() {
+        // H5(3): QuickProfit ("50%") authorizes exactly half the raw balance,
+        // submitted as the exact decimal string (not "50%").
+        let raw = layer_raw_amount(1_000_000, "50%").expect("50% of 1_000_000");
+        assert_eq!(raw, 500_000);
+        let decision = hotscan_exit_decision(
+            false,
+            Some(PriceExitCategory::QuickProfit {
+                entry_price: 1.0,
+                qp_pct: 20.0,
+                tp_pct: 50.0,
+            }),
+            Some(HotScanExecQuote {
+                exec_price_sol_per_token: 1.30, // +30%: in the quick-profit band
+                venue: MarketVenue::PumpBondingCurve,
+            }),
+            raw,
+            6,
+            "50%",
+        );
+        assert_eq!(
+            decision,
+            HotScanExitDecision::QuotedSell {
+                submit_amount: "0.5".to_string(),
+                pool: PoolType::Pump,
+            }
+        );
+    }
+
+    #[test]
+    fn test_h_exact_second_profit_quote_size() {
+        // H5(4): SecondProfit ("25%") authorizes exactly a quarter of the raw
+        // balance, submitted as the exact decimal string (not "25%"). The
+        // second-profit band is modeled with QuickProfit(qp=second_pct, tp).
+        let raw = layer_raw_amount(1_000_000, "25%").expect("25% of 1_000_000");
+        assert_eq!(raw, 250_000);
+        let decision = hotscan_exit_decision(
+            false,
+            Some(PriceExitCategory::QuickProfit {
+                entry_price: 1.0,
+                qp_pct: 40.0, // second_profit_pct
+                tp_pct: 80.0, // take_profit_pct
+            }),
+            Some(HotScanExecQuote {
+                exec_price_sol_per_token: 1.50, // +50%: in the second-profit band
+                venue: MarketVenue::PumpSwapCanonical,
+            }),
+            raw,
+            6,
+            "25%",
+        );
+        assert_eq!(
+            decision,
+            HotScanExitDecision::QuotedSell {
+                submit_amount: "0.25".to_string(),
+                pool: PoolType::PumpAmm,
+            }
+        );
+    }
+
+    #[test]
+    fn test_h_full_quote_size() {
+        // H5(5): a full ("100%") exit authorizes the entire raw balance as its
+        // exact decimal string.
+        let raw = layer_raw_amount(2_000_000, "100%").expect("100% of 2_000_000");
+        assert_eq!(raw, 2_000_000);
+        let decision = hotscan_exit_decision(
+            false,
+            Some(PriceExitCategory::TakeProfit {
+                entry_price: 1.0,
+                tp_pct: 50.0,
+            }),
+            Some(HotScanExecQuote {
+                exec_price_sol_per_token: 1.60, // +60%: meets take-profit
+                venue: MarketVenue::PumpBondingCurve,
+            }),
+            raw,
+            6,
+            "100%",
+        );
+        assert_eq!(
+            decision,
+            HotScanExitDecision::QuotedSell {
+                submit_amount: "2".to_string(),
+                pool: PoolType::Pump,
+            }
+        );
+    }
+
+    #[test]
+    fn test_h_quoted_venue_pinned() {
+        // H5(6): the submitted route is pinned to the QUOTED venue, never Auto,
+        // for an authorized price exit — Pump curve => Pump, PumpSwap => PumpAmm.
+        let tp = PriceExitCategory::TakeProfit {
+            entry_price: 1.0,
+            tp_pct: 50.0,
+        };
+        for (venue, expect_pool) in [
+            (MarketVenue::PumpBondingCurve, PoolType::Pump),
+            (MarketVenue::PumpSwapCanonical, PoolType::PumpAmm),
+        ] {
+            let decision = hotscan_exit_decision(
+                false,
+                Some(tp),
+                Some(HotScanExecQuote {
+                    exec_price_sol_per_token: 1.60,
+                    venue,
+                }),
+                1_000_000,
+                6,
+                "100%",
+            );
+            match decision {
+                HotScanExitDecision::QuotedSell { pool, .. } => {
+                    assert_eq!(pool, expect_pool);
+                    assert_ne!(pool, PoolType::Auto);
+                }
+                other => panic!("expected QuotedSell, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_h_drift_uses_quote_not_mark() {
+        // H5(7): the quote-to-fill drift baseline is the EXECUTABLE quote price,
+        // never the mark. The C-layer sell-drift helper is `(expected - actual) /
+        // expected * 100`. Using the quote (1.20) vs. a hypothetical mark (1.50)
+        // yields materially different drift; the executable quote is authoritative.
+        use crate::strategy::types::{ExecutionRecord, Side};
+        let quote_expected = 1.20_f64;
+        let mark = 1.50_f64;
+        let actual_fill = 1.14_f64; // 5% worse than the executable quote
+
+        let drift_vs_quote =
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, quote_expected, actual_fill)
+                .expect("finite drift");
+        // 5% worse than the quote.
+        assert!((drift_vs_quote - 5.0).abs() < 1e-6, "drift_vs_quote={}", drift_vs_quote);
+
+        let drift_vs_mark =
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, mark, actual_fill)
+                .expect("finite drift");
+        // The mark-based number is very different — proving the baseline choice matters.
+        assert!(
+            (drift_vs_quote - drift_vs_mark).abs() > 10.0,
+            "quote {} vs mark {} baselines must diverge",
+            drift_vs_quote,
+            drift_vs_mark
+        );
     }
 
     // ======================================================================
