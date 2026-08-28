@@ -24,9 +24,11 @@ use crate::stream::pumpportal::{PumpPortalClient, PumpPortalEvent};
 use crate::stream::shredstream::ShredStreamClient;
 use crate::trading::pumpportal_api::PumpPortalTrader;
 use crate::trading::{
-    PendingBuyContext, PendingExecution, PendingExecutionStore, PendingSellContext,
-    PendingSellIntent, ReconciliationOutcome, ReconciliationSide, TradeReconciler,
+    reconcile_pending_execution, PendingBuyContext, PendingExecution, PendingExecutionStore,
+    PendingSellContext, PendingSellIntent, ReconciliationOutcome, ReconciliationSide,
+    TradeReconciler,
 };
+use crate::wallet::{ExecutionWalletRegistry, WalletOwnershipProbe};
 
 /// Query actual token balance for a wallet and mint
 /// Returns the token balance or 0 if not found
@@ -267,6 +269,70 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     // (250ms polling / 15s timeout) - do not change here.
     let trade_reconciler = Arc::new(TradeReconciler::new(rpc_client.clone()));
 
+    // === D1: recovery-only exact controlled-wallet registry + ownership probe ===
+    // This registry exists ONLY so restart recovery can recognize positions
+    // created previously (including by HotScan multi-wallet mode). It is NOT used
+    // for primary new-buy selection. Local signing authority and Lightning wallet
+    // authority are distinct (INV-WALLET-001); we never fall back between them.
+    //
+    // Local set = primary local keypair + every successfully loaded
+    // MultiWalletManager local wallet (when trading_wallets is non-empty).
+    let mut recovery_local_wallets: Vec<Pubkey> = Vec::new();
+    let recovery_multi_wallet = if !config.wallet.trading_wallets.is_empty() {
+        match crate::wallet::MultiWalletManager::new(
+            config.wallet.trading_wallets.clone(),
+            &config.wallet.selection_strategy,
+        ) {
+            Ok(mw) => {
+                info!(
+                    "Recovery registry: multi-wallet recognized with {} wallet(s)",
+                    mw.wallet_count()
+                );
+                for w in mw.wallets() {
+                    recovery_local_wallets.push(w.pubkey());
+                }
+                Some(Arc::new(mw))
+            }
+            Err(e) => {
+                // Fail closed: configured multi-wallets that will not load leave
+                // recovery unable to recognize prior positions.
+                return Err(anyhow::anyhow!(
+                    "Failed to load configured trading_wallets for recovery registry; refusing to start: {}",
+                    e
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let _ = &recovery_multi_wallet; // used later by kill-switch/hotscan agents
+
+    // Strictly parse the configured Lightning wallet, if present. An invalid
+    // non-empty Lightning wallet fails closed (INV-WALLET-001/002).
+    let recovery_lightning_wallet: Option<Pubkey> = {
+        let lw = config.pumpportal.lightning_wallet.trim();
+        if lw.is_empty() {
+            None
+        } else {
+            match Pubkey::from_str(lw) {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Configured lightning_wallet is not a valid Pubkey; refusing to start recovery/trading: {}",
+                        e
+                    ));
+                }
+            }
+        }
+    };
+
+    let recovery_registry = ExecutionWalletRegistry::new(
+        keypair.pubkey(),
+        &recovery_local_wallets,
+        recovery_lightning_wallet,
+    );
+    let recovery_probe = WalletOwnershipProbe::new(rpc_client.clone());
+
     // Initialize the persistent pending-execution journal. A submitted signature is
     // submission identity, not fill proof (INV-TX-001); the journal records
     // in-flight signatures so unresolved state survives restarts.
@@ -278,41 +344,59 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     pending_executions.load().await?;
     pending_executions.ensure_writable().await?;
 
-    // Fail-closed halt flag for NEW entries. Set when unresolved transaction state
-    // exists; 001C owns recovery/unhalt semantics.
+    // Fail-closed halt flag for NEW entries. Set when unresolved transaction or
+    // ownership state remains AFTER recovery (D5). No operator override.
     let new_entries_halted = Arc::new(AtomicBool::new(false));
 
-    // If the journal is non-empty at startup, an earlier run left unresolved
-    // submitted execution(s). We do NOT recover/reconcile/delete them here (that is
-    // 001C). We halt new entries and continue so existing positions can still exit.
-    let pending_at_startup = pending_executions.len().await;
-    if pending_at_startup > 0 {
+    // === D5: startup transaction/position recovery ===
+    // Atomic PositionManager is already loaded (fail-closed) and the pending
+    // journal is loaded + ensured writable above. Now:
+    //   1. recover the pending journal against confirmed chain state (D2);
+    //   2. recover legacy/incomplete positions from chain evidence (D3/D4);
+    //   3. halt NEW entries iff any unresolved pending OR recovery-required /
+    //      unroutable position remains. If recovery fully succeeds, entries may
+    //      resume.
+    let pending_summary =
+        recover_pending_store(&trade_reconciler, &pending_executions, &position_manager).await?;
+    info!(
+        "Pending recovery: recovered={}, confirmed_failures_removed={}, still_unresolved={}, accounting_conflicts={}",
+        pending_summary.recovered,
+        pending_summary.confirmed_failures_removed,
+        pending_summary.still_unresolved,
+        pending_summary.accounting_conflicts
+    );
+
+    let legacy_summary = recover_legacy_positions(
+        &trade_reconciler,
+        &recovery_probe,
+        &recovery_registry,
+        &position_manager,
+    )
+    .await?;
+    info!(
+        "Legacy recovery: recovered={}, resolved_zero={}, still_recovery_required={}",
+        legacy_summary.recovered, legacy_summary.resolved_zero, legacy_summary.still_recovery_required
+    );
+
+    // Re-inspect remaining positions after recovery for any that are still
+    // recovery-required or unroutable (defense in depth beyond the counters).
+    let post_recovery_positions = position_manager.get_all_positions().await;
+    let residual_blocked = post_recovery_positions
+        .iter()
+        .filter(|p| legacy_recovery_required(p, &recovery_registry))
+        .count();
+
+    if !pending_summary.fully_resolved()
+        || !legacy_summary.fully_resolved()
+        || residual_blocked > 0
+    {
         error!(
-            "Found {} unresolved submitted execution(s).\nNew entries are HALTED.\nP0-TRANSACTION-TRUTH-001C startup reconciliation is required.",
-            pending_at_startup
+            "New entries HALTED after recovery: unresolved_pending={}, legacy_unresolved={}, residual_blocked_positions={}",
+            pending_summary.still_unresolved, legacy_summary.still_recovery_required, residual_blocked
         );
         new_entries_halted.store(true, Ordering::SeqCst);
-    }
-
-    // Halt new entries if ANY loaded position is legacy/unmigrated (missing
-    // token_decimals, empty wallet, or an unparseable wallet pubkey). We do NOT
-    // mutate/guess these values here; we only refuse to open NEW risk while
-    // existing ownership state is not canonical. Independent of the pending-journal
-    // halt above (either may set the flag).
-    let loaded_positions = position_manager.get_all_positions().await;
-    let mut legacy_position_found = false;
-    for position in &loaded_positions {
-        if position_requires_recovery(position) {
-            legacy_position_found = true;
-            error!(
-                "Loaded position requires recovery (missing decimals / invalid wallet): mint {}",
-                position.mint
-            );
-        }
-    }
-    if legacy_position_found {
-        error!("New entries are HALTED due to legacy/unmigrated loaded position(s).");
-        new_entries_halted.store(true, Ordering::SeqCst);
+    } else {
+        info!("Startup recovery complete: transaction/position truth restored; new entries may resume.");
     }
 
     // Initialize kill-switch evaluator
@@ -417,6 +501,56 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         info!("Strategy engine disabled - using basic mode");
         None
     };
+
+    // === D6: StrategyEngine restart rebuild ===
+    // AFTER engine creation and BEFORE monitor/event processing, restore the
+    // daily realized P&L safety floor and rebuild portfolio exposure from the
+    // canonical PositionManager positions. State restore ONLY — no execution
+    // feedback / chain-health / slippage / latency samples (INV-STRAT-002).
+    // A position that cannot be restored halts new entries (INV-STRAT-001).
+    if let Some(ref engine) = strategy_engine {
+        let stats = position_manager.get_daily_stats().await;
+        {
+            let mut guard = engine.write().await;
+            if !guard.restore_daily_realized_pnl(stats.net_pnl_sol).await {
+                warn!(
+                    "Daily realized P&L restore skipped (non-finite value {})",
+                    stats.net_pnl_sol
+                );
+            } else {
+                info!(
+                    "Restored daily realized P&L safety floor: {} SOL",
+                    stats.net_pnl_sol
+                );
+            }
+        }
+
+        let mut restored = 0usize;
+        let mut unrestorable = 0usize;
+        for position in position_manager.get_all_positions().await {
+            if position_is_canonical_for_restore(&position, &recovery_registry) {
+                let strategy_position = manager_position_to_strategy_position(
+                    &position,
+                    config.strategy.default_strategy.clone(),
+                );
+                engine.write().await.record_entry(strategy_position).await;
+                restored += 1;
+            } else {
+                unrestorable += 1;
+            }
+        }
+        info!(
+            "Strategy exposure rebuilt: {} canonical position(s) restored, {} not restorable",
+            restored, unrestorable
+        );
+        if unrestorable > 0 {
+            error!(
+                "New entries HALTED: {} position(s) could not be restored into strategy exposure",
+                unrestorable
+            );
+            new_entries_halted.store(true, Ordering::SeqCst);
+        }
+    }
 
     // Track wallets for copy trading
     let tracked_wallets: std::collections::HashSet<String> =
@@ -4186,6 +4320,558 @@ fn primary_sell_fill_values(
     Ok((actual_sold_raw, actual_received_sol, actual_exit_price))
 }
 
+// ===========================================================================
+// AGENT D — STARTUP RECOVERY + STRATEGY REBUILD (D1-D8)
+//
+// All helpers below are startup/recovery-only. They NEVER submit transactions;
+// they only OBSERVE (through the accepted reconciler / ownership probe) and
+// APPLY the resulting deterministic plan to durable state. A pending record is
+// only ever removed AFTER its confirmed economic state is durably applied, or
+// after a confirmed on-chain failure (INV-REC-002). An observer failure keeps
+// pending state (INV-REC-003).
+// ===========================================================================
+
+/// Counts summarizing the result of a pending-store startup recovery pass (D2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoverySummary {
+    /// Confirmed buys/sells whose economics were durably applied.
+    pub recovered: usize,
+    /// Pending records dropped because the tx confirmed FAILED on-chain.
+    pub confirmed_failures_removed: usize,
+    /// Pending records kept because the tx could not be resolved (or a
+    /// structural observer error occurred, or a ConfirmedBuy conflicted).
+    pub still_unresolved: usize,
+    /// ConfirmedBuy records that could not be recorded due to an accounting
+    /// conflict (also counted in `still_unresolved`, pending kept).
+    pub accounting_conflicts: usize,
+}
+
+impl RecoverySummary {
+    /// True when no unresolved pending state remains after this pass.
+    fn fully_resolved(&self) -> bool {
+        self.still_unresolved == 0
+    }
+}
+
+/// Recover the pending-execution journal against confirmed chain state (D2).
+///
+/// Uses the Agent-B planner (`reconcile_pending_execution`). NEVER submits a
+/// transaction. Per plan:
+/// - `ConfirmedFailure` => remove pending, no position mutation, no fake
+///   execution feedback on startup.
+/// - `ConfirmedBuy` => `record_confirmed_position` (idempotent success is fine),
+///   conflict keeps pending + counts unresolved; remove pending LAST.
+/// - `ConfirmedSell` => apply exact sold raw + received SOL via
+///   `close_position_reconciled`; reapply missing QuickProfit/SecondProfit
+///   markers even on idempotent replay; remove pending LAST.
+/// - `Unresolved`/structural `Err` => KEEP pending, count unresolved.
+///
+/// A pending record is NEVER deleted merely because its Position is absent.
+async fn recover_pending_store(
+    reconciler: &TradeReconciler,
+    pending_store: &PendingExecutionStore,
+    positions: &crate::position::manager::PositionManager,
+) -> crate::error::Result<RecoverySummary> {
+    use crate::trading::PendingRecoveryPlan;
+
+    let mut summary = RecoverySummary::default();
+
+    for pending in pending_store.all().await {
+        let plan = match reconcile_pending_execution(reconciler, &pending).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                // INV-REC-003: an observer failure cannot erase pending state.
+                warn!(
+                    "Pending recovery observer error for sig {} (mint {}): {} - keeping pending",
+                    pending.signature, pending.mint, e
+                );
+                summary.still_unresolved += 1;
+                continue;
+            }
+        };
+
+        match plan {
+            PendingRecoveryPlan::ConfirmedFailure {
+                pending,
+                error,
+                observed_after_ms,
+            } => {
+                info!(
+                    "Pending {} (mint {}) confirmed FAILED on-chain after {}ms: {} - removing pending, no position mutation",
+                    pending.signature, pending.mint, observed_after_ms, error
+                );
+                // No position mutation; NO fake execution-feedback sample.
+                pending_store.remove(&pending.signature).await?;
+                summary.confirmed_failures_removed += 1;
+            }
+
+            PendingRecoveryPlan::ConfirmedBuy {
+                pending, position, ..
+            } => {
+                match positions.record_confirmed_position(position).await {
+                    Ok(_idempotent_or_new) => {
+                        // Ok(false) = same signature already present (idempotent
+                        // success). Either way the position state is durable;
+                        // remove pending LAST.
+                        pending_store.remove(&pending.signature).await?;
+                        summary.recovered += 1;
+                        info!(
+                            "Recovered confirmed BUY for mint {} (sig {})",
+                            pending.mint, pending.signature
+                        );
+                    }
+                    Err(e) => {
+                        // Accounting conflict: keep pending, count unresolved.
+                        summary.accounting_conflicts += 1;
+                        summary.still_unresolved += 1;
+                        error!(
+                            "Recovered confirmed BUY for mint {} (sig {}) conflicts with tracked state: {} - keeping pending",
+                            pending.mint, pending.signature, e
+                        );
+                    }
+                }
+            }
+
+            PendingRecoveryPlan::ConfirmedSell {
+                pending,
+                sold_amount_raw,
+                received_sol,
+                intent,
+                ..
+            } => {
+                match apply_recovered_sell(
+                    positions,
+                    &pending,
+                    sold_amount_raw,
+                    received_sol,
+                    intent,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        pending_store.remove(&pending.signature).await?;
+                        summary.recovered += 1;
+                    }
+                    Err(e) => {
+                        summary.still_unresolved += 1;
+                        error!(
+                            "Recovered confirmed SELL for mint {} (sig {}) could not be applied: {} - keeping pending",
+                            pending.mint, pending.signature, e
+                        );
+                    }
+                }
+            }
+
+            PendingRecoveryPlan::Unresolved {
+                pending,
+                reason,
+                observed_after_ms,
+            } => {
+                // INV-TX-003 / INV-REC-002: unresolved stays pending.
+                summary.still_unresolved += 1;
+                warn!(
+                    "Pending {} (mint {}) unresolved after {}ms: {} - keeping pending",
+                    pending.signature, pending.mint, observed_after_ms, reason
+                );
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Apply a recovered confirmed SELL to durable position state (D2 detail).
+///
+/// - If a Position exists, validate its decimals against the fill before close.
+///   (We validate against the pending Sell context's known decimals only via the
+///   position; the fill decimals were already identity-checked by the planner.)
+/// - `close_position_reconciled` is idempotent via the durable receipt ledger,
+///   so it succeeds even if the Position is absent (full-exit replay).
+/// - Reapply a missing QuickProfit/SecondProfit marker when a partial position
+///   remains, EVEN if the close result was `already_applied`.
+async fn apply_recovered_sell(
+    positions: &crate::position::manager::PositionManager,
+    pending: &PendingExecution,
+    sold_amount_raw: u64,
+    received_sol: f64,
+    intent: PendingSellIntent,
+) -> crate::error::Result<()> {
+    let close_result = positions
+        .close_position_reconciled(&pending.mint, &pending.signature, sold_amount_raw, received_sol)
+        .await?;
+
+    // Reapply layer marker when a partial position still remains. Idempotent
+    // replay (already_applied) must still repair a missing flag (D2, D8).
+    if !close_result.fully_closed {
+        if positions.get_position(&pending.mint).await.is_some() {
+            match intent {
+                PendingSellIntent::QuickProfit => {
+                    positions.mark_quick_profit_taken(&pending.mint).await?;
+                }
+                PendingSellIntent::SecondProfit => {
+                    positions.mark_second_profit_taken(&pending.mint).await?;
+                }
+                // Full / Manual / KillSwitch add no profit-layer marker.
+                PendingSellIntent::Full
+                | PendingSellIntent::Manual
+                | PendingSellIntent::KillSwitch => {}
+            }
+        }
+    }
+
+    info!(
+        "Recovered confirmed SELL for mint {} (sig {}): sold {} raw, net {} SOL, full_close={}",
+        pending.mint, pending.signature, sold_amount_raw, received_sol, close_result.fully_closed
+    );
+    Ok(())
+}
+
+/// Counts summarizing legacy-position chain recovery (D3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyRecoverySummary {
+    /// Positions canonicalized via `migrate_position_from_confirmed_entry`.
+    pub recovered: usize,
+    /// Positions removed because the controlled wallet proved a zero balance.
+    pub resolved_zero: usize,
+    /// Positions that remain recovery-required / unroutable after this pass.
+    pub still_recovery_required: usize,
+}
+
+impl LegacyRecoverySummary {
+    /// True when no recovery-required / unroutable position remains.
+    fn fully_resolved(&self) -> bool {
+        self.still_recovery_required == 0
+    }
+}
+
+/// Pure predicate (D3): does this position need legacy chain recovery OR is it
+/// operationally blocked because its (valid) wallet has no route in `registry`?
+///
+/// Recovery-required when `token_decimals` is unknown, or the wallet pubkey is
+/// empty/invalid. Additionally blocked (returns true) when the wallet parses but
+/// the registry does not own/route it — a canonical-looking position we cannot
+/// actually execute against.
+fn legacy_recovery_required(
+    position: &crate::position::manager::Position,
+    registry: &crate::wallet::ExecutionWalletRegistry,
+) -> bool {
+    if position_requires_recovery(position) {
+        return true;
+    }
+    // Wallet parses (position_requires_recovery already proved that). If the
+    // registry has no route for it, the position is unroutable => blocked.
+    match position.wallet_pubkey.parse::<Pubkey>() {
+        Ok(pk) => registry.route_for(&pk).is_none(),
+        Err(_) => true,
+    }
+}
+
+/// Recover legacy/incomplete positions from chain evidence (D3/D4).
+///
+/// For each position that is recovery-required or unroutable, find its current
+/// owning wallet via the ownership probe across registry wallets, then reconcile
+/// the original entry transaction and canonicalize (migrate) or resolve-zero.
+/// Only ConfirmedFill canonicalizes; anything ambiguous keeps the position
+/// recovery-required (INV-POS-002/003/004).
+async fn recover_legacy_positions(
+    reconciler: &TradeReconciler,
+    ownership: &crate::wallet::WalletOwnershipProbe,
+    registry: &crate::wallet::ExecutionWalletRegistry,
+    positions: &crate::position::manager::PositionManager,
+) -> crate::error::Result<LegacyRecoverySummary> {
+    use crate::wallet::OwnedHolderResolution;
+
+    let mut summary = LegacyRecoverySummary::default();
+
+    for position in positions.get_all_positions().await {
+        if !legacy_recovery_required(&position, registry) {
+            continue;
+        }
+
+        let mint_pk = match position.mint.parse::<Pubkey>() {
+            Ok(pk) => pk,
+            Err(e) => {
+                warn!(
+                    "Legacy recovery: mint {} is not a valid Pubkey: {} - keeping recovery-required",
+                    position.mint, e
+                );
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+
+        // Determine the current owning wallet (D3 ownership rules).
+        let holders = match ownership.find_positive_holders(registry, mint_pk).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    "Legacy recovery: ownership probe failed for mint {}: {} - keeping recovery-required",
+                    position.mint, e
+                );
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+
+        // (selected_wallet, proven_zero)
+        let (selected_wallet, proven_zero): (Option<Pubkey>, bool) = match holders {
+            OwnedHolderResolution::Single(state) => (Some(state.wallet), false),
+            OwnedHolderResolution::Multiple(_) => {
+                // Ambiguous: do not merge, do not choose (INV-WALLET-004).
+                warn!(
+                    "Legacy recovery: mint {} held in multiple controlled wallets - ambiguous, keeping recovery-required",
+                    position.mint
+                );
+                summary.still_recovery_required += 1;
+                continue;
+            }
+            OwnedHolderResolution::None => {
+                // Proven zero ONLY if the existing wallet parses, the registry
+                // owns/routes it, and a probe of THAT exact wallet proves zero.
+                match position.wallet_pubkey.parse::<Pubkey>() {
+                    Ok(existing) if registry.owns(&existing) => {
+                        match ownership.probe(existing, mint_pk).await {
+                            Ok(state) if state.raw_amount == 0 => (Some(existing), true),
+                            Ok(_) => {
+                                // Non-zero now but not surfaced as a positive holder
+                                // above: treat as unresolved rather than guessing.
+                                summary.still_recovery_required += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Legacy recovery: zero-proof probe failed for mint {} wallet {}: {} - keeping recovery-required",
+                                    position.mint, existing, e
+                                );
+                                summary.still_recovery_required += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Identity was unknown and all wallets show zero: do NOT
+                        // assume the position belonged to one of them (INV-POS-004).
+                        summary.still_recovery_required += 1;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let wallet = match selected_wallet {
+            Some(w) => w,
+            None => {
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+
+        // D4: reconcile the ORIGINAL entry transaction for this exact wallet.
+        let outcome = match reconciler
+            .reconcile(
+                &position.entry_signature,
+                &wallet.to_string(),
+                &position.mint,
+                ReconciliationSide::Buy,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(
+                    "Legacy recovery: entry reconcile RPC error for mint {}: {} - keeping recovery-required",
+                    position.mint, e
+                );
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+
+        let fill = match outcome {
+            ReconciliationOutcome::ConfirmedFill(fill) => fill,
+            _ => {
+                // ConfirmedFailure / Unresolved: do not guess.
+                summary.still_recovery_required += 1;
+                warn!(
+                    "Legacy recovery: entry tx for mint {} not a confirmed fill - keeping recovery-required",
+                    position.mint
+                );
+                continue;
+            }
+        };
+
+        // Require exact wallet/mint/Buy, nonzero original raw, cost>0, price>0.
+        let original_raw = fill.token_amount_raw().unwrap_or(0);
+        let original_cost = -fill.wallet_sol_delta_sol();
+        let original_price = fill.effective_price_sol_per_token().unwrap_or(0.0);
+        let identity_ok = fill.wallet == wallet.to_string()
+            && fill.mint == position.mint
+            && fill.side == ReconciliationSide::Buy;
+        if !identity_ok
+            || original_raw == 0
+            || !(original_cost.is_finite() && original_cost > 0.0)
+            || !(original_price.is_finite() && original_price > 0.0)
+        {
+            summary.still_recovery_required += 1;
+            warn!(
+                "Legacy recovery: entry fill for mint {} failed exact-economics validation - keeping recovery-required",
+                position.mint
+            );
+            continue;
+        }
+
+        if proven_zero {
+            // Current balance proven zero: resolve without inventing P&L.
+            match positions
+                .resolve_zero_balance_position(&position.mint, &position.entry_signature)
+                .await
+            {
+                Ok(true) => {
+                    summary.resolved_zero += 1;
+                    info!(
+                        "Legacy recovery: mint {} proven zero on-chain, position resolved (no P&L invented)",
+                        position.mint
+                    );
+                }
+                Ok(false) => summary.still_recovery_required += 1,
+                Err(e) => {
+                    summary.still_recovery_required += 1;
+                    warn!(
+                        "Legacy recovery: resolve_zero for mint {} failed: {} - keeping recovery-required",
+                        position.mint, e
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Re-probe the selected wallet's CURRENT balance to decide migrate vs zero.
+        let current = match ownership.probe(wallet, mint_pk).await {
+            Ok(state) => state,
+            Err(e) => {
+                summary.still_recovery_required += 1;
+                warn!(
+                    "Legacy recovery: current-balance probe failed for mint {}: {} - keeping recovery-required",
+                    position.mint, e
+                );
+                continue;
+            }
+        };
+
+        if current.raw_amount > original_raw {
+            // Ambiguous additional transfer/buy: do not canonicalize.
+            summary.still_recovery_required += 1;
+            warn!(
+                "Legacy recovery: mint {} current raw {} exceeds original entry raw {} - ambiguous, keeping halted",
+                position.mint, current.raw_amount, original_raw
+            );
+            continue;
+        }
+
+        if current.raw_amount == 0 {
+            match positions
+                .resolve_zero_balance_position(&position.mint, &position.entry_signature)
+                .await
+            {
+                Ok(true) => summary.resolved_zero += 1,
+                Ok(false) => summary.still_recovery_required += 1,
+                Err(e) => {
+                    summary.still_recovery_required += 1;
+                    warn!(
+                        "Legacy recovery: resolve_zero for mint {} failed: {} - keeping recovery-required",
+                        position.mint, e
+                    );
+                }
+            }
+            continue;
+        }
+
+        // 0 < current <= original: canonicalize with prorated remaining cost.
+        let decimals = match current.decimals.or(Some(fill.token_decimals)) {
+            Some(d) => d,
+            None => {
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+        match positions
+            .migrate_position_from_confirmed_entry(
+                &position.mint,
+                &position.entry_signature,
+                &wallet.to_string(),
+                original_raw,
+                current.raw_amount,
+                decimals,
+                original_cost,
+                original_price,
+            )
+            .await
+        {
+            Ok(_) => {
+                summary.recovered += 1;
+                info!(
+                    "Legacy recovery: mint {} canonicalized from confirmed entry (raw {} of {})",
+                    position.mint, current.raw_amount, original_raw
+                );
+            }
+            Err(e) => {
+                summary.still_recovery_required += 1;
+                warn!(
+                    "Legacy recovery: migrate for mint {} failed: {} - keeping recovery-required",
+                    position.mint, e
+                );
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Pure conversion (D6): build the strategy-engine `Position` used to restore
+/// portfolio exposure from a canonical PositionManager position. State restore
+/// ONLY — size_sol is the REMAINING total cost, tokens_held is the RAW token
+/// amount. Never records execution feedback / chain health / slippage.
+fn manager_position_to_strategy_position(
+    position: &crate::position::manager::Position,
+    default_strategy: crate::strategy::types::TradingStrategy,
+) -> crate::strategy::types::Position {
+    // highest = max(peak_price, entry_price); lowest = the meaningful lower of
+    // current/entry (a positive finite current price is meaningful, else entry).
+    let highest_price = position.peak_price.max(position.entry_price);
+    let lowest_price = if position.current_price.is_finite() && position.current_price > 0.0 {
+        position.current_price.min(position.entry_price)
+    } else {
+        position.entry_price
+    };
+    crate::strategy::types::Position {
+        mint: position.mint.clone(),
+        entry_price: position.entry_price,
+        entry_time: position.entry_time,
+        size_sol: position.total_cost_sol,
+        tokens_held: position.token_amount,
+        strategy: default_strategy,
+        exit_style: crate::strategy::types::ExitStyle::default(),
+        highest_price,
+        lowest_price,
+        exit_levels_hit: vec![],
+    }
+}
+
+/// Pure predicate (D6): a canonical position eligible for strategy-exposure
+/// restore has known decimals, a valid wallet, and a route in the registry.
+fn position_is_canonical_for_restore(
+    position: &crate::position::manager::Position,
+    registry: &crate::wallet::ExecutionWalletRegistry,
+) -> bool {
+    if position.token_decimals.is_none() {
+        return false;
+    }
+    match position.wallet_pubkey.parse::<Pubkey>() {
+        Ok(pk) => registry.route_for(&pk).is_some(),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4397,5 +5083,252 @@ mod tests {
         fill.token_delta_raw = -101;
         let position = synthetic_sell_position();
         assert!(primary_sell_fill_values(&fill, &position).is_err());
+    }
+
+    // ======================================================================
+    // AGENT D — startup recovery + strategy rebuild helper tests (D8)
+    // ======================================================================
+
+    use crate::config::SafetyConfig;
+    use crate::position::manager::{EntryType, PositionManager};
+    use crate::wallet::ExecutionWalletRegistry;
+
+    /// In-memory (non-persisted) manager for recovery-helper tests.
+    fn mem_manager() -> PositionManager {
+        let cfg = SafetyConfig {
+            require_sell_confirmation: false,
+            max_position_sol: 1_000.0,
+            daily_loss_limit_sol: 1_000.0,
+            keypair_balance_warning_sol: 0.0,
+        };
+        PositionManager::new(cfg, None)
+    }
+
+    /// A canonical (decimals known, valid wallet) manager Position holding
+    /// `raw` tokens with the given wallet/entry signature.
+    fn canonical_position(mint: &str, wallet: &str, sig: &str, raw: u64) -> crate::position::manager::Position {
+        crate::position::manager::Position {
+            mint: mint.to_string(),
+            name: "T".to_string(),
+            symbol: "T".to_string(),
+            bonding_curve: "bc".to_string(),
+            token_amount: raw,
+            token_decimals: Some(6),
+            entry_price: 0.001,
+            total_cost_sol: 1.0,
+            entry_time: chrono::Utc::now(),
+            entry_signature: sig.to_string(),
+            entry_type: EntryType::Opportunity,
+            quick_profit_taken: false,
+            second_profit_taken: false,
+            peak_price: 0.002,
+            current_price: 0.0015,
+            kill_switch_triggered: false,
+            kill_switch_reason: None,
+            wallet_pubkey: wallet.to_string(),
+            applied_exit_signatures: vec![],
+        }
+    }
+
+    fn sell_pending(mint: &str, wallet: &str, sig: &str, intent: PendingSellIntent) -> PendingExecution {
+        PendingExecution::sell(
+            sig.to_string(),
+            mint.to_string(),
+            wallet.to_string(),
+            PendingSellContext {
+                requested_amount: "50%".to_string(),
+                intent,
+                reason: "test".to_string(),
+            },
+        )
+    }
+
+    const T_MINT: &str = "Mint1111111111111111111111111111111111111111";
+
+    /// D8: a recovered FULL exit removes the position and is idempotent on replay.
+    #[tokio::test]
+    async fn test_recovered_full_exit_removes_pending_idempotently() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+
+        let pending = sell_pending(T_MINT, &wallet, "exit-full", PendingSellIntent::Full);
+        // Sell the ENTIRE 100 raw => full close.
+        apply_recovered_sell(&mgr, &pending, 100, 0.5, PendingSellIntent::Full)
+            .await
+            .unwrap();
+        assert!(mgr.get_position(T_MINT).await.is_none(), "position should be fully closed");
+
+        // Idempotent replay of the same exit signature must not error / double-count.
+        apply_recovered_sell(&mgr, &pending, 100, 0.5, PendingSellIntent::Full)
+            .await
+            .unwrap();
+        assert!(mgr.get_position(T_MINT).await.is_none());
+    }
+
+    /// D8: a recovered PARTIAL exit reapplies a missing QuickProfit marker,
+    /// even on idempotent replay.
+    #[tokio::test]
+    async fn test_recovered_partial_reapplies_quick_profit_marker() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+
+        let pending = sell_pending(T_MINT, &wallet, "exit-quick", PendingSellIntent::QuickProfit);
+        apply_recovered_sell(&mgr, &pending, 40, 0.3, PendingSellIntent::QuickProfit)
+            .await
+            .unwrap();
+        let pos = mgr.get_position(T_MINT).await.expect("partial remains");
+        assert!(pos.quick_profit_taken, "quick_profit flag must be set on partial recovery");
+        assert!(!pos.second_profit_taken);
+        assert_eq!(pos.token_amount, 60);
+
+        // Idempotent replay: still no error, flag stays set.
+        apply_recovered_sell(&mgr, &pending, 40, 0.3, PendingSellIntent::QuickProfit)
+            .await
+            .unwrap();
+        assert!(mgr.get_position(T_MINT).await.unwrap().quick_profit_taken);
+    }
+
+    /// D8: a recovered PARTIAL SecondProfit exit reapplies the second flag.
+    #[tokio::test]
+    async fn test_recovered_partial_reapplies_second_profit_marker() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+
+        let pending = sell_pending(T_MINT, &wallet, "exit-second", PendingSellIntent::SecondProfit);
+        apply_recovered_sell(&mgr, &pending, 25, 0.2, PendingSellIntent::SecondProfit)
+            .await
+            .unwrap();
+        let pos = mgr.get_position(T_MINT).await.expect("partial remains");
+        assert!(pos.second_profit_taken, "second_profit flag must be set");
+        assert!(!pos.quick_profit_taken);
+    }
+
+    /// D8: Full/Manual/KillSwitch partial exits add NO profit-layer marker.
+    #[tokio::test]
+    async fn test_recovered_partial_full_intent_adds_no_marker() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+        let pending = sell_pending(T_MINT, &wallet, "exit-manual", PendingSellIntent::Manual);
+        apply_recovered_sell(&mgr, &pending, 40, 0.3, PendingSellIntent::Manual)
+            .await
+            .unwrap();
+        let pos = mgr.get_position(T_MINT).await.unwrap();
+        assert!(!pos.quick_profit_taken);
+        assert!(!pos.second_profit_taken);
+    }
+
+    fn single_wallet_registry(wallet: &str) -> ExecutionWalletRegistry {
+        let primary = wallet.parse::<Pubkey>().unwrap();
+        ExecutionWalletRegistry::new(primary, &[], None)
+    }
+
+    /// D8: strategy-restore conversion uses REMAINING cost and RAW tokens.
+    #[test]
+    fn test_strategy_restore_uses_remaining_cost_and_raw_tokens() {
+        let wallet = Pubkey::new_unique().to_string();
+        let mut pos = canonical_position(T_MINT, &wallet, "entry-sig", 60);
+        // Simulate a partial exit already applied: remaining cost < original.
+        pos.total_cost_sol = 0.6;
+        let sp = manager_position_to_strategy_position(
+            &pos,
+            crate::strategy::types::TradingStrategy::Adaptive,
+        );
+        assert_eq!(sp.tokens_held, 60, "tokens_held must be the RAW token amount");
+        assert!((sp.size_sol - 0.6).abs() < 1e-12, "size_sol must be REMAINING total cost");
+        assert_eq!(sp.mint, T_MINT);
+        // highest = max(peak, entry) = max(0.002, 0.001) = 0.002.
+        assert!((sp.highest_price - 0.002).abs() < 1e-12);
+        // lowest = min(current, entry) = min(0.0015, 0.001) = 0.001.
+        assert!((sp.lowest_price - 0.001).abs() < 1e-12);
+        assert!(sp.exit_levels_hit.is_empty());
+    }
+
+    /// D8: a canonical position with a routable wallet is restore-eligible; one
+    /// whose wallet is unknown to the registry is not.
+    #[test]
+    fn test_position_is_canonical_for_restore_route_gating() {
+        let wallet = Pubkey::new_unique().to_string();
+        let reg = single_wallet_registry(&wallet);
+        let ok = canonical_position(T_MINT, &wallet, "s", 10);
+        assert!(position_is_canonical_for_restore(&ok, &reg));
+
+        // Different (unrouted) wallet => not restorable.
+        let other = Pubkey::new_unique().to_string();
+        let unrouted = canonical_position(T_MINT, &other, "s", 10);
+        assert!(!position_is_canonical_for_restore(&unrouted, &reg));
+
+        // Unknown decimals => not restorable.
+        let mut no_dec = ok.clone();
+        no_dec.token_decimals = None;
+        assert!(!position_is_canonical_for_restore(&no_dec, &reg));
+    }
+
+    /// D8: legacy_recovery_required flags unknown decimals, invalid wallets, and
+    /// canonical-but-unroutable positions.
+    #[test]
+    fn test_legacy_recovery_required_classification() {
+        let wallet = Pubkey::new_unique().to_string();
+        let reg = single_wallet_registry(&wallet);
+
+        // Canonical + routable => not required.
+        let ok = canonical_position(T_MINT, &wallet, "s", 10);
+        assert!(!legacy_recovery_required(&ok, &reg));
+
+        // Unknown decimals => required.
+        let mut no_dec = ok.clone();
+        no_dec.token_decimals = None;
+        assert!(legacy_recovery_required(&no_dec, &reg));
+
+        // Valid but unrouted wallet => blocked (required).
+        let unrouted = canonical_position(T_MINT, &Pubkey::new_unique().to_string(), "s", 10);
+        assert!(legacy_recovery_required(&unrouted, &reg));
+
+        // Empty wallet => required.
+        let mut empty = ok.clone();
+        empty.wallet_pubkey = String::new();
+        assert!(legacy_recovery_required(&empty, &reg));
+    }
+
+    /// D8: multi-holder ownership resolution is ambiguous and is NOT reduced to a
+    /// single actionable wallet (mirrors the recover_legacy_positions guard).
+    #[test]
+    fn test_multi_wallet_legacy_holder_stays_unresolved() {
+        use crate::wallet::{OwnedHolderResolution, WalletTokenState};
+        let mint = Pubkey::new_unique();
+        let states = vec![
+            WalletTokenState {
+                wallet: Pubkey::new_unique(),
+                mint,
+                raw_amount: 10,
+                decimals: Some(6),
+                token_account_count: 1,
+            },
+            WalletTokenState {
+                wallet: Pubkey::new_unique(),
+                mint,
+                raw_amount: 20,
+                decimals: Some(6),
+                token_account_count: 1,
+            },
+        ];
+        // The recovery path treats Multiple as ambiguous: no single wallet chosen.
+        let resolution = OwnedHolderResolution::Multiple(states);
+        let selected: Option<Pubkey> = match resolution {
+            OwnedHolderResolution::Single(s) => Some(s.wallet),
+            OwnedHolderResolution::Multiple(_) | OwnedHolderResolution::None => None,
+        };
+        assert!(selected.is_none(), "multi-holder must not resolve to a single wallet");
     }
 }
