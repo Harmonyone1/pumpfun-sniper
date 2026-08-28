@@ -540,6 +540,14 @@ impl StrategyEngine {
         portfolio.record_partial_exit(mint, remaining_size_sol, remaining_tokens, realized_pnl_sol)
     }
 
+    /// Restore the current day's realized P&L into the portfolio governor on
+    /// startup recovery, so a pre-crash daily loss re-arms the daily-loss gate.
+    /// Delegates to the governor; returns false on a non-finite input.
+    pub async fn restore_daily_realized_pnl(&mut self, pnl_sol: f64) -> bool {
+        let mut portfolio = self.portfolio_risk.write().await;
+        portfolio.restore_daily_realized_pnl(pnl_sol)
+    }
+
     /// Record a failed transaction
     pub async fn record_tx_failure(
         &mut self,

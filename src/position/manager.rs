@@ -114,7 +114,7 @@ impl EntryType {
 }
 
 /// A single position in a token
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     /// Token mint address
     pub mint: String,
@@ -293,13 +293,23 @@ pub struct AppliedExitReceipt {
     pub remaining_cost_sol: f64,
 }
 
-/// Versioned on-disk snapshot: positions plus the applied-exit receipt ledger.
+/// Canonical version written by the current code. Bumped to 2 when DailyStats
+/// was added to the snapshot. A snapshot with a HIGHER version than this is from
+/// a newer binary whose semantics we cannot safely interpret => fail closed.
+const CURRENT_SNAPSHOT_VERSION: u32 = 2;
+
+/// Versioned on-disk snapshot: positions plus the applied-exit receipt ledger
+/// plus the day's realized trading statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PositionStoreSnapshot {
     version: u32,
     positions: HashMap<String, Position>,
     #[serde(default)]
     applied_exit_receipts: HashMap<String, AppliedExitReceipt>,
+    /// Present in version >= 2. Absent (None) for version-1 snapshots and legacy
+    /// bare-HashMap files.
+    #[serde(default)]
+    daily_stats: Option<DailyStats>,
 }
 
 /// Backward-compatible on-disk representation. New snapshots are the tagged
@@ -393,76 +403,233 @@ impl PositionManager {
         Ok(())
     }
 
-    /// Load positions (and the applied-exit receipt ledger) from disk.
+    /// Staging path for the interrupted-write temp: `<persistence_path>.tmp`.
+    fn tmp_path(path: &str) -> String {
+        format!("{}.tmp", path)
+    }
+
+    /// Decode + validate a snapshot blob into (positions, receipts, daily_stats).
+    /// Fail-closed on invalid JSON, a violated receipt invariant, or a snapshot
+    /// version newer than this binary can interpret.
+    fn decode_and_validate(
+        path: &str,
+        data: &str,
+    ) -> Result<(
+        HashMap<String, Position>,
+        HashMap<String, AppliedExitReceipt>,
+        Option<DailyStats>,
+    )> {
+        let on_disk: PositionStoreOnDisk = serde_json::from_str(data)
+            .map_err(|e| Error::PositionPersistence(format!("{}: {}", path, e)))?;
+
+        let (positions, receipts, daily_stats) = match on_disk {
+            PositionStoreOnDisk::Snapshot(snap) => {
+                // Version gating. Legacy bare HashMap has no version and is
+                // handled by the Legacy arm. A tagged snapshot with a version
+                // GREATER than the current canonical version is from a newer
+                // binary: fail closed rather than silently misinterpret.
+                if snap.version > CURRENT_SNAPSHOT_VERSION {
+                    return Err(Error::PositionPersistence(format!(
+                        "{}: snapshot version {} is newer than supported version {}",
+                        path, snap.version, CURRENT_SNAPSHOT_VERSION
+                    )));
+                }
+                // version 1 => daily_stats absent (None); version 2 => may carry it.
+                (snap.positions, snap.applied_exit_receipts, snap.daily_stats)
+            }
+            PositionStoreOnDisk::Legacy(positions) => (positions, HashMap::new(), None),
+        };
+
+        // Validate receipt ledger before committing to in-memory state.
+        for (key, receipt) in &receipts {
+            Self::validate_receipt(key, receipt)?;
+        }
+
+        Ok((positions, receipts, daily_stats))
+    }
+
+    /// Windows-safe atomic promote of `from` onto `to`. `std::fs::rename` cannot
+    /// replace an existing destination on Windows, so on direct-rename failure we
+    /// remove the destination and retry. The source is never dropped before a
+    /// successful rename, so no candidate snapshot is silently discarded.
+    fn promote(from: &str, to: &str) -> Result<()> {
+        if std::fs::rename(from, to).is_ok() {
+            return Ok(());
+        }
+        if Path::new(to).exists() {
+            std::fs::remove_file(to).map_err(|e| {
+                Error::PositionPersistence(format!(
+                    "failed to clear destination '{}' before promoting '{}': {}",
+                    to, from, e
+                ))
+            })?;
+        }
+        std::fs::rename(from, to).map_err(|e| {
+            Error::PositionPersistence(format!(
+                "failed to promote '{}' to '{}': {}",
+                from, to, e
+            ))
+        })
+    }
+
+    /// Load positions, the applied-exit receipt ledger, and daily stats from disk.
+    ///
+    /// Interrupted-write recovery: a leftover `<path>.tmp` is NEVER silently
+    /// ignored. A valid temp means a prior save crashed between "durable temp
+    /// written" and "renamed into place"; its contents are at least as fresh as
+    /// the main file, so it is recovered and promoted. A malformed temp fails
+    /// closed rather than falling back to (possibly stale) main state.
     pub async fn load(&self) -> Result<()> {
-        if let Some(path) = &self.persistence_path {
-            if Path::new(path).exists() {
-                let data = tokio::fs::read_to_string(path)
-                    .await
-                    .map_err(|e| Error::PositionPersistence(e.to_string()))?;
+        let path = match &self.persistence_path {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+        let tmp_path = Self::tmp_path(&path);
 
-                let on_disk: PositionStoreOnDisk = serde_json::from_str(&data)
-                    .map_err(|e| Error::PositionPersistence(e.to_string()))?;
+        // Resolve which blob to load from, handling a leftover temp first.
+        let (positions, receipts, daily_stats) = if Path::new(&tmp_path).exists() {
+            let tmp_data = tokio::fs::read_to_string(&tmp_path).await.map_err(|e| {
+                Error::PositionPersistence(format!(
+                    "failed to read interrupted-write temp '{}': {}",
+                    tmp_path, e
+                ))
+            })?;
 
-                let (positions, receipts) = match on_disk {
-                    PositionStoreOnDisk::Snapshot(snap) => {
-                        (snap.positions, snap.applied_exit_receipts)
-                    }
-                    PositionStoreOnDisk::Legacy(positions) => (positions, HashMap::new()),
-                };
+            // Fail closed if the temp is malformed — do not fall back to main.
+            let decoded = Self::decode_and_validate(&tmp_path, &tmp_data)?;
 
-                // Validate receipt ledger before committing to in-memory state.
-                for (key, receipt) in &receipts {
-                    Self::validate_receipt(key, receipt)?;
-                }
+            // Temp is complete + valid: promote it into place.
+            Self::promote(&tmp_path, &path)?;
+            decoded
+        } else if Path::new(&path).exists() {
+            let data = tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|e| Error::PositionPersistence(e.to_string()))?;
+            Self::decode_and_validate(&path, &data)?
+        } else {
+            // Nothing on disk: leave in-memory defaults untouched.
+            return Ok(());
+        };
 
-                let positions_len = positions.len();
-                let receipts_len = receipts.len();
+        let positions_len = positions.len();
+        let receipts_len = receipts.len();
 
-                {
-                    let mut guard = self.positions.write().await;
-                    *guard = positions;
-                }
-                {
-                    let mut guard = self.applied_exit_receipts.write().await;
-                    *guard = receipts;
-                }
+        {
+            let mut guard = self.positions.write().await;
+            *guard = positions;
+        }
+        {
+            let mut guard = self.applied_exit_receipts.write().await;
+            *guard = receipts;
+        }
 
-                info!(
-                    "Loaded {} positions and {} applied-exit receipts from {}",
-                    positions_len, receipts_len, path
-                );
+        // Restore daily stats only if they belong to the current UTC day;
+        // otherwise start a fresh day so a stale loss/pnl gate is not resurrected.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        match daily_stats {
+            Some(ds) if ds.date == today => {
+                let mut guard = self.daily_stats.write().await;
+                *guard = ds;
+                info!("Restored daily stats for {}", today);
+            }
+            _ => {
+                let mut guard = self.daily_stats.write().await;
+                *guard = DailyStats::new();
             }
         }
+
+        info!(
+            "Loaded {} positions and {} applied-exit receipts from {}",
+            positions_len, receipts_len, path
+        );
         Ok(())
     }
 
-    /// Save positions and the receipt ledger to disk as a versioned snapshot.
+    /// Save positions, the receipt ledger, and daily stats as a versioned
+    /// snapshot, crash-safe.
+    ///
+    /// A consistent snapshot is cloned under read locks, then the locks are
+    /// RELEASED before any I/O. The snapshot is serialized, the parent directory
+    /// ensured, then written to `<path>.tmp`, flushed and fsync'd so a complete
+    /// durable blob exists, and only then promoted onto the real path. A crash
+    /// before the promote leaves a valid temp that `load` recovers; a crash
+    /// mid-write only ever corrupts the temp, never the live snapshot.
     pub async fn save(&self) -> Result<()> {
-        if let Some(path) = &self.persistence_path {
+        let path = match &self.persistence_path {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+
+        // Clone a consistent snapshot under read locks, then release the locks
+        // BEFORE doing any I/O.
+        let snapshot = {
             let positions = self.positions.read().await;
             let receipts = self.applied_exit_receipts.read().await;
-
-            let snapshot = PositionStoreSnapshot {
-                version: 1,
+            let daily_stats = self.daily_stats.read().await;
+            PositionStoreSnapshot {
+                version: CURRENT_SNAPSHOT_VERSION,
                 positions: positions.clone(),
                 applied_exit_receipts: receipts.clone(),
-            };
+                daily_stats: Some(daily_stats.clone()),
+            }
+        };
 
-            let data = serde_json::to_string_pretty(&snapshot)
-                .map_err(|e| Error::PositionPersistence(e.to_string()))?;
+        let position_count = snapshot.positions.len();
+        let receipt_count = snapshot.applied_exit_receipts.len();
 
-            tokio::fs::write(path, data)
-                .await
-                .map_err(|e| Error::PositionPersistence(e.to_string()))?;
+        let data = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| Error::PositionPersistence(e.to_string()))?;
 
-            debug!(
-                "Saved {} positions and {} receipts to {}",
-                positions.len(),
-                receipts.len(),
-                path
-            );
+        // Ensure the parent directory exists.
+        if let Some(parent) = Path::new(&path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    Error::PositionPersistence(format!(
+                        "failed to create parent dir '{}' for position store: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
         }
+
+        let tmp_path = Self::tmp_path(&path);
+
+        // Write + flush + fsync the temp so it is fully durable before promotion.
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+                Error::PositionPersistence(format!(
+                    "failed to create temp '{}' for position store: {}",
+                    tmp_path, e
+                ))
+            })?;
+            file.write_all(data.as_bytes()).await.map_err(|e| {
+                Error::PositionPersistence(format!(
+                    "failed to write temp '{}' for position store: {}",
+                    tmp_path, e
+                ))
+            })?;
+            file.flush().await.map_err(|e| {
+                Error::PositionPersistence(format!(
+                    "failed to flush temp '{}' for position store: {}",
+                    tmp_path, e
+                ))
+            })?;
+            file.sync_all().await.map_err(|e| {
+                Error::PositionPersistence(format!(
+                    "failed to fsync temp '{}' for position store: {}",
+                    tmp_path, e
+                ))
+            })?;
+        }
+
+        Self::promote(&tmp_path, &path)?;
+
+        debug!(
+            "Saved {} positions and {} receipts to {}",
+            position_count, receipt_count, path
+        );
         Ok(())
     }
 
@@ -777,6 +944,150 @@ impl PositionManager {
             self.save().await?;
         }
         Ok(())
+    }
+
+    /// Startup chain-recovery: reconcile an existing tracked position against the
+    /// confirmed on-chain entry and the CURRENT wallet balance. Used only when
+    /// recovering after a crash where some of the entry fill may already have been
+    /// sold off-book. Does NOT record a DailyStats trade — no realized P&L event
+    /// occurred here, only a re-basing of the tracked position to reality.
+    ///
+    /// `original_entry_raw` is the confirmed entry fill in RAW token units;
+    /// `current_wallet_raw` is what the wallet holds NOW (<= the original fill).
+    /// The remaining cost basis is prorated by `current_wallet_raw /
+    /// original_entry_raw`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn migrate_position_from_confirmed_entry(
+        &self,
+        mint: &str,
+        entry_signature: &str,
+        wallet: &str,
+        original_entry_raw: u64,
+        current_wallet_raw: u64,
+        token_decimals: u8,
+        original_entry_cost_sol: f64,
+        original_entry_price: f64,
+    ) -> Result<Position> {
+        if wallet.is_empty() {
+            return Err(Error::PositionAccounting("wallet is empty".to_string()));
+        }
+        if original_entry_raw == 0 {
+            return Err(Error::PositionAccounting(
+                "original_entry_raw must be > 0".to_string(),
+            ));
+        }
+        if current_wallet_raw == 0 {
+            return Err(Error::PositionAccounting(
+                "current_wallet_raw must be > 0".to_string(),
+            ));
+        }
+        if current_wallet_raw > original_entry_raw {
+            return Err(Error::PositionAccounting(format!(
+                "current_wallet_raw {} exceeds original_entry_raw {} for {}",
+                current_wallet_raw, original_entry_raw, mint
+            )));
+        }
+        if !original_entry_cost_sol.is_finite() || original_entry_cost_sol <= 0.0 {
+            return Err(Error::PositionAccounting(
+                "original_entry_cost_sol must be finite and > 0".to_string(),
+            ));
+        }
+        if !original_entry_price.is_finite() || original_entry_price <= 0.0 {
+            return Err(Error::PositionAccounting(
+                "original_entry_price must be finite and > 0".to_string(),
+            ));
+        }
+
+        let updated = {
+            let mut positions = self.positions.write().await;
+            let position = positions
+                .get_mut(mint)
+                .ok_or_else(|| Error::PositionNotFound(mint.to_string()))?;
+
+            if position.entry_signature != entry_signature {
+                return Err(Error::PositionAccounting(format!(
+                    "entry_signature mismatch for {}: tracked {} != param {}",
+                    mint, position.entry_signature, entry_signature
+                )));
+            }
+
+            let remaining_ratio = current_wallet_raw as f64 / original_entry_raw as f64;
+            let remaining_cost = original_entry_cost_sol * remaining_ratio;
+
+            // Re-base to confirmed reality. RAW token units with known decimals.
+            position.token_amount = current_wallet_raw;
+            position.token_decimals = Some(token_decimals);
+            position.wallet_pubkey = wallet.to_string();
+            position.entry_price = original_entry_price;
+            position.total_cost_sol = remaining_cost;
+
+            // current_price / peak_price: keep existing finite positive value,
+            // otherwise seed from the confirmed entry price.
+            if !(position.current_price.is_finite() && position.current_price > 0.0) {
+                position.current_price = original_entry_price;
+            }
+            if !(position.peak_price.is_finite() && position.peak_price > 0.0) {
+                position.peak_price = original_entry_price;
+            }
+
+            // entry_time: preserve unless clearly invalid (default/epoch sentinel).
+            if position.entry_time == chrono::DateTime::<chrono::Utc>::default() {
+                position.entry_time = chrono::Utc::now();
+            }
+
+            // name/symbol/bonding_curve/entry_type/profit flags/kill-switch state/
+            // applied_exit_signatures are all preserved untouched.
+            position.clone()
+        };
+
+        info!(
+            "Migrated position {} from confirmed entry {} (raw {} of {}, cost {:.10} SOL)",
+            mint, entry_signature, current_wallet_raw, original_entry_raw, updated.total_cost_sol
+        );
+
+        self.save().await?;
+        Ok(updated)
+    }
+
+    /// Startup chain-recovery: resolve a tracked position whose on-chain balance
+    /// is now zero (the tokens are gone — sold off-book before crash, dust-burned,
+    /// etc.). Removes the tracked position WITHOUT recording P&L and WITHOUT
+    /// touching the DailyStats trade count, because the realized economics of the
+    /// missing tokens are unknown and must NOT be invented.
+    ///
+    /// Does NOT query RPC. Returns `Ok(true)` if a matching position was removed,
+    /// `Ok(false)` if no position exists for `mint`. An existing position with a
+    /// mismatched `entry_signature` is an accounting conflict => `Err`.
+    pub async fn resolve_zero_balance_position(
+        &self,
+        mint: &str,
+        entry_signature: &str,
+    ) -> Result<bool> {
+        {
+            let mut positions = self.positions.write().await;
+            match positions.get(mint) {
+                None => return Ok(false),
+                Some(existing) => {
+                    if existing.entry_signature != entry_signature {
+                        return Err(Error::PositionAccounting(format!(
+                            "entry_signature mismatch for {}: tracked {} != param {}",
+                            mint, existing.entry_signature, entry_signature
+                        )));
+                    }
+                }
+            }
+            positions.remove(mint);
+        }
+
+        tracing::warn!(
+            "Resolved zero-balance position {} (entry {}): removed WITHOUT recording P&L. \
+             Historical realized P&L is unavailable; no trade statistic was invented.",
+            mint,
+            entry_signature
+        );
+
+        self.save().await?;
+        Ok(true)
     }
 
     /// Update current price for a position and track peak price
@@ -1310,9 +1621,11 @@ mod tests {
         assert!((replay.pnl_sol - 0.5).abs() < 1e-9);
         assert_eq!(replay.remaining_amount, 0);
         assert!((replay.remaining_cost_sol - 0.0).abs() < 1e-9);
-        // Position still absent; fresh manager's stats untouched by the replay.
+        // Position still absent. DailyStats now persist in the snapshot (v2), so the
+        // reloaded same-day manager restores the original close's trade count (1); the
+        // idempotent replay records NO additional trade, so it stays 1.
         assert!(mgr2.get_position("mintFR").await.is_none());
-        assert_eq!(mgr2.get_daily_stats().await.total_trades, 0);
+        assert_eq!(mgr2.get_daily_stats().await.total_trades, 1);
 
         let _ = tokio::fs::remove_file(&path).await;
     }
@@ -1465,12 +1778,307 @@ mod tests {
             version: 1,
             positions: HashMap::new(),
             applied_exit_receipts: receipts,
+            daily_stats: None,
         };
         let json = serde_json::to_string_pretty(&snapshot).unwrap();
         tokio::fs::write(&path, json).await.unwrap();
 
         let mgr = manager_with_path(&path);
         assert!(mgr.load().await.is_err());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_position_store_v2_round_trips_daily_stats() {
+        let path = tmp_persistence_path("v2daily");
+
+        let mgr = manager_with_path(&path);
+        let pos = confirmed_position("mintV2", "sigV2", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        // A reconciled close records a trade into DailyStats and persists (v2).
+        mgr.close_position_reconciled("mintV2", "exitV2", 100, 1.5)
+            .await
+            .unwrap();
+        let stats_before = mgr.get_daily_stats().await;
+        assert_eq!(stats_before.total_trades, 1);
+        assert!((stats_before.net_pnl_sol - 0.5).abs() < 1e-9);
+
+        // Reload: because the persisted stats are for today, they restore.
+        let mgr2 = manager_with_path(&path);
+        mgr2.load().await.unwrap();
+        let stats_after = mgr2.get_daily_stats().await;
+        assert_eq!(stats_after.total_trades, 1);
+        assert_eq!(stats_after.winning_trades, 1);
+        assert!((stats_after.net_pnl_sol - 0.5).abs() < 1e-9);
+        assert_eq!(stats_after.date, stats_before.date);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_position_store_v1_without_daily_stats_still_loads() {
+        let path = tmp_persistence_path("v1nostats");
+
+        // Hand-write a version-1 snapshot (no daily_stats field at all).
+        let mut positions: HashMap<String, Position> = HashMap::new();
+        positions.insert(
+            "mintV1".to_string(),
+            confirmed_position("mintV1", "sigV1", 1_000_000, 0.05),
+        );
+        let snapshot = PositionStoreSnapshot {
+            version: 1,
+            positions,
+            applied_exit_receipts: HashMap::new(),
+            daily_stats: None,
+        };
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        tokio::fs::write(&path, json).await.unwrap();
+
+        let mgr = manager_with_path(&path);
+        mgr.load().await.unwrap();
+
+        assert!(mgr.get_position("mintV1").await.is_some());
+        // No daily stats persisted => fresh stats for today, zero trades.
+        let stats = mgr.get_daily_stats().await;
+        assert_eq!(stats.total_trades, 0);
+        assert_eq!(stats.date, chrono::Utc::now().format("%Y-%m-%d").to_string());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_position_store_old_date_resets_daily_stats() {
+        let path = tmp_persistence_path("olddate");
+
+        // Version-2 snapshot whose daily_stats belong to a clearly-past day.
+        let mut stale = DailyStats::new();
+        stale.date = "2000-01-01".to_string();
+        stale.record_trade(-0.5); // some prior-day loss
+        assert!(stale.total_loss_sol > 0.0);
+
+        let snapshot = PositionStoreSnapshot {
+            version: 2,
+            positions: HashMap::new(),
+            applied_exit_receipts: HashMap::new(),
+            daily_stats: Some(stale),
+        };
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        tokio::fs::write(&path, json).await.unwrap();
+
+        let mgr = manager_with_path(&path);
+        mgr.load().await.unwrap();
+
+        // Old-date stats are NOT resurrected: fresh day, no carried loss.
+        let stats = mgr.get_daily_stats().await;
+        assert_eq!(stats.date, chrono::Utc::now().format("%Y-%m-%d").to_string());
+        assert_eq!(stats.total_trades, 0);
+        assert_eq!(stats.total_loss_sol, 0.0);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_position_store_newer_version_fails_closed() {
+        let path = tmp_persistence_path("newerver");
+
+        let snapshot = PositionStoreSnapshot {
+            version: CURRENT_SNAPSHOT_VERSION + 1,
+            positions: HashMap::new(),
+            applied_exit_receipts: HashMap::new(),
+            daily_stats: None,
+        };
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        tokio::fs::write(&path, json).await.unwrap();
+
+        let mgr = manager_with_path(&path);
+        assert!(mgr.load().await.is_err());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_position_store_interrupted_valid_temp_recovers() {
+        let path = tmp_persistence_path("inttemp_valid");
+        let tmp = format!("{}.tmp", path);
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+
+        // Valid v2 snapshot lives ONLY in the temp (crash right before rename).
+        let mut positions: HashMap<String, Position> = HashMap::new();
+        positions.insert(
+            "mintIT".to_string(),
+            confirmed_position("mintIT", "sigIT", 1_000_000, 0.05),
+        );
+        let snapshot = PositionStoreSnapshot {
+            version: 2,
+            positions,
+            applied_exit_receipts: HashMap::new(),
+            daily_stats: None,
+        };
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        tokio::fs::write(&tmp, json).await.unwrap();
+
+        let mgr = manager_with_path(&path);
+        mgr.load().await.unwrap();
+
+        // Recovered from temp, not silently ignored.
+        assert!(mgr.get_position("mintIT").await.is_some());
+        // Temp promoted into place: real file now exists, temp gone.
+        assert!(Path::new(&path).exists());
+        assert!(!Path::new(&tmp).exists());
+
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_position_store_interrupted_corrupt_temp_fails_closed() {
+        let path = tmp_persistence_path("inttemp_corrupt");
+        let tmp = format!("{}.tmp", path);
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+
+        // Valid (stale) main file plus a corrupt temp: load must NOT silently
+        // fall back to main and drop the temp candidate — it must error.
+        tokio::fs::write(&path, "{}").await.unwrap();
+        tokio::fs::write(&tmp, "not json{").await.unwrap();
+
+        let mgr = manager_with_path(&path);
+        assert!(mgr.load().await.is_err());
+
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_migrate_position_from_confirmed_entry_sets_raw_units_and_remaining_cost() {
+        let path = tmp_persistence_path("migrate_ok");
+
+        let mgr = manager_with_path(&path);
+        // Track an existing position with a known entry signature.
+        let pos = confirmed_position("mintMG", "sigMG", 1_000_000, 0.10);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        // Original fill 1_000_000 raw, wallet now holds 600_000 (40% sold off-book).
+        let updated = mgr
+            .migrate_position_from_confirmed_entry(
+                "mintMG",
+                "sigMG",
+                "walletMG",
+                1_000_000,
+                600_000,
+                6,
+                0.10,        // original entry cost
+                0.000000002, // original entry price
+            )
+            .await
+            .unwrap();
+
+        // RAW units set to current wallet balance.
+        assert_eq!(updated.token_amount, 600_000);
+        assert_eq!(updated.token_decimals, Some(6));
+        assert_eq!(updated.wallet_pubkey, "walletMG");
+        assert!((updated.entry_price - 0.000000002).abs() < 1e-18);
+        // remaining_cost = 0.10 * (600_000/1_000_000) = 0.06.
+        assert!((updated.total_cost_sol - 0.06).abs() < 1e-12);
+
+        // No trade recorded.
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 0);
+
+        // Persisted.
+        let mgr2 = manager_with_path(&path);
+        mgr2.load().await.unwrap();
+        let stored = mgr2.get_position("mintMG").await.unwrap();
+        assert_eq!(stored.token_amount, 600_000);
+        assert!((stored.total_cost_sol - 0.06).abs() < 1e-12);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_migrate_position_rejects_current_balance_above_original_fill() {
+        let mgr = manager_with_path(&tmp_persistence_path("migrate_over"));
+        let pos = confirmed_position("mintOV", "sigOV", 1_000_000, 0.10);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        let res = mgr
+            .migrate_position_from_confirmed_entry(
+                "mintOV",
+                "sigOV",
+                "walletOV",
+                1_000_000,
+                1_000_001, // more than the original fill => reject
+                6,
+                0.10,
+                0.000000002,
+            )
+            .await;
+        assert!(matches!(res, Err(Error::PositionAccounting(_))));
+
+        // Untouched.
+        let stored = mgr.get_position("mintOV").await.unwrap();
+        assert_eq!(stored.token_amount, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_position_requires_matching_entry_signature() {
+        let mgr = manager_with_path(&tmp_persistence_path("migrate_sig"));
+        let pos = confirmed_position("mintSG", "sigRIGHT", 1_000_000, 0.10);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        let res = mgr
+            .migrate_position_from_confirmed_entry(
+                "mintSG",
+                "sigWRONG",
+                "walletSG",
+                1_000_000,
+                500_000,
+                6,
+                0.10,
+                0.000000002,
+            )
+            .await;
+        assert!(matches!(res, Err(Error::PositionAccounting(_))));
+
+        let stored = mgr.get_position("mintSG").await.unwrap();
+        assert_eq!(stored.token_amount, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_zero_balance_position_removes_without_trade_stats() {
+        let path = tmp_persistence_path("zerobal");
+
+        let mgr = manager_with_path(&path);
+        let pos = confirmed_position("mintZB", "sigZB", 1_000_000, 0.10);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        // No position for an unknown mint => Ok(false).
+        assert!(!mgr
+            .resolve_zero_balance_position("nope", "whatever")
+            .await
+            .unwrap());
+
+        // Wrong signature => accounting error, no removal.
+        let bad = mgr
+            .resolve_zero_balance_position("mintZB", "sigWRONG")
+            .await;
+        assert!(matches!(bad, Err(Error::PositionAccounting(_))));
+        assert!(mgr.get_position("mintZB").await.is_some());
+
+        // Correct signature => removed, no trade recorded.
+        assert!(mgr
+            .resolve_zero_balance_position("mintZB", "sigZB")
+            .await
+            .unwrap());
+        assert!(mgr.get_position("mintZB").await.is_none());
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 0);
+
+        // Removal is durable.
+        let mgr2 = manager_with_path(&path);
+        mgr2.load().await.unwrap();
+        assert!(mgr2.get_position("mintZB").await.is_none());
 
         let _ = tokio::fs::remove_file(&path).await;
     }

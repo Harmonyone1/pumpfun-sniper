@@ -312,6 +312,21 @@ impl PortfolioRiskGovernor {
         }
     }
 
+    /// Restore the current day's realized P&L accumulator on startup recovery.
+    ///
+    /// Sets the SAME `daily_pnl` field the daily-loss gate reads, so a restored
+    /// prior-loss immediately re-arms the daily loss limit after a crash. This
+    /// deliberately does NOT touch the hourly rolling window (that would fabricate
+    /// intra-hour samples) and does NOT invent consecutive-loss state. Returns
+    /// false without mutating on a non-finite input.
+    pub fn restore_daily_realized_pnl(&mut self, pnl_sol: f64) -> bool {
+        if !pnl_sol.is_finite() {
+            return false;
+        }
+        self.daily_pnl = pnl_sol;
+        true
+    }
+
     /// Pause trading for a duration
     pub fn pause_trading(&mut self, reason: String, duration_secs: u64) {
         tracing::warn!("Pausing trading: {} ({}s)", reason, duration_secs);
@@ -630,6 +645,28 @@ mod tests {
 
         // Should cap at remaining capacity
         assert_eq!(governor.adjust_position_size(0.5), 0.2); // Still capped at max per token
+    }
+
+    #[test]
+    fn test_restore_daily_realized_pnl_affects_daily_loss_gate() {
+        let config = PortfolioRiskConfig {
+            daily_loss_limit_sol: 1.0,
+            ..Default::default()
+        };
+        let mut governor = PortfolioRiskGovernor::new(config);
+
+        // Restore a prior-day-within-today loss beyond the limit.
+        assert!(governor.restore_daily_realized_pnl(-1.2));
+
+        // Daily loss gate must now block a new position.
+        let result = governor.can_open_position(0.1);
+        assert!(matches!(
+            result,
+            Err(PortfolioBlock::DailyLossLimitReached { .. })
+        ));
+
+        // Non-finite input is rejected without mutation.
+        assert!(!governor.restore_daily_realized_pnl(f64::NAN));
     }
 
     #[test]
