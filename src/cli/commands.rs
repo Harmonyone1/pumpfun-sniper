@@ -410,6 +410,15 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
         let monitor_use_local_api = use_local_api;
+        // Transaction-truth wiring (§51): clone the already-initialized reconciler,
+        // pending journal, halt flag and strategy engine into the monitor. No new
+        // RPC/reconciler is constructed inside the loop.
+        let monitor_reconciler = trade_reconciler.clone();
+        let monitor_pending = pending_executions.clone();
+        let monitor_entry_halt = new_entries_halted.clone();
+        let monitor_engine = strategy_engine.clone();
+        // Exact Lightning execution wallet, read-only. Local mode does not use this.
+        let monitor_lightning_wallet: Option<Pubkey> = primary_execution_wallet;
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
@@ -431,15 +440,6 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                     let current_price = position.current_price;
                     if current_price <= 0.0 {
                         continue;
-                    }
-
-                    // CONFIRMATION WAIT: Skip positions less than 10 seconds old
-                    // This gives time for buy tx to confirm and ATA to be created
-                    let position_age_secs = (chrono::Utc::now() - position.entry_time)
-                        .num_seconds()
-                        .max(0) as u64;
-                    if position_age_secs < 10 {
-                        continue; // Too new, wait for confirmation
                     }
 
                     // Calculate P&L from entry
@@ -540,9 +540,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                     // Execute sell if triggered
                     if should_sell {
+                        // `current_price` is the DexScreener trigger/reference price ONLY.
+                        // It is NOT the execution price and is never used to estimate proceeds.
                         warn!(
-                            "AUTO-SELL TRIGGERED: {} ({}) - {}",
-                            position.symbol, position.mint, reason
+                            "AUTO-SELL TRIGGERED: {} ({}) - {} (trigger price {:.12} SOL/token)",
+                            position.symbol, position.mint, reason, current_price
                         );
 
                         if let Some(ref trader) = monitor_trader {
@@ -550,16 +552,81 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             let priority_fee =
                                 monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
-                            // Retry logic: try up to 3 times with Lightning, then try local fallback
+                            // §53 PENDING GUARD: never submit a second sell for a mint that
+                            // already has an unresolved submitted sell in the journal.
+                            if let Some(pending) = monitor_pending
+                                .get_for_mint(&position.mint, ReconciliationSide::Sell)
+                                .await
+                            {
+                                error!(
+                                    "Sell remains pending for {}: signature {}. Not submitting another sell (001C reconciliation required).",
+                                    position.mint, pending.signature
+                                );
+                                continue;
+                            }
+
+                            // §54 LEGACY GUARD: a position without confirmed token decimals is
+                            // not canonical. Do not reconciled-sell it. Fail closed until 001C.
+                            if position.token_decimals.is_none() {
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "Legacy/unmigrated position has unknown token decimals; 001C reconciliation required (mint {})",
+                                    position.mint
+                                );
+                                continue;
+                            }
+
+                            // §55 EXACT WALLET GUARD: the position's recorded wallet must parse
+                            // and must match the wallet controlled by THIS execution route.
+                            let position_wallet = match Pubkey::from_str(position.wallet_pubkey.trim()) {
+                                Ok(pk) => pk,
+                                Err(e) => {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "Position wallet_pubkey empty/invalid for {} ({:?}): {} - no sell, new entries HALTED",
+                                        position.mint, position.wallet_pubkey, e
+                                    );
+                                    continue;
+                                }
+                            };
+                            if monitor_use_local_api {
+                                if position_wallet != monitor_keypair.pubkey() {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "Local sell wallet mismatch for {}: position {} != local {} - no sell, new entries HALTED",
+                                        position.mint, position_wallet, monitor_keypair.pubkey()
+                                    );
+                                    continue;
+                                }
+                            } else {
+                                match monitor_lightning_wallet {
+                                    Some(lw) if lw == position_wallet => {}
+                                    Some(lw) => {
+                                        monitor_entry_halt.store(true, Ordering::SeqCst);
+                                        error!(
+                                            "Lightning sell wallet mismatch for {}: position {} != lightning {} - no sell, new entries HALTED",
+                                            position.mint, position_wallet, lw
+                                        );
+                                        continue;
+                                    }
+                                    None => {
+                                        monitor_entry_halt.store(true, Ordering::SeqCst);
+                                        error!(
+                                            "Lightning execution wallet unresolved; cannot validate sell route for {} - no sell, new entries HALTED",
+                                            position.mint
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // Retry counter behavior preserved.
                             let attempts = sell_attempts.entry(position.mint.clone()).or_insert(0);
                             *attempts += 1;
 
                             if *attempts > 5 {
-                                // The sell is unresolved but the tokens may still be in the
-                                // wallet. NEVER close/remove the position on retry exhaustion
-                                // (that would delete wallet-owned risk from tracking). Leave it
-                                // OPEN/TRACKED, reset the retry counter, and let a later monitor
-                                // cycle try again. Proper reconciliation is a later packet.
+                                // Retry exhaustion: never close/remove wallet-owned risk. Leave
+                                // OPEN/TRACKED, reset counter, let a later cycle try again.
                                 error!(
                                     "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
                                     position.symbol
@@ -568,12 +635,12 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 continue;
                             }
 
-                            // Local mode signs its own transactions: go DIRECTLY to sell_local
-                            // instead of wasting 3 Lightning attempts. Otherwise preserve the
-                            // existing Lightning (1-3) -> local (4-5) fallback.
+                            // §56 ROUTE: no Lightning->Local fallback in the primary monitor.
+                            // Local mode always sell_local with the local keypair; Lightning mode
+                            // always sell() via Lightning for every attempt.
                             let sell_start = std::time::Instant::now();
                             let sell_result: Result<String, crate::error::Error> = if monitor_use_local_api {
-                                info!("Attempting LOCAL API sell (attempt {})", attempts);
+                                info!("Attempting LOCAL API sell for {} (attempt {})", position.mint, attempts);
                                 trader
                                     .sell_local(
                                         &position.mint,
@@ -584,102 +651,274 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         &monitor_rpc,
                                     )
                                     .await
-                            } else if *attempts <= 3 {
-                                info!("Attempting Lightning API sell (attempt {})", attempts);
+                            } else {
+                                info!("Attempting Lightning API sell for {} (attempt {})", position.mint, attempts);
                                 trader
                                     .sell(&position.mint, sell_pct, slippage, priority_fee)
                                     .await
-                            } else {
-                                // Attempts 4-5: Try local signing fallback
-                                warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
-                                trader
-                                    .sell_local(
-                                        &position.mint,
-                                        sell_pct,
-                                        slippage,
-                                        priority_fee,
-                                        &monitor_keypair,
-                                        &monitor_rpc,
-                                    )
-                                    .await
                             };
 
-                            match sell_result {
-                                Ok(sig) => {
-                                    info!("AUTO-SELL EXECUTED: {} - {}", position.symbol, sig);
+                            let signature = match sell_result {
+                                Ok(sig) => sig,
+                                Err(e) => {
+                                    // §57 SUBMISSION FAILURE: no signature, no pending. Record a
+                                    // symmetric execution failure sample; keep position open.
+                                    let provider_latency_ms = sell_start.elapsed().as_millis() as u64;
+                                    error!(
+                                        "AUTO-SELL SUBMISSION FAILED for {} (attempt {}): {} ({}ms)",
+                                        position.symbol, attempts, e, provider_latency_ms
+                                    );
+                                    if let Some(ref engine) = monitor_engine {
+                                        engine.write().await.record_tx_failure(
+                                            &position.mint,
+                                            false,
+                                            position.total_cost_sol,
+                                            provider_latency_ms,
+                                            &e.to_string(),
+                                        ).await;
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            // §58 PERSIST SIGNATURE: submitted != executed.
+                            info!("AUTO-SELL SUBMITTED: {} (sig {})", position.symbol, signature);
+                            let intent = if sell_pct == "50%" {
+                                PendingSellIntent::QuickProfit
+                            } else {
+                                PendingSellIntent::Full
+                            };
+                            let pending_sell = PendingExecution::sell(
+                                signature.clone(),
+                                position.mint.clone(),
+                                position.wallet_pubkey.clone(),
+                                PendingSellContext {
+                                    requested_amount: sell_pct.to_string(),
+                                    intent,
+                                    reason: reason.clone(),
+                                },
+                            );
+                            if let Err(e) = monitor_pending.upsert(pending_sell).await {
+                                // Signature already exists on chain-side; persistence failed.
+                                // Halt new entries but STILL reconcile the submitted signature.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "Failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
+                                    signature, e
+                                );
+                            }
+
+                            // §59 RECONCILE: no fixed sleep, no estimated-proceeds fallback.
+                            let outcome = monitor_reconciler
+                                .reconcile(
+                                    &signature,
+                                    &position.wallet_pubkey,
+                                    &position.mint,
+                                    ReconciliationSide::Sell,
+                                )
+                                .await;
+
+                            match outcome {
+                                Ok(ReconciliationOutcome::ConfirmedFailure { error, observed_after_ms, .. }) => {
+                                    // §60: remove pending, record failure, keep position.
+                                    match monitor_pending.remove(&signature).await {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                                            error!(
+                                                "Failed to remove pending sell after ConfirmedFailure (sig {}): {} - new entries HALTED",
+                                                signature, e
+                                            );
+                                        }
+                                    }
+                                    let total_sell_latency_ms = sell_start.elapsed().as_millis() as u64;
+                                    error!(
+                                        "AUTO-SELL CONFIRMED FAILED for {} (sig {}): {} ({}ms observed) - position remains OPEN/TRACKED",
+                                        position.symbol, signature, error, observed_after_ms
+                                    );
+                                    if let Some(ref engine) = monitor_engine {
+                                        engine.write().await.record_tx_failure(
+                                            &position.mint,
+                                            false,
+                                            position.total_cost_sol,
+                                            total_sell_latency_ms,
+                                            &error,
+                                        ).await;
+                                    }
+                                    // Do not mark quick profit; do not record_exit/partial. Later
+                                    // monitor cycle may retry.
+                                    continue;
+                                }
+                                Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
+                                    // §61: KEEP pending, keep position + flags, halt new entries.
+                                    // Do NOT clear sell-attempt state (pending guard prevents a
+                                    // second submission on the next cycle).
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, position kept, new entries HALTED",
+                                        position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    // §61: structural observer failure is not tx-failure proof.
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "CRITICAL: sell reconciliation error for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
+                                        position.symbol, signature, e
+                                    );
+                                    continue;
+                                }
+                                Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+                                    // §62 identity validation at the live boundary.
+                                    if fill.side != ReconciliationSide::Sell
+                                        || fill.wallet != position.wallet_pubkey
+                                        || fill.mint != position.mint
+                                    {
+                                        monitor_entry_halt.store(true, Ordering::SeqCst);
+                                        error!(
+                                            "CRITICAL: reconciled sell fill identity mismatch for sig {} (wallet/mint/side) - pending kept, position kept, new entries HALTED",
+                                            signature
+                                        );
+                                        continue;
+                                    }
+
+                                    // §62/§63 economics via pure helper (validates decimals match,
+                                    // nonzero raw, finite delta/price, and no oversell).
+                                    let (actual_sold_raw, actual_received_sol, actual_exit_price) =
+                                        match primary_sell_fill_values(&fill, &position) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "Reconciled sell fill validation failed for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
+                                                    position.mint, signature, e
+                                                );
+                                                continue;
+                                            }
+                                        };
+
+                                    // §64 pre-mutation capture, then idempotent reconciled close.
+                                    let pre_close_cost = position.total_cost_sol;
+                                    let pre_close_tokens = position.token_amount;
+
+                                    let close_result = match monitor_positions
+                                        .close_position_reconciled(
+                                            &position.mint,
+                                            &signature,
+                                            actual_sold_raw,
+                                            actual_received_sol,
+                                        )
+                                        .await
+                                    {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            // §64: PositionAccounting error -> keep pending,
+                                            // halt, no strategy P&L.
+                                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                                            error!(
+                                                "Reconciled close failed for {} (sig {}): {} - pending kept, new entries HALTED",
+                                                position.mint, signature, e
+                                            );
+                                            continue;
+                                        }
+                                    };
+
                                     sell_attempts.remove(&position.mint);
 
-                                    // Calculate trade metrics
+                                    // §65 partial vs full comes from the ACTUAL fill.
+                                    let fully_closed = close_result.fully_closed;
+                                    let already_applied = close_result.already_applied;
                                     let hold_secs =
                                         (chrono::Utc::now() - position.entry_time).num_seconds();
-                                    let price_change_pct = ((current_price - position.entry_price)
-                                        / position.entry_price)
-                                        * 100.0;
 
-                                    if sell_pct == "50%" {
-                                        // Partial exit - mark quick profit taken
-                                        let half_amount = position.token_amount / 2;
-                                        // Estimate received SOL based on current price (minus ~2% slippage estimate)
-                                        let estimated_received =
-                                            (half_amount as f64 * current_price) * 0.98;
-                                        let pnl_sol =
-                                            estimated_received - (position.total_cost_sol / 2.0);
-                                        let _ = monitor_positions
-                                            .close_position(
-                                                &position.mint,
-                                                half_amount,
-                                                estimated_received,
-                                            )
-                                            .await;
+                                    // §66 quick-profit flag: only if intent QuickProfit, first
+                                    // application, and the position still exists (partial).
+                                    if intent == PendingSellIntent::QuickProfit
+                                        && !already_applied
+                                        && !fully_closed
+                                    {
                                         let _ = monitor_positions
                                             .mark_quick_profit_taken(&position.mint)
                                             .await;
-                                        info!("=== TRADE CLOSED (Partial) ===");
-                                        info!(
-                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                            position.symbol,
-                                            position.entry_price,
-                                            current_price,
-                                            price_change_pct
-                                        );
-                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
-                                              half_amount, estimated_received, pnl_sol, hold_secs);
-                                    } else {
-                                        // Full exit
-                                        // Estimate received SOL based on current price (minus ~2% slippage estimate)
-                                        let estimated_received =
-                                            (position.token_amount as f64 * current_price) * 0.98;
-                                        let pnl_sol = estimated_received - position.total_cost_sol;
-                                        let pnl_pct = (pnl_sol / position.total_cost_sol) * 100.0;
-                                        let _ = monitor_positions
-                                            .close_position(
-                                                &position.mint,
-                                                position.token_amount,
-                                                estimated_received,
-                                            )
-                                            .await;
-                                        info!("=== TRADE CLOSED (Full) ===");
-                                        info!(
-                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                            position.symbol,
-                                            position.entry_price,
-                                            current_price,
-                                            price_change_pct
-                                        );
-                                        info!("  Cost: {:.4} SOL | Received: {:.4} SOL | P&L: {:+.4} SOL ({:+.1}%) | Hold: {}s",
-                                              position.total_cost_sol, estimated_received, pnl_sol, pnl_pct, hold_secs);
                                     }
-                                }
-                                Err(e) => {
-                                    let sell_latency_ms = sell_start.elapsed().as_millis() as u64;
-                                    error!(
-                                        "AUTO-SELL FAILED for {} (attempt {}): {} ({}ms)",
-                                        position.symbol, attempts, e, sell_latency_ms
+
+                                    // §67/§68 strategy governor + §69 execution feedback, only on
+                                    // first application.
+                                    if !already_applied {
+                                        if let Some(ref engine) = monitor_engine {
+                                            let total_sell_latency_ms =
+                                                sell_start.elapsed().as_millis() as u64;
+                                            if fully_closed {
+                                                // §68 full exit (idempotent portfolio behavior).
+                                                engine.write().await.record_exit(
+                                                    &position.mint,
+                                                    close_result.pnl_sol,
+                                                ).await;
+                                            } else {
+                                                // §67 partial exit updates exposure + realized P&L.
+                                                let ok = engine.write().await.record_partial_exit(
+                                                    &position.mint,
+                                                    close_result.remaining_cost_sol,
+                                                    close_result.remaining_amount,
+                                                    close_result.pnl_sol,
+                                                ).await;
+                                                if !ok {
+                                                    warn!(
+                                                        "Strategy governor lacks position {} for partial exit; PositionManager result unchanged",
+                                                        position.mint
+                                                    );
+                                                }
+                                            }
+
+                                            // §69 execution feedback: requested proxy = pre-close
+                                            // cost basis scaled by actual sold ratio.
+                                            let requested_proxy = if pre_close_tokens > 0 {
+                                                pre_close_cost
+                                                    * (actual_sold_raw as f64 / pre_close_tokens as f64)
+                                            } else {
+                                                pre_close_cost
+                                            };
+                                            engine.write().await.record_reconciled_execution(
+                                                &position.mint,
+                                                false,
+                                                requested_proxy,
+                                                actual_received_sol,
+                                                actual_exit_price,
+                                                total_sell_latency_ms,
+                                                &signature,
+                                            ).await;
+                                        }
+                                    }
+
+                                    // §71 confirmed logging (no estimated language).
+                                    if fully_closed {
+                                        info!("=== AUTO-SELL CONFIRMED (Full) ===");
+                                    } else {
+                                        info!("=== AUTO-SELL CONFIRMED (Partial) ===");
+                                    }
+                                    info!(
+                                        "  {} (sig {}) | sold_raw={} decimals={} net_sol_delta={:+.9} exit_price={:.12} SOL/token | realized P&L: {:+.9} SOL | recon_wait={}ms | hold={}s{}",
+                                        position.symbol,
+                                        signature,
+                                        actual_sold_raw,
+                                        fill.token_decimals,
+                                        actual_received_sol,
+                                        actual_exit_price,
+                                        close_result.pnl_sol,
+                                        fill.reconciliation_wait_ms,
+                                        hold_secs,
+                                        if already_applied { " (already applied; idempotent)" } else { "" }
                                     );
-                                    // Sell failure is logged but intentionally not fed into global execution
-                                    // feedback yet. Successful sells cannot be authoritatively reconciled today;
-                                    // failure-only samples would corrupt fill-rate/chain-health controls.
-                                    // Transaction reconciliation will wire both sides symmetrically.
+
+                                    // §70 remove pending LAST.
+                                    if let Err(e) = monitor_pending.remove(&signature).await {
+                                        monitor_entry_halt.store(true, Ordering::SeqCst);
+                                        error!(
+                                            "Failed to remove pending sell after confirmed fill (sig {}): {} - new entries HALTED; position state already applied",
+                                            signature, e
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -3825,6 +4064,89 @@ fn primary_buy_fill_values(
     Ok((token_amount_raw, fill.token_decimals, actual_cost_sol, actual_entry_price))
 }
 
+/// Pure fill-validation boundary for the primary auto-sell path. Extracts the
+/// canonical sell economics from a reconciled SELL fill without mutating state.
+///
+/// Returns `(actual_sold_raw, net_received_sol, actual_exit_price)`.
+///
+/// Validation:
+/// - fill side is Sell;
+/// - fill decimals exactly match the position's confirmed decimals;
+/// - raw token amount is nonzero and fits in u64;
+/// - net wallet SOL delta is finite (NEGATIVE is allowed — a fee-dominated sale);
+/// - effective price is finite and positive;
+/// - sold raw amount does NOT exceed the tracked position amount (INV-POS-011),
+///   rejected BEFORE any position mutation.
+fn primary_sell_fill_values(
+    fill: &crate::trading::ReconciledFill,
+    position: &crate::position::manager::Position,
+) -> crate::error::Result<(u64, f64, f64)> {
+    use crate::error::Error;
+
+    if fill.side != ReconciliationSide::Sell {
+        return Err(Error::TransactionReconciliation(
+            "primary_sell_fill_values: fill side is not Sell".to_string(),
+        ));
+    }
+
+    match position.token_decimals {
+        Some(d) if d == fill.token_decimals => {}
+        Some(d) => {
+            return Err(Error::TransactionReconciliation(format!(
+                "primary_sell_fill_values: decimals mismatch (position {} != fill {})",
+                d, fill.token_decimals
+            )));
+        }
+        None => {
+            return Err(Error::TransactionReconciliation(
+                "primary_sell_fill_values: position has unknown token decimals".to_string(),
+            ));
+        }
+    }
+
+    let actual_sold_raw = fill.token_amount_raw().ok_or_else(|| {
+        Error::TransactionReconciliation(
+            "primary_sell_fill_values: raw token amount does not fit in u64".to_string(),
+        )
+    })?;
+    if actual_sold_raw == 0 {
+        return Err(Error::TransactionReconciliation(
+            "primary_sell_fill_values: raw token amount is zero".to_string(),
+        ));
+    }
+
+    // INV-POS-011: never subtract more raw tokens than the position tracks.
+    // Rejected here, before any mutation.
+    if actual_sold_raw > position.token_amount {
+        return Err(Error::TransactionReconciliation(format!(
+            "primary_sell_fill_values: oversell ({} sold > {} tracked)",
+            actual_sold_raw, position.token_amount
+        )));
+    }
+
+    let actual_received_sol = fill.wallet_sol_delta_sol();
+    if !actual_received_sol.is_finite() {
+        return Err(Error::TransactionReconciliation(
+            "primary_sell_fill_values: net SOL delta is not finite".to_string(),
+        ));
+    }
+
+    // Per §62/§63 the sell exit price need only be FINITE; a fee-dominated confirmed
+    // sale can produce a zero/negative economic price and must NOT be rejected here.
+    let actual_exit_price = fill.effective_price_sol_per_token().ok_or_else(|| {
+        Error::TransactionReconciliation(
+            "primary_sell_fill_values: effective price unavailable".to_string(),
+        )
+    })?;
+    if !actual_exit_price.is_finite() {
+        return Err(Error::TransactionReconciliation(
+            "primary_sell_fill_values: effective price is not finite".to_string(),
+        ));
+    }
+
+    Ok((actual_sold_raw, actual_received_sol, actual_exit_price))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3908,5 +4230,82 @@ mod tests {
         fill.side = ReconciliationSide::Sell;
         // A sell fill passed into the buy helper must error.
         assert!(primary_buy_fill_values(&fill).is_err());
+    }
+
+    /// Synthetic SELL fill: 100 raw tokens removed (negative delta), decimals 6,
+    /// positive net SOL received by default.
+    fn synthetic_sell_fill() -> crate::trading::ReconciledFill {
+        crate::trading::ReconciledFill {
+            signature: "sig-sell".to_string(),
+            slot: 200,
+            block_time: Some(1_700_000_100),
+            wallet: "WalletPubkey1111111111111111111111111111111".to_string(),
+            mint: "Mint1111111111111111111111111111111111111111".to_string(),
+            side: ReconciliationSide::Sell,
+            // -100 raw tokens (sold). token_amount_raw() takes unsigned_abs.
+            token_delta_raw: -100,
+            token_decimals: 6,
+            // Received 0.05 SOL net (positive delta) = 50_000_000 lamports.
+            wallet_sol_delta_lamports: 50_000_000,
+            fee_lamports: 5_000,
+            reconciliation_wait_ms: 250,
+        }
+    }
+
+    /// Synthetic reconciled Position holding 100 raw tokens with decimals Some(6).
+    fn synthetic_sell_position() -> crate::position::manager::Position {
+        crate::position::manager::Position {
+            mint: "Mint1111111111111111111111111111111111111111".to_string(),
+            name: "Test".to_string(),
+            symbol: "TST".to_string(),
+            bonding_curve: "bc".to_string(),
+            token_amount: 100,
+            token_decimals: Some(6),
+            entry_price: 0.01,
+            total_cost_sol: 1.0,
+            entry_time: chrono::Utc::now(),
+            entry_signature: "sig-buy".to_string(),
+            entry_type: crate::position::manager::EntryType::default(),
+            quick_profit_taken: false,
+            second_profit_taken: false,
+            peak_price: 0.01,
+            current_price: 0.01,
+            kill_switch_triggered: false,
+            kill_switch_reason: None,
+            wallet_pubkey: "WalletPubkey1111111111111111111111111111111".to_string(),
+            applied_exit_signatures: vec![],
+        }
+    }
+
+    #[test]
+    fn test_primary_sell_fill_rejects_decimal_mismatch() {
+        let mut fill = synthetic_sell_fill();
+        fill.token_decimals = 9;
+        let position = synthetic_sell_position(); // Some(6)
+        assert!(primary_sell_fill_values(&fill, &position).is_err());
+    }
+
+    #[test]
+    fn test_primary_sell_fill_accepts_negative_net_sol() {
+        let mut fill = synthetic_sell_fill();
+        // Fee-dominated confirmed sale: net wallet SOL delta is negative.
+        fill.wallet_sol_delta_lamports = -1_000;
+        let position = synthetic_sell_position();
+        let (sold_raw, net_sol, price) =
+            primary_sell_fill_values(&fill, &position).expect("negative net SOL is allowed");
+        assert_eq!(sold_raw, 100);
+        // Helper returns the negative delta unclamped.
+        assert!(net_sol < 0.0, "net_sol was {}", net_sol);
+        // Fee-dominated sale: price is finite but may be negative; not clamped.
+        assert!(price.is_finite());
+    }
+
+    #[test]
+    fn test_primary_sell_fill_rejects_oversell_before_position_mutation() {
+        let mut fill = synthetic_sell_fill();
+        // Position holds 100 raw; fill claims 101 sold.
+        fill.token_delta_raw = -101;
+        let position = synthetic_sell_position();
+        assert!(primary_sell_fill_values(&fill, &position).is_err());
     }
 }
