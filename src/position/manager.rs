@@ -581,19 +581,38 @@ impl PositionManager {
         {
             let receipts = self.applied_exit_receipts.read().await;
             if let Some(receipt) = receipts.get(exit_signature) {
+                // The same signature must describe the same deterministic
+                // reconciliation of the same confirmed transaction. Contradictory
+                // economics on a replay are a hard accounting error, never an
+                // idempotent no-op. (Mutate nothing on any of these paths.)
                 if receipt.mint != mint {
                     return Err(Error::PositionAccounting(format!(
-                        "exit signature {} already applied to mint {} but replayed for mint {}",
+                        "exit signature {} conflict on field 'mint': stored {} replayed {}",
                         exit_signature, receipt.mint, mint
                     )));
                 }
-                // Already applied: mirror the receipt's remaining state, record
-                // no new P&L and mutate nothing.
+                if receipt.sold_amount != sold_amount {
+                    return Err(Error::PositionAccounting(format!(
+                        "exit signature {} conflict on field 'sold_amount': stored {} replayed {}",
+                        exit_signature, receipt.sold_amount, sold_amount
+                    )));
+                }
+                if receipt.received_sol != received_sol {
+                    return Err(Error::PositionAccounting(format!(
+                        "exit signature {} conflict on field 'received_sol': stored {} replayed {}",
+                        exit_signature, receipt.received_sol, received_sol
+                    )));
+                }
+                // Already applied: return the DURABLE receipt's TRUE economics
+                // (what actually happened — full/partial, realized P&L, remaining
+                // state). already_applied=true tells the caller these are
+                // historical/replayed, not newly applied. No P&L/stats/receipt
+                // mutation, no save.
                 return Ok(ReconciledCloseResult {
-                    pnl_sol: 0.0,
-                    fully_closed: false,
+                    pnl_sol: receipt.pnl_sol,
+                    fully_closed: receipt.fully_closed,
                     already_applied: true,
-                    sold_amount: 0,
+                    sold_amount: receipt.sold_amount,
                     remaining_amount: receipt.remaining_amount,
                     remaining_cost_sol: receipt.remaining_cost_sol,
                 });
@@ -1127,14 +1146,16 @@ mod tests {
             .unwrap();
         assert!(!first.already_applied);
 
-        // Replay same signature: no-op, no P&L, no stats change.
+        // Replay same signature: returns the durable receipt's true economics
+        // (already_applied=true), but applies NO new P&L/stats/mutation.
         let replay = mgr
             .close_position_reconciled("mintF", "exitF", 40, 0.6)
             .await
             .unwrap();
         assert!(replay.already_applied);
-        assert_eq!(replay.pnl_sol, 0.0);
-        assert_eq!(replay.sold_amount, 0);
+        assert!(!replay.fully_closed);
+        assert_eq!(replay.sold_amount, 40);
+        assert!((replay.pnl_sol - 0.2).abs() < 1e-9);
         assert_eq!(replay.remaining_amount, 60);
         assert!((replay.remaining_cost_sol - 0.6).abs() < 1e-9);
 
@@ -1276,16 +1297,21 @@ mod tests {
         mgr2.load().await.unwrap();
         assert!(mgr2.get_position("mintFR").await.is_none());
 
-        // Replay the same full close: already_applied, NOT PositionNotFound.
+        // Replay the same full close: already_applied returns the DURABLE receipt's
+        // TRUE economics (full close, original pnl), NOT PositionNotFound and NOT a
+        // contradictory fully_closed=false.
         let replay = mgr2
             .close_position_reconciled("mintFR", "exitFR", 100, 1.5)
             .await
             .unwrap();
         assert!(replay.already_applied);
-        assert_eq!(replay.pnl_sol, 0.0);
-        assert_eq!(replay.sold_amount, 0);
+        assert!(replay.fully_closed);
+        assert_eq!(replay.sold_amount, 100);
+        assert!((replay.pnl_sol - 0.5).abs() < 1e-9);
         assert_eq!(replay.remaining_amount, 0);
-        // Fresh manager's stats untouched by the replay (no new trade recorded).
+        assert!((replay.remaining_cost_sol - 0.0).abs() < 1e-9);
+        // Position still absent; fresh manager's stats untouched by the replay.
+        assert!(mgr2.get_position("mintFR").await.is_none());
         assert_eq!(mgr2.get_daily_stats().await.total_trades, 0);
 
         let _ = tokio::fs::remove_file(&path).await;
@@ -1310,14 +1336,16 @@ mod tests {
         let receipt = mgr.get_applied_exit_receipt("exitPR").await.unwrap();
         assert_eq!(receipt.remaining_amount, 60);
 
-        // Replay same signature => already_applied via global receipt, no 2nd mutation.
+        // Replay same signature => already_applied returns the receipt's original
+        // partial economics, no 2nd mutation.
         let replay = mgr
             .close_position_reconciled("mintPR", "exitPR", 40, 0.6)
             .await
             .unwrap();
         assert!(replay.already_applied);
-        assert_eq!(replay.pnl_sol, 0.0);
-        assert_eq!(replay.sold_amount, 0);
+        assert!(!replay.fully_closed);
+        assert_eq!(replay.sold_amount, 40);
+        assert!((replay.pnl_sol - 0.2).abs() < 1e-9);
         assert_eq!(replay.remaining_amount, 60);
         assert!((replay.remaining_cost_sol - 0.6).abs() < 1e-9);
 
@@ -1352,6 +1380,64 @@ mod tests {
         // Mint B untouched.
         let stored = mgr.get_position("mintB").await.unwrap();
         assert_eq!(stored.token_amount, 100);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_exit_signature_replay_conflicting_sold_amount_is_error() {
+        let path = tmp_persistence_path("conflictamount");
+
+        let mgr = manager_with_path(&path);
+        let pos = confirmed_position("mintCA", "sigCA", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        // First application: partial sell 40 for 0.6 SOL.
+        mgr.close_position_reconciled("mintCA", "exitConflictAmount", 40, 0.6)
+            .await
+            .unwrap();
+
+        // Replay SAME signature + SAME mint but a DIFFERENT sold_amount => error.
+        let res = mgr
+            .close_position_reconciled("mintCA", "exitConflictAmount", 41, 0.6)
+            .await;
+        assert!(matches!(res, Err(Error::PositionAccounting(_))));
+
+        // Nothing mutated: position still 60 raw, one trade, receipt still 40.
+        let stored = mgr.get_position("mintCA").await.unwrap();
+        assert_eq!(stored.token_amount, 60);
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 1);
+        let receipt = mgr.get_applied_exit_receipt("exitConflictAmount").await.unwrap();
+        assert_eq!(receipt.sold_amount, 40);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_exit_signature_replay_conflicting_received_sol_is_error() {
+        let path = tmp_persistence_path("conflictsol");
+
+        let mgr = manager_with_path(&path);
+        let pos = confirmed_position("mintCS", "sigCS", 100, 1.0);
+        mgr.record_confirmed_position(pos).await.unwrap();
+
+        // First application: sold 40 for 0.6 SOL.
+        mgr.close_position_reconciled("mintCS", "exitConflictSol", 40, 0.6)
+            .await
+            .unwrap();
+
+        // Replay SAME signature/mint/sold_amount but DIFFERENT received_sol => error.
+        let res = mgr
+            .close_position_reconciled("mintCS", "exitConflictSol", 40, 0.61)
+            .await;
+        assert!(matches!(res, Err(Error::PositionAccounting(_))));
+
+        // Nothing mutated: position still 60, one trade, receipt still 0.6.
+        let stored = mgr.get_position("mintCS").await.unwrap();
+        assert_eq!(stored.token_amount, 60);
+        assert_eq!(mgr.get_daily_stats().await.total_trades, 1);
+        let receipt = mgr.get_applied_exit_receipt("exitConflictSol").await.unwrap();
+        assert!((receipt.received_sol - 0.6).abs() < 1e-9);
 
         let _ = tokio::fs::remove_file(&path).await;
     }
