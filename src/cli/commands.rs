@@ -947,15 +947,23 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     reason: reason.clone(),
                                 },
                             );
-                            if let Err(e) = monitor_pending.upsert(pending_sell).await {
-                                // Signature already exists on chain-side; persistence failed.
-                                // Halt new entries but STILL reconcile the submitted signature.
-                                monitor_entry_halt.store(true, Ordering::SeqCst);
-                                error!(
-                                    "Failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
-                                    signature, e
-                                );
-                            }
+                            // AUDIT-002 A5: retain the exact pending record + whether the
+                            // first journal write persisted, so ambiguous/confirmed-unapplied
+                            // outcomes can retry durable persistence before relying on restart
+                            // recovery.
+                            let pending_sell_persisted = match monitor_pending.upsert(pending_sell.clone()).await {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    // Signature already exists on chain-side; persistence failed.
+                                    // Halt new entries but STILL reconcile the submitted signature.
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "Failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
+                                        signature, e
+                                    );
+                                    false
+                                }
+                            };
 
                             // §59 RECONCILE: no fixed sleep, no estimated-proceeds fallback.
                             let outcome = monitor_reconciler
@@ -1007,20 +1015,38 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     // B10: Unresolved => KEEP the reservation (do NOT release);
                                     // the same-mint sell stays owned until the signature resolves.
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
-                                    error!(
-                                        "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, reservation kept, position kept, new entries HALTED",
-                                        position.mint, signature, position.wallet_pubkey, unresolved_reason
-                                    );
+                                    // AUDIT-002 A5: if the initial journal write failed, retry
+                                    // durable persistence before leaving this arm so the in-flight
+                                    // signature survives a crash. Reservation kept regardless.
+                                    if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                        error!(
+                                            "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                            position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                        );
+                                    } else {
+                                        error!(
+                                            "CRITICAL: AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                            position.mint, signature, position.wallet_pubkey, unresolved_reason, signature
+                                        );
+                                    }
                                     continue;
                                 }
                                 Err(e) => {
                                     // §61: structural observer failure is not tx-failure proof.
                                     // B10: structural reconciler Err => KEEP the reservation.
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
-                                    error!(
-                                        "CRITICAL: sell reconciliation error for {} (sig {}): {} - pending kept, reservation kept, position kept, new entries HALTED",
-                                        position.symbol, signature, e
-                                    );
+                                    // AUDIT-002 A5: same durability retry rule as Unresolved.
+                                    if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                        error!(
+                                            "CRITICAL: sell reconciliation error for {} (sig {}): {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                            position.symbol, signature, e
+                                        );
+                                    } else {
+                                        error!(
+                                            "CRITICAL: sell reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                            position.symbol, signature, e, signature
+                                        );
+                                    }
                                     continue;
                                 }
                                 Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
@@ -1030,10 +1056,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         || fill.mint != position.mint
                                     {
                                         monitor_entry_halt.store(true, Ordering::SeqCst);
-                                        error!(
-                                            "CRITICAL: reconciled sell fill identity mismatch for sig {} (wallet/mint/side) - pending kept, position kept, new entries HALTED",
-                                            signature
-                                        );
+                                        // AUDIT-002 A5: confirmed-but-unapplied. Retry durability;
+                                        // keep reservation regardless.
+                                        if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                            error!(
+                                                "CRITICAL: reconciled sell fill identity mismatch for sig {} (wallet/mint/side) - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                signature
+                                            );
+                                        } else {
+                                            error!(
+                                                "CRITICAL: reconciled sell fill identity mismatch for sig {} (wallet/mint/side) - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                signature, signature
+                                            );
+                                        }
                                         continue;
                                     }
 
@@ -1044,10 +1079,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             Ok(v) => v,
                                             Err(e) => {
                                                 monitor_entry_halt.store(true, Ordering::SeqCst);
-                                                error!(
-                                                    "Reconciled sell fill validation failed for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
-                                                    position.mint, signature, e
-                                                );
+                                                // AUDIT-002 A5: confirmed-but-unapplied. Retry
+                                                // durability; keep reservation regardless.
+                                                if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                                    error!(
+                                                        "Reconciled sell fill validation failed for {} (sig {}): {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                        position.mint, signature, e
+                                                    );
+                                                } else {
+                                                    error!(
+                                                        "CRITICAL: reconciled sell fill validation failed for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                        position.mint, signature, e, signature
+                                                    );
+                                                }
                                                 continue;
                                             }
                                         };
@@ -1070,10 +1114,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             // §64: PositionAccounting error -> keep pending,
                                             // halt, no strategy P&L.
                                             monitor_entry_halt.store(true, Ordering::SeqCst);
-                                            error!(
-                                                "Reconciled close failed for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                position.mint, signature, e
-                                            );
+                                            // AUDIT-002 A5: confirmed-but-unapplied. Retry
+                                            // durability; keep reservation regardless.
+                                            if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                                error!(
+                                                    "Reconciled close failed for {} (sig {}): {} - pending kept (durable), reservation kept, new entries HALTED",
+                                                    position.mint, signature, e
+                                                );
+                                            } else {
+                                                error!(
+                                                    "CRITICAL: reconciled close failed for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                    position.mint, signature, e, signature
+                                                );
+                                            }
                                             continue;
                                         }
                                     };
@@ -1596,7 +1649,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                                         // Persist the submitted signature BEFORE treating it as
                                         // filled (INV-TX-015).
-                                        let pending = PendingExecution::buy(
+                                        let pending_buy = PendingExecution::buy(
                                             signature.clone(),
                                             token.mint.clone(),
                                             wallet_string.clone(),
@@ -1608,16 +1661,24 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 requested_sol: final_amount_sol,
                                             },
                                         );
-                                        if let Err(e) = pending_executions.upsert(pending).await {
-                                            // Serious state-integrity failure: the tx was already
-                                            // sent. Halt new entries, still attempt immediate
-                                            // reconciliation, never send another buy.
-                                            new_entries_halted.store(true, Ordering::SeqCst);
-                                            error!(
-                                                "Failed to persist pending buy for {} (sig {}): {} - halting new entries; still reconciling",
-                                                token.symbol, signature, e
-                                            );
-                                        }
+                                        // AUDIT-002 A4: retain the exact pending buy + whether the
+                                        // first journal write persisted, so ambiguous/confirmed-
+                                        // unapplied outcomes can retry durable persistence before
+                                        // relying on restart recovery.
+                                        let pending_buy_persisted = match pending_executions.upsert(pending_buy.clone()).await {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                // Serious state-integrity failure: the tx was already
+                                                // sent. Halt new entries, still attempt immediate
+                                                // reconciliation, never send another buy.
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "Failed to persist pending buy for {} (sig {}): {} - halting new entries; still reconciling",
+                                                    token.symbol, signature, e
+                                                );
+                                                false
+                                            }
+                                        };
 
                                         // Reconcile the submitted signature. No sleep before the call.
                                         let outcome = trade_reconciler
@@ -1658,19 +1719,36 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 // Timeout/observation gap is NOT a failed fill
                                                 // (INV-TX-014). Keep pending, halt new entries.
                                                 new_entries_halted.store(true, Ordering::SeqCst);
-                                                error!(
-                                                    "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, new entries HALTED",
-                                                    mint, signature, wallet_string, reason
-                                                );
+                                                // AUDIT-002 A4: retry durable persistence if the
+                                                // initial write failed.
+                                                if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                    error!(
+                                                        "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), new entries HALTED",
+                                                        mint, signature, wallet_string, reason
+                                                    );
+                                                } else {
+                                                    error!(
+                                                        "CRITICAL: BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                        mint, signature, wallet_string, reason, signature
+                                                    );
+                                                }
                                                 continue;
                                             }
                                             Err(e) => {
                                                 // Structural observer failure is not tx-failure proof.
                                                 new_entries_halted.store(true, Ordering::SeqCst);
-                                                error!(
-                                                    "CRITICAL: buy reconciliation error for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                    token.symbol, signature, e
-                                                );
+                                                // AUDIT-002 A4: same durability retry rule as Unresolved.
+                                                if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                    error!(
+                                                        "CRITICAL: buy reconciliation error for {} (sig {}): {} - pending kept (durable), new entries HALTED",
+                                                        token.symbol, signature, e
+                                                    );
+                                                } else {
+                                                    error!(
+                                                        "CRITICAL: buy reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                        token.symbol, signature, e, signature
+                                                    );
+                                                }
                                                 continue;
                                             }
                                             Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
@@ -1680,10 +1758,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                     || fill.mint != *mint
                                                 {
                                                     new_entries_halted.store(true, Ordering::SeqCst);
-                                                    error!(
-                                                        "CRITICAL: reconciled buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept, new entries HALTED",
-                                                        signature
-                                                    );
+                                                    // AUDIT-002 A4: confirmed-but-unapplied. Retry durability.
+                                                    if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                        error!(
+                                                            "CRITICAL: reconciled buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept (durable), new entries HALTED",
+                                                            signature
+                                                        );
+                                                    } else {
+                                                        error!(
+                                                            "CRITICAL: reconciled buy fill identity mismatch for sig {} (wallet/mint/side) - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                            signature, signature
+                                                        );
+                                                    }
                                                     continue;
                                                 }
 
@@ -1693,10 +1779,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         Ok(v) => v,
                                                         Err(e) => {
                                                             new_entries_halted.store(true, Ordering::SeqCst);
-                                                            error!(
-                                                                "CRITICAL: reconciled buy fill conversion failed for sig {}: {} - pending kept, new entries HALTED",
-                                                                signature, e
-                                                            );
+                                                            // AUDIT-002 A4: confirmed-but-unapplied. Retry durability.
+                                                            if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                                error!(
+                                                                    "CRITICAL: reconciled buy fill conversion failed for sig {}: {} - pending kept (durable), new entries HALTED",
+                                                                    signature, e
+                                                                );
+                                                            } else {
+                                                                error!(
+                                                                    "CRITICAL: reconciled buy fill conversion failed for sig {}: {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                    signature, e, signature
+                                                                );
+                                                            }
                                                             continue;
                                                         }
                                                     };
@@ -1750,10 +1844,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         // Confirmed on-chain but could not record.
                                                         // Keep pending, halt; do not pretend failure.
                                                         new_entries_halted.store(true, Ordering::SeqCst);
-                                                        error!(
-                                                            "Confirmed owned position could not be recorded for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                            token.symbol, signature, e
-                                                        );
+                                                        // AUDIT-002 A4: confirmed-but-unapplied. Retry durability.
+                                                        if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                            error!(
+                                                                "Confirmed owned position could not be recorded for {} (sig {}): {} - pending kept (durable), new entries HALTED",
+                                                                token.symbol, signature, e
+                                                            );
+                                                        } else {
+                                                            error!(
+                                                                "CRITICAL: confirmed owned position could not be recorded for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                token.symbol, signature, e, signature
+                                                            );
+                                                        }
                                                         continue;
                                                     }
                                                 };
@@ -2067,13 +2169,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         reason: alert.reason.clone(),
                                                     },
                                                 );
-                                                if let Err(e) = pending_executions.upsert(pending_sell).await {
-                                                    new_entries_halted.store(true, Ordering::SeqCst);
-                                                    error!(
-                                                        "KILL-SWITCH: failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
-                                                        signature, e
-                                                    );
-                                                }
+                                                // AUDIT-002 A6: retain the exact pending record +
+                                                // whether the first journal write persisted.
+                                                let pending_sell_persisted = match pending_executions.upsert(pending_sell.clone()).await {
+                                                    Ok(()) => true,
+                                                    Err(e) => {
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "KILL-SWITCH: failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
+                                                            signature, e
+                                                        );
+                                                        false
+                                                    }
+                                                };
 
                                                 let outcome = trade_reconciler
                                                     .reconcile(
@@ -2116,20 +2224,37 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         // B10: Unresolved => KEEP pending AND KEEP the
                                                         // reservation; halt new entries, keep position.
                                                         new_entries_halted.store(true, Ordering::SeqCst);
-                                                        error!(
-                                                            "KILL-SWITCH SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, reservation kept, position kept, new entries HALTED",
-                                                            position.mint, signature, position.wallet_pubkey, unresolved_reason
-                                                        );
+                                                        // AUDIT-002 A6: retry durability if the initial
+                                                        // write failed. Reservation kept regardless.
+                                                        if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                            error!(
+                                                                "KILL-SWITCH SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                                position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                                            );
+                                                        } else {
+                                                            error!(
+                                                                "CRITICAL: KILL-SWITCH SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                position.mint, signature, position.wallet_pubkey, unresolved_reason, signature
+                                                            );
+                                                        }
                                                         continue;
                                                     }
                                                     Err(e) => {
                                                         // B10: structural reconciler Err => KEEP the
                                                         // reservation (not tx-failure proof).
                                                         new_entries_halted.store(true, Ordering::SeqCst);
-                                                        error!(
-                                                            "CRITICAL: kill-switch sell reconciliation error for {} (sig {}): {} - pending kept, reservation kept, position kept, new entries HALTED",
-                                                            &trade.mint[..12], signature, e
-                                                        );
+                                                        // AUDIT-002 A6: same durability retry as Unresolved.
+                                                        if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                            error!(
+                                                                "CRITICAL: kill-switch sell reconciliation error for {} (sig {}): {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                                &trade.mint[..12], signature, e
+                                                            );
+                                                        } else {
+                                                            error!(
+                                                                "CRITICAL: kill-switch sell reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                &trade.mint[..12], signature, e, signature
+                                                            );
+                                                        }
                                                         continue;
                                                     }
                                                     Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
@@ -2140,10 +2265,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                             || fill.mint != position.mint
                                                         {
                                                             new_entries_halted.store(true, Ordering::SeqCst);
-                                                            error!(
-                                                                "CRITICAL: kill-switch fill identity mismatch for sig {} (wallet/mint/side) - pending kept, position kept, new entries HALTED",
-                                                                signature
-                                                            );
+                                                            // AUDIT-002 A6: confirmed-but-unapplied.
+                                                            // Retry durability; keep reservation.
+                                                            if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                                error!(
+                                                                    "CRITICAL: kill-switch fill identity mismatch for sig {} (wallet/mint/side) - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                                    signature
+                                                                );
+                                                            } else {
+                                                                error!(
+                                                                    "CRITICAL: kill-switch fill identity mismatch for sig {} (wallet/mint/side) - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                    signature, signature
+                                                                );
+                                                            }
                                                             continue;
                                                         }
 
@@ -2154,10 +2288,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                                 Ok(v) => v,
                                                                 Err(e) => {
                                                                     new_entries_halted.store(true, Ordering::SeqCst);
-                                                                    error!(
-                                                                        "KILL-SWITCH fill validation failed for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
-                                                                        position.mint, signature, e
-                                                                    );
+                                                                    // AUDIT-002 A6: confirmed-but-unapplied.
+                                                                    if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                                        error!(
+                                                                            "KILL-SWITCH fill validation failed for {} (sig {}): {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                                            position.mint, signature, e
+                                                                        );
+                                                                    } else {
+                                                                        error!(
+                                                                            "CRITICAL: KILL-SWITCH fill validation failed for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                            position.mint, signature, e, signature
+                                                                        );
+                                                                    }
                                                                     continue;
                                                                 }
                                                             };
@@ -2177,10 +2319,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                             Ok(r) => r,
                                                             Err(e) => {
                                                                 new_entries_halted.store(true, Ordering::SeqCst);
-                                                                error!(
-                                                                    "KILL-SWITCH reconciled close failed for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                                    position.mint, signature, e
-                                                                );
+                                                                // AUDIT-002 A6: confirmed-but-unapplied.
+                                                                if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                                    error!(
+                                                                        "KILL-SWITCH reconciled close failed for {} (sig {}): {} - pending kept (durable), reservation kept, new entries HALTED",
+                                                                        position.mint, signature, e
+                                                                    );
+                                                                } else {
+                                                                    error!(
+                                                                        "CRITICAL: KILL-SWITCH reconciled close failed for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                        position.mint, signature, e, signature
+                                                                    );
+                                                                }
                                                                 continue;
                                                             }
                                                         };
@@ -2407,18 +2557,93 @@ fn manual_untracked_resolution(
     }
 }
 
-/// C4: retry durable persistence of a manual pending record when the initial
-/// post-signature journal write failed and the outcome remains ambiguous
-/// (Unresolved / structural reconciler error / confirmed-fill apply failure).
-/// Ensures the store's persistence directory is writable, then upserts. Any
+/// C4/AUDIT-002 A1: retry durable persistence of an ALREADY-SUBMITTED pending
+/// record when the initial post-signature journal write failed and the outcome
+/// remains ambiguous or confirmed-but-unapplied (Unresolved / structural
+/// reconciler error / confirmed-fill identity/validation/application failure).
+///
+/// This is used on EVERY live submit path (primary buy / primary auto-sell /
+/// event kill-switch sell / HotScan buy / HotScan sell / manual sell). It
+/// ensures the store's persistence directory is writable, then upserts. Any
 /// error is returned so the caller can escalate to a CRITICAL, do-not-resubmit
 /// report that preserves the public signature.
-async fn ensure_manual_pending_durable(
+///
+/// Because the transaction is already submitted, this helper must NEVER:
+/// submit/re-submit; replace a conflicting same-signature record; remove another
+/// pending record; or guess economic state. It only makes the exact pending
+/// record durable.
+///
+/// Single-process coordination note (AUDIT-002 A13): persistent trading state is
+/// currently single-process coordinated. Do not run manual sell / HotScan /
+/// start concurrently against the same credentials_dir. Cross-process file
+/// locking is not implemented.
+async fn ensure_pending_execution_durable(
     store: &PendingExecutionStore,
     pending: &PendingExecution,
 ) -> crate::error::Result<()> {
     store.ensure_writable().await?;
     store.upsert(pending.clone()).await
+}
+
+/// AUDIT-002 A10: retry durable pending persistence only when the initial
+/// post-signature journal write failed. Returns whether the pending record is
+/// durable after this call:
+/// - `initially_persisted == true` => already durable => `true` (no retry);
+/// - initially failed + retry Ok => `true`;
+/// - initially failed + retry Err => `false`.
+///
+/// The caller retains all policy decisions (halt flag, reservation lifetime,
+/// continue/break/error). This helper never submits a transaction, never mutates
+/// positions, and logs no secrets.
+async fn retry_pending_durability_if_needed(
+    store: &PendingExecutionStore,
+    pending: &PendingExecution,
+    initially_persisted: bool,
+) -> bool {
+    if initially_persisted {
+        return true;
+    }
+    ensure_pending_execution_durable(store, pending).await.is_ok()
+}
+
+/// AUDIT-002 A11: pure reconciliation-outcome state for an already-submitted
+/// transaction, used to decide whether a durable pending record is still
+/// required for restart recovery when the initial journal write failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmittedOutcomeState {
+    /// Chain proves no economic fill; no durable pending needed.
+    ConfirmedFailure,
+    /// Confirmed fill whose economic state was durably applied; no durable
+    /// pending needed for restart economic recovery.
+    ConfirmedApplied,
+    /// Ambiguous (timeout/observation gap); durable pending required.
+    Unresolved,
+    /// Structural observer/reconciler error; durable pending required.
+    StructuralError,
+    /// Confirmed fill but identity/validation/application incomplete; durable
+    /// pending required so the confirmed-but-unapplied fill is restart-recoverable.
+    ConfirmedUnapplied,
+}
+
+/// AUDIT-002 A11: given whether the initial post-signature journal write
+/// succeeded and the resolved outcome, decide whether a durability retry is
+/// required. Persisted outcomes never require a retry; terminal outcomes
+/// (ConfirmedFailure / ConfirmedApplied) never require an invented durable
+/// record; ambiguous / confirmed-unapplied outcomes require durability when the
+/// initial write failed. Pure and deterministic (no network / store).
+fn pending_durability_required(
+    initially_persisted: bool,
+    state: SubmittedOutcomeState,
+) -> bool {
+    if initially_persisted {
+        return false;
+    }
+    match state {
+        SubmittedOutcomeState::ConfirmedFailure | SubmittedOutcomeState::ConfirmedApplied => false,
+        SubmittedOutcomeState::Unresolved
+        | SubmittedOutcomeState::StructuralError
+        | SubmittedOutcomeState::ConfirmedUnapplied => true,
+    }
 }
 
 /// C4 pure decision: given whether the initial post-signature journal write
@@ -2470,6 +2695,12 @@ pub async fn sell(
     force: bool,
     dry_run: bool,
 ) -> Result<()> {
+    // AUDIT-002 A13 — operational constraint (documentation only):
+    // Persistent trading state is currently single-process coordinated. Do not
+    // run manual sell / HotScan / start concurrently against the same
+    // credentials_dir. Cross-process file locking is not implemented. The
+    // ActiveSellMints reservation coordinates tasks inside one start() process
+    // only; positions.json and pending_executions.json have no cross-process lock.
     info!("Sell command: token={}, amount={}", token, amount);
 
     // Parse token address.
@@ -2887,7 +3118,7 @@ pub async fn sell(
             // NOT durable yet — retry durable persistence before returning so a
             // restart can recover this in-flight signature.
             if !initial_persisted {
-                match ensure_manual_pending_durable(&pending_store, &pending).await {
+                match ensure_pending_execution_durable(&pending_store, &pending).await {
                     Ok(()) => {
                         error!(
                             "Manual sell UNRESOLVED (sig {}): {} - initial journal write failed but pending is now durable",
@@ -2930,7 +3161,7 @@ pub async fn sell(
             // pending. If the initial journal write failed, retry durable
             // persistence before returning (same policy as Unresolved).
             if !initial_persisted {
-                match ensure_manual_pending_durable(&pending_store, &pending).await {
+                match ensure_pending_execution_durable(&pending_store, &pending).await {
                     Ok(()) => {
                         error!(
                             "Manual sell reconciliation error (sig {}): {} - initial journal write failed but pending is now durable",
@@ -2978,7 +3209,7 @@ pub async fn sell(
             {
                 if !initial_persisted {
                     if let Err(persist_err) =
-                        ensure_manual_pending_durable(&pending_store, &pending).await
+                        ensure_pending_execution_durable(&pending_store, &pending).await
                     {
                         anyhow::bail!(
                             "CRITICAL: reconciled manual sell fill identity mismatch for signature {} \
@@ -2997,16 +3228,18 @@ pub async fn sell(
                 );
             }
 
-            let actual_sold_raw = fill.token_amount_raw().ok_or_else(|| {
-                anyhow::anyhow!("Reconciled sell raw token amount does not fit in u64")
-            })?;
-            if actual_sold_raw == 0 {
-                anyhow::bail!("Reconciled manual sell reported zero raw tokens sold; pending kept.");
-            }
-            let net_sol = fill.wallet_sol_delta_sol();
-            if !net_sol.is_finite() {
-                anyhow::bail!("Reconciled manual sell net SOL delta is not finite; pending kept.");
-            }
+            // AUDIT-002 A9: the confirmed fill is identity-validated. The early
+            // raw/net validation MUST NOT bypass durability recovery for a
+            // TRACKED confirmed-but-unapplied sell when the initial pending
+            // persistence failed. For a tracked position, primary_sell_fill_values
+            // below is the authoritative raw/net/price validation boundary (it
+            // already rejects a raw that does not fit u64, a zero raw, and a
+            // non-finite net SOL) and its failure arm attempts durable
+            // persistence. So we do NOT duplicate raw/net validation ahead of it.
+            //
+            // The UI-only display values below are non-authoritative and never
+            // gate application; the untracked branch performs its own explicit
+            // representation checks where a u64 raw is actually reported.
             let ui_sold = fill.token_amount_ui();
             // Economic (effective) price; a fee-dominated sale may be zero/negative.
             let effective_price = fill.effective_price_sol_per_token().unwrap_or(0.0);
@@ -3023,7 +3256,7 @@ pub async fn sell(
                             // initial journal write failed.
                             if !initial_persisted {
                                 if let Err(persist_err) =
-                                    ensure_manual_pending_durable(&pending_store, &pending).await
+                                    ensure_pending_execution_durable(&pending_store, &pending).await
                                 {
                                     anyhow::bail!(
                                         "CRITICAL: reconciled sell fill validation failed (sig {}): {} \
@@ -3060,7 +3293,7 @@ pub async fn sell(
                         // initial journal write failed.
                         if !initial_persisted {
                             if let Err(persist_err) =
-                                ensure_manual_pending_durable(&pending_store, &pending).await
+                                ensure_pending_execution_durable(&pending_store, &pending).await
                             {
                                 anyhow::bail!(
                                     "CRITICAL: reconciled close failed (sig {}): {} AND pending journal \
@@ -3105,9 +3338,24 @@ pub async fn sell(
                 // === H7: untracked token application ===
                 // No authoritative cost basis: do NOT create fake P&L, do NOT call
                 // PositionManager close. Report actuals and state P&L unavailable.
+                // AUDIT-002 A9: there is no PositionManager state to apply for an
+                // untracked confirmed fill, so no durable pending is required for
+                // restart economic recovery. Report confirmed actuals. If a u64
+                // raw amount cannot be represented we return an explicit
+                // representation error — we do NOT invent a fake u64 and do NOT
+                // claim the transaction is unresolved when the chain fill is
+                // confirmed. The pending record is removed LAST below.
+                let net_sol = fill.wallet_sol_delta_sol();
+                // Report the raw magnitude via the fill's own representation. When
+                // it does not fit u64, surface the wider on-chain magnitude as a
+                // string rather than fabricating a u64.
+                let raw_sold_display: String = match fill.token_amount_raw() {
+                    Some(raw) => raw.to_string(),
+                    None => format!("{} (raw magnitude exceeds u64)", fill.token_amount_ui()),
+                };
                 println!("\n=== MANUAL SELL CONFIRMED (untracked) ===");
                 println!("  Signature: {}", signature);
-                println!("  Raw sold: {}", actual_sold_raw);
+                println!("  Raw sold: {}", raw_sold_display);
                 println!("  UI sold: {:.6}", ui_sold);
                 println!("  Net SOL (wallet delta): {:+.6} SOL", net_sol);
                 println!("  Effective price: {:.10} SOL/token", effective_price);
@@ -4846,15 +5094,22 @@ pub async fn hot_scan(
                                 reason: reason.clone(),
                             },
                         );
-                        if let Err(e) = monitor_pending.upsert(pending_sell).await {
-                            // Signature already exists chain-side; persistence failed.
-                            // Halt new entries but STILL reconcile the submitted signature.
-                            monitor_entry_halt.store(true, Ordering::SeqCst);
-                            error!(
-                                "[{}] failed to persist pending sell (sig {}): {} - HotScan new entries HALTED, still reconciling",
-                                position.symbol, signature, e
-                            );
-                        }
+                        // AUDIT-002 A8: retain the exact pending sell + whether the first
+                        // journal write persisted. HotScan has no shared primary
+                        // reservation, so no reservation behavior is added here.
+                        let pending_sell_persisted = match monitor_pending.upsert(pending_sell.clone()).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                // Signature already exists chain-side; persistence failed.
+                                // Halt new entries but STILL reconcile the submitted signature.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] failed to persist pending sell (sig {}): {} - HotScan new entries HALTED, still reconciling",
+                                    position.symbol, signature, e
+                                );
+                                false
+                            }
+                        };
 
                         // Reconcile: no fixed sleep, no estimated-proceeds fallback.
                         let outcome = monitor_reconciler
@@ -4887,19 +5142,35 @@ pub async fn hot_scan(
                             Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
                                 // KEEP pending, keep position + flags, halt new entries.
                                 monitor_entry_halt.store(true, Ordering::SeqCst);
-                                error!(
-                                    "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, position kept, HotScan new entries HALTED",
-                                    position.mint, signature, position.wallet_pubkey, unresolved_reason
-                                );
+                                // AUDIT-002 A8: retry durability if the initial write failed.
+                                if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                    error!(
+                                        "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), position kept, HotScan new entries HALTED",
+                                        position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                    );
+                                } else {
+                                    error!(
+                                        "CRITICAL: AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Position kept, HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                        position.mint, signature, position.wallet_pubkey, unresolved_reason, signature
+                                    );
+                                }
                                 continue;
                             }
                             Err(e) => {
                                 // Structural observer failure is not tx-failure proof.
                                 monitor_entry_halt.store(true, Ordering::SeqCst);
-                                error!(
-                                    "CRITICAL: HotScan sell reconciliation error for {} (sig {}): {} - pending kept, position kept, HotScan new entries HALTED",
-                                    position.symbol, signature, e
-                                );
+                                // AUDIT-002 A8: same durability retry rule as Unresolved.
+                                if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                    error!(
+                                        "CRITICAL: HotScan sell reconciliation error for {} (sig {}): {} - pending kept (durable), position kept, HotScan new entries HALTED",
+                                        position.symbol, signature, e
+                                    );
+                                } else {
+                                    error!(
+                                        "CRITICAL: HotScan sell reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Position kept, HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                        position.symbol, signature, e, signature
+                                    );
+                                }
                                 continue;
                             }
                             Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
@@ -4909,10 +5180,18 @@ pub async fn hot_scan(
                                     || fill.mint != position.mint
                                 {
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
-                                    error!(
-                                        "CRITICAL: reconciled HotScan sell fill identity mismatch for sig {} - pending kept, position kept, HotScan new entries HALTED",
-                                        signature
-                                    );
+                                    // AUDIT-002 A8: confirmed-but-unapplied. Retry durability.
+                                    if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                        error!(
+                                            "CRITICAL: reconciled HotScan sell fill identity mismatch for sig {} - pending kept (durable), position kept, HotScan new entries HALTED",
+                                            signature
+                                        );
+                                    } else {
+                                        error!(
+                                            "CRITICAL: reconciled HotScan sell fill identity mismatch for sig {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Position kept, HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                            signature, signature
+                                        );
+                                    }
                                     continue;
                                 }
 
@@ -4924,10 +5203,18 @@ pub async fn hot_scan(
                                         Ok(v) => v,
                                         Err(e) => {
                                             monitor_entry_halt.store(true, Ordering::SeqCst);
-                                            error!(
-                                                "[{}] reconciled sell fill validation failed (sig {}): {} - pending kept, position kept, HotScan new entries HALTED",
-                                                position.symbol, signature, e
-                                            );
+                                            // AUDIT-002 A8: confirmed-but-unapplied. Retry durability.
+                                            if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                                error!(
+                                                    "[{}] reconciled sell fill validation failed (sig {}): {} - pending kept (durable), position kept, HotScan new entries HALTED",
+                                                    position.symbol, signature, e
+                                                );
+                                            } else {
+                                                error!(
+                                                    "CRITICAL: [{}] reconciled sell fill validation failed (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Position kept, HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                    position.symbol, signature, e, signature
+                                                );
+                                            }
                                             continue;
                                         }
                                     };
@@ -4945,10 +5232,18 @@ pub async fn hot_scan(
                                     Ok(r) => r,
                                     Err(e) => {
                                         monitor_entry_halt.store(true, Ordering::SeqCst);
-                                        error!(
-                                            "[{}] reconciled close failed (sig {}): {} - pending kept, HotScan new entries HALTED",
-                                            position.symbol, signature, e
-                                        );
+                                        // AUDIT-002 A8: confirmed-but-unapplied. Retry durability.
+                                        if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                            error!(
+                                                "[{}] reconciled close failed (sig {}): {} - pending kept (durable), HotScan new entries HALTED",
+                                                position.symbol, signature, e
+                                            );
+                                        } else {
+                                            error!(
+                                                "CRITICAL: [{}] reconciled close failed (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                position.symbol, signature, e, signature
+                                            );
+                                        }
                                         continue;
                                     }
                                 };
@@ -5342,7 +5637,7 @@ pub async fn hot_scan(
 
                                     // Persist the submitted signature BEFORE treating it as
                                     // filled. Do NOT add bought_mints yet.
-                                    let pending = PendingExecution::buy(
+                                    let pending_buy = PendingExecution::buy(
                                         signature.clone(),
                                         token.mint.clone(),
                                         wallet_string.clone(),
@@ -5356,15 +5651,21 @@ pub async fn hot_scan(
                                             requested_sol: final_buy_amount,
                                         },
                                     );
-                                    if let Err(e) = pending_executions.upsert(pending).await {
-                                        // The tx was already sent. Halt new entries, still
-                                        // attempt reconciliation, never send another buy.
-                                        new_entries_halted.store(true, Ordering::SeqCst);
-                                        error!(
-                                            "Failed to persist pending HotScan buy for {} (sig {}): {} - halting new entries; still reconciling",
-                                            token.symbol, signature, e
-                                        );
-                                    }
+                                    // AUDIT-002 A7: retain the exact pending buy + whether the
+                                    // first journal write persisted.
+                                    let pending_buy_persisted = match pending_executions.upsert(pending_buy.clone()).await {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            // The tx was already sent. Halt new entries, still
+                                            // attempt reconciliation, never send another buy.
+                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                            error!(
+                                                "Failed to persist pending HotScan buy for {} (sig {}): {} - halting new entries; still reconciling",
+                                                token.symbol, signature, e
+                                            );
+                                            false
+                                        }
+                                    };
 
                                     // Reconcile the submitted signature. No sleep.
                                     let outcome = trade_reconciler
@@ -5417,20 +5718,36 @@ pub async fn hot_scan(
                                             // NOT a failed fill. Keep pending, halt new
                                             // entries, no position, no failed_mints.
                                             new_entries_halted.store(true, Ordering::SeqCst);
-                                            error!(
-                                                "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, HotScan new entries HALTED",
-                                                token.mint, signature, wallet_string, reason
-                                            );
+                                            // AUDIT-002 A7: retry durability before break.
+                                            if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                error!(
+                                                    "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), HotScan new entries HALTED",
+                                                    token.mint, signature, wallet_string, reason
+                                                );
+                                            } else {
+                                                error!(
+                                                    "CRITICAL: BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                    token.mint, signature, wallet_string, reason, signature
+                                                );
+                                            }
                                             break;
                                         }
                                         Err(e) => {
                                             // Structural observer failure is not tx-failure
                                             // proof. Keep pending, halt, no failed_mints.
                                             new_entries_halted.store(true, Ordering::SeqCst);
-                                            error!(
-                                                "CRITICAL: HotScan buy reconciliation error for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                token.symbol, signature, e
-                                            );
+                                            // AUDIT-002 A7: same durability retry rule as Unresolved.
+                                            if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                error!(
+                                                    "CRITICAL: HotScan buy reconciliation error for {} (sig {}): {} - pending kept (durable), new entries HALTED",
+                                                    token.symbol, signature, e
+                                                );
+                                            } else {
+                                                error!(
+                                                    "CRITICAL: HotScan buy reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                    token.symbol, signature, e, signature
+                                                );
+                                            }
                                             break;
                                         }
                                         Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
@@ -5440,10 +5757,18 @@ pub async fn hot_scan(
                                                 || fill.mint != token.mint
                                             {
                                                 new_entries_halted.store(true, Ordering::SeqCst);
-                                                error!(
-                                                    "CRITICAL: reconciled HotScan buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept, new entries HALTED",
-                                                    signature
-                                                );
+                                                // AUDIT-002 A7: confirmed-but-unapplied. Retry durability.
+                                                if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                    error!(
+                                                        "CRITICAL: reconciled HotScan buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept (durable), new entries HALTED",
+                                                        signature
+                                                    );
+                                                } else {
+                                                    error!(
+                                                        "CRITICAL: reconciled HotScan buy fill identity mismatch for sig {} (wallet/mint/side) - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                        signature, signature
+                                                    );
+                                                }
                                                 break;
                                             }
 
@@ -5458,10 +5783,18 @@ pub async fn hot_scan(
                                                 Err(e) => {
                                                     new_entries_halted
                                                         .store(true, Ordering::SeqCst);
-                                                    error!(
-                                                        "CRITICAL: reconciled HotScan buy fill conversion failed for sig {}: {} - pending kept, new entries HALTED",
-                                                        signature, e
-                                                    );
+                                                    // AUDIT-002 A7: confirmed-but-unapplied. Retry durability.
+                                                    if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                        error!(
+                                                            "CRITICAL: reconciled HotScan buy fill conversion failed for sig {}: {} - pending kept (durable), new entries HALTED",
+                                                            signature, e
+                                                        );
+                                                    } else {
+                                                        error!(
+                                                            "CRITICAL: reconciled HotScan buy fill conversion failed for sig {}: {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                            signature, e, signature
+                                                        );
+                                                    }
                                                     break;
                                                 }
                                             };
@@ -5522,10 +5855,18 @@ pub async fn hot_scan(
                                                     // add bought_mints.
                                                     new_entries_halted
                                                         .store(true, Ordering::SeqCst);
-                                                    error!(
-                                                        "Confirmed owned HotScan position could not be recorded for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                        token.symbol, signature, e
-                                                    );
+                                                    // AUDIT-002 A7: confirmed-but-unapplied. Retry durability.
+                                                    if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                        error!(
+                                                            "Confirmed owned HotScan position could not be recorded for {} (sig {}): {} - pending kept (durable), new entries HALTED",
+                                                            token.symbol, signature, e
+                                                        );
+                                                    } else {
+                                                        error!(
+                                                            "CRITICAL: confirmed owned HotScan position could not be recorded for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                            token.symbol, signature, e, signature
+                                                        );
+                                                    }
                                                     break;
                                                 }
                                             }
@@ -7910,7 +8251,7 @@ mod tests {
             },
         );
 
-        ensure_manual_pending_durable(&store, &pending)
+        ensure_pending_execution_durable(&store, &pending)
             .await
             .expect("durable retry must succeed for a writable path");
 
@@ -7940,5 +8281,140 @@ mod tests {
             manual_pending_action(true, ManualOutcomeKind::ConfirmedFailure),
             ManualPendingAction::RemoveIfPersisted
         );
+    }
+
+    // ===================================================================
+    // AUDIT-002 A11 — symmetric post-signature durability tests. These are
+    // pure/helper-level and require no network. `pending_durability_required`
+    // is the single decision applied on every live submit path (primary buy,
+    // primary auto-sell, event kill-switch sell, HotScan buy, HotScan sell,
+    // manual sell) once the reconciliation outcome is known.
+    // ===================================================================
+
+    /// A11: an Unresolved outcome whose initial pending write FAILED requires a
+    /// durability retry; the same outcome after a successful write does not.
+    #[test]
+    fn test_pending_durability_action_unresolved_requires_retry_after_initial_failure() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::Unresolved));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::Unresolved));
+    }
+
+    /// A11: a structural reconciler error whose initial write FAILED requires a
+    /// durability retry (same rule as Unresolved).
+    #[test]
+    fn test_pending_durability_action_structural_error_requires_retry_after_initial_failure() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::StructuralError));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::StructuralError));
+    }
+
+    /// A11: a confirmed-but-unapplied fill (identity/validation/application
+    /// failure) whose initial write FAILED requires a durability retry so the
+    /// confirmed fill is restart-recoverable.
+    #[test]
+    fn test_pending_durability_action_confirmed_unapplied_requires_retry_after_initial_failure() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::ConfirmedUnapplied));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::ConfirmedUnapplied));
+    }
+
+    /// A11: a confirmed fill whose economic state was durably applied does NOT
+    /// require an additional durable pending record — the applied close/receipt
+    /// (or record_confirmed_position) is the authoritative durable truth.
+    #[test]
+    fn test_pending_durability_action_confirmed_applied_does_not_require_retry() {
+        assert!(!pending_durability_required(false, SubmittedOutcomeState::ConfirmedApplied));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::ConfirmedApplied));
+        // And a ConfirmedFailure never requires an invented durable record.
+        assert!(!pending_durability_required(false, SubmittedOutcomeState::ConfirmedFailure));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::ConfirmedFailure));
+    }
+
+    /// A11: primary buy — an Unresolved outcome after an initial persist failure
+    /// is NOT terminal; without a durability retry the submitted signature is not
+    /// restart-recoverable, so the decision demands a retry.
+    #[test]
+    fn test_primary_buy_unresolved_after_initial_persist_failure_is_not_terminal_without_retry() {
+        // initial persist failed + Unresolved => must retry (not terminal).
+        assert!(pending_durability_required(false, SubmittedOutcomeState::Unresolved));
+        // If the retry had already made it durable (modeled as initially_persisted),
+        // no further durability action is required.
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::Unresolved));
+    }
+
+    /// A11: primary auto-sell — a confirmed fill whose local application failed
+    /// (confirmed-but-unapplied) after an initial persist failure requires a
+    /// durability retry.
+    #[test]
+    fn test_primary_sell_confirmed_apply_failure_after_initial_persist_failure_requires_retry() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::ConfirmedUnapplied));
+    }
+
+    /// A11: HotScan buy — Unresolved after an initial persist failure requires a
+    /// durability retry before break.
+    #[test]
+    fn test_hotscan_buy_unresolved_after_initial_persist_failure_requires_retry() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::Unresolved));
+    }
+
+    /// A11: HotScan sell — a confirmed-but-unapplied close failure after an
+    /// initial persist failure requires a durability retry.
+    #[test]
+    fn test_hotscan_sell_confirmed_apply_failure_after_initial_persist_failure_requires_retry() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::ConfirmedUnapplied));
+    }
+
+    /// A11/A9: a manual TRACKED confirmed-but-unapplied sell whose early fill
+    /// validation fails must go through the durability path when the initial
+    /// pending write failed (modeled as ConfirmedUnapplied), rather than bypassing
+    /// it via an early return.
+    #[test]
+    fn test_manual_tracked_early_fill_validation_failure_requires_pending_durability() {
+        // Tracked confirmed fill that fails validation with no durable pending =>
+        // must retry durable persistence.
+        assert!(pending_durability_required(false, SubmittedOutcomeState::ConfirmedUnapplied));
+        // A durable initial write needs no retry.
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::ConfirmedUnapplied));
+    }
+
+    /// A10/A11: the retry helper actually makes an initially-unpersisted pending
+    /// record durable against a real temp-dir store, and short-circuits to `true`
+    /// when it was already persisted.
+    #[tokio::test]
+    async fn test_retry_pending_durability_if_needed_persists_when_initial_failed() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "pf_retry_durable_{}_{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = PendingExecutionStore::new(path.clone());
+        store.load().await.unwrap();
+        let pending = PendingExecution::sell(
+            "retry-durable-sig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::Manual,
+                reason: "manual".to_string(),
+            },
+        );
+
+        // Already persisted => true without touching the store.
+        assert!(retry_pending_durability_if_needed(&store, &pending, true).await);
+
+        // Initially failed => retry persists it durably.
+        assert!(retry_pending_durability_if_needed(&store, &pending, false).await);
+
+        let reloaded = PendingExecutionStore::new(path.clone());
+        reloaded.load().await.unwrap();
+        assert!(
+            reloaded.get("retry-durable-sig").await.is_some(),
+            "pending must be durable after retry_pending_durability_if_needed"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
