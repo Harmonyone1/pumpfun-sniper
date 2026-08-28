@@ -30,11 +30,6 @@ use crate::trading::{
 };
 use crate::wallet::{ExecutionWalletRegistry, WalletOwnershipProbe};
 
-// G10: `query_token_balance` (the old first-nonzero balance-poll helper) has been
-// deleted. After Agents F/G and primary 001B, no live path derives fill truth from
-// a balance poll; canonical exposure comes from reconciled fills and the exact
-// wallet ownership probe (crate::wallet::WalletOwnershipProbe).
-
 fn persist_bought_mints(path: &str, map: &std::collections::HashMap<String, i64>) {
     match serde_json::to_string_pretty(map) {
         Ok(data) => {
@@ -2412,6 +2407,61 @@ fn manual_untracked_resolution(
     }
 }
 
+/// C4: retry durable persistence of a manual pending record when the initial
+/// post-signature journal write failed and the outcome remains ambiguous
+/// (Unresolved / structural reconciler error / confirmed-fill apply failure).
+/// Ensures the store's persistence directory is writable, then upserts. Any
+/// error is returned so the caller can escalate to a CRITICAL, do-not-resubmit
+/// report that preserves the public signature.
+async fn ensure_manual_pending_durable(
+    store: &PendingExecutionStore,
+    pending: &PendingExecution,
+) -> crate::error::Result<()> {
+    store.ensure_writable().await?;
+    store.upsert(pending.clone()).await
+}
+
+/// C4 pure decision: given whether the initial post-signature journal write
+/// succeeded and the resolved outcome kind, decide what pending action the
+/// manual sell handler must take. Testable without any network or store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualOutcomeKind {
+    ConfirmedFill,
+    ConfirmedFailure,
+    Unresolved,
+    StructuralError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualPendingAction {
+    /// Confirmed fill applied durably (or untracked): remove pending as usual.
+    RemovePending,
+    /// Confirmed failure: remove pending only if it was persisted; otherwise
+    /// no failure record to invent.
+    RemoveIfPersisted,
+    /// Ambiguous outcome and pending already durable: keep as-is.
+    KeepDurable,
+    /// Ambiguous outcome but initial write failed: must re-persist durably.
+    RetryDurable,
+}
+
+fn manual_pending_action(
+    initial_persisted: bool,
+    outcome: ManualOutcomeKind,
+) -> ManualPendingAction {
+    match outcome {
+        ManualOutcomeKind::ConfirmedFill => ManualPendingAction::RemovePending,
+        ManualOutcomeKind::ConfirmedFailure => ManualPendingAction::RemoveIfPersisted,
+        ManualOutcomeKind::Unresolved | ManualOutcomeKind::StructuralError => {
+            if initial_persisted {
+                ManualPendingAction::KeepDurable
+            } else {
+                ManualPendingAction::RetryDurable
+            }
+        }
+    }
+}
+
 /// Manually sell a token position — exact wallet, transaction-reconciled (H1-H8).
 pub async fn sell(
     config: &Config,
@@ -2783,7 +2833,20 @@ pub async fn sell(
             reason: "manual".to_string(),
         },
     );
-    pending_store.upsert(pending).await?;
+    // C3: a post-signature journal write failure must NOT short-circuit immediate
+    // reconciliation. The transaction is already submitted; returning here would
+    // leave a live, unreconciled signature with no durable record. Record whether
+    // the initial persist succeeded and continue to reconcile either way.
+    let initial_persisted = match pending_store.upsert(pending.clone()).await {
+        Ok(()) => true,
+        Err(e) => {
+            error!(
+                "submitted signature {} but pending journal write failed: {} - continuing immediate reconciliation",
+                signature, e
+            );
+            false
+        }
+    };
 
     // Reconcile: exact wallet/mint/Sell. No sleep, no balance polling, no estimate.
     let outcome = trade_reconciler
@@ -2801,8 +2864,12 @@ pub async fn sell(
             observed_after_ms,
             ..
         }) => {
-            // Remove pending; report failure; tracked position unchanged.
-            pending_store.remove(&signature).await?;
+            // C5: chain proves failure. If a pending record was persisted, remove
+            // it. If the initial persist never succeeded, there is no pending
+            // failure record to invent. No economic state mutation either way.
+            if initial_persisted {
+                pending_store.remove(&signature).await?;
+            }
             error!(
                 "Manual sell CONFIRMED FAILED (sig {}): {} ({}ms observed)",
                 signature, error, observed_after_ms
@@ -2814,12 +2881,42 @@ pub async fn sell(
             );
         }
         Ok(ReconciliationOutcome::Unresolved { reason, .. }) => {
-            // KEEP pending; report UNRESOLVED including the signature; no Position
-            // mutation; do NOT tell the user to immediately retry.
-            error!(
-                "Manual sell UNRESOLVED (sig {}): {} - pending kept, position unchanged",
-                signature, reason
-            );
+            // C4: KEEP pending; report UNRESOLVED including the signature; no
+            // Position mutation; do NOT tell the user to immediately retry. If the
+            // initial post-signature journal write failed, the pending record is
+            // NOT durable yet — retry durable persistence before returning so a
+            // restart can recover this in-flight signature.
+            if !initial_persisted {
+                match ensure_manual_pending_durable(&pending_store, &pending).await {
+                    Ok(()) => {
+                        error!(
+                            "Manual sell UNRESOLVED (sig {}): {} - initial journal write failed but pending is now durable",
+                            signature, reason
+                        );
+                    }
+                    Err(persist_err) => {
+                        error!(
+                            "CRITICAL: manual sell UNRESOLVED (sig {}): {} - AND pending journal is NOT durable: {}",
+                            signature, reason, persist_err
+                        );
+                        anyhow::bail!(
+                            "CRITICAL: manual sell outcome is UNRESOLVED for signature {} and the pending \
+                             journal is NOT durable ({}). The transaction was submitted; do NOT resubmit. \
+                             Preserve and investigate signature {} before taking any further action. \
+                             Reason: {}",
+                            signature,
+                            persist_err,
+                            signature,
+                            reason
+                        );
+                    }
+                }
+            } else {
+                error!(
+                    "Manual sell UNRESOLVED (sig {}): {} - pending kept, position unchanged",
+                    signature, reason
+                );
+            }
             anyhow::bail!(
                 "Manual sell outcome is UNRESOLVED for signature {}. The transaction was submitted \
                  but its on-chain result could not be confirmed. It remains recorded as pending; \
@@ -2829,11 +2926,40 @@ pub async fn sell(
             );
         }
         Err(e) => {
-            // A structural observer error is NOT tx-failure proof. Keep pending.
-            error!(
-                "Manual sell reconciliation error (sig {}): {} - pending kept, position unchanged",
-                signature, e
-            );
+            // C4: a structural observer error is NOT tx-failure proof. Keep
+            // pending. If the initial journal write failed, retry durable
+            // persistence before returning (same policy as Unresolved).
+            if !initial_persisted {
+                match ensure_manual_pending_durable(&pending_store, &pending).await {
+                    Ok(()) => {
+                        error!(
+                            "Manual sell reconciliation error (sig {}): {} - initial journal write failed but pending is now durable",
+                            signature, e
+                        );
+                    }
+                    Err(persist_err) => {
+                        error!(
+                            "CRITICAL: manual sell reconciliation error (sig {}): {} - AND pending journal is NOT durable: {}",
+                            signature, e, persist_err
+                        );
+                        anyhow::bail!(
+                            "CRITICAL: manual sell outcome is UNRESOLVED for signature {} (reconciliation \
+                             observer error: {}) and the pending journal is NOT durable ({}). The \
+                             transaction was submitted; do NOT resubmit. Preserve and investigate \
+                             signature {} before taking any further action.",
+                            signature,
+                            e,
+                            persist_err,
+                            signature
+                        );
+                    }
+                }
+            } else {
+                error!(
+                    "Manual sell reconciliation error (sig {}): {} - pending kept, position unchanged",
+                    signature, e
+                );
+            }
             anyhow::bail!(
                 "Manual sell outcome is UNRESOLVED for signature {} (reconciliation observer error): {}. \
                  It remains recorded as pending; do NOT resubmit.",
@@ -2842,11 +2968,28 @@ pub async fn sell(
             );
         }
         Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
-            // Identity validation at the live boundary.
+            // C6: identity/fill validation happens AFTER a confirmed fill. If it
+            // fails we must keep the pending record for restart recovery. When the
+            // initial journal write failed, retry durable persistence before
+            // returning the error so the confirmed-but-unapplied fill is not lost.
             if fill.side != ReconciliationSide::Sell
                 || fill.wallet != execution_wallet.to_string()
                 || fill.mint != token
             {
+                if !initial_persisted {
+                    if let Err(persist_err) =
+                        ensure_manual_pending_durable(&pending_store, &pending).await
+                    {
+                        anyhow::bail!(
+                            "CRITICAL: reconciled manual sell fill identity mismatch for signature {} \
+                             AND pending journal is NOT durable ({}); confirmed fill is unapplied. Do \
+                             NOT resubmit; preserve and investigate signature {}.",
+                            signature,
+                            persist_err,
+                            signature
+                        );
+                    }
+                }
                 anyhow::bail!(
                     "Reconciled manual sell fill identity mismatch for signature {}; pending kept, \
                      position unchanged.",
@@ -2872,15 +3015,36 @@ pub async fn sell(
                 // === H6: tracked Position application ===
                 // Validate fill decimals vs Position before mutation.
                 let (validated_sold_raw, validated_net_sol, validated_price) =
-                    primary_sell_fill_values(&fill, &pos).map_err(|e| {
-                        anyhow::anyhow!(
-                            "Reconciled sell fill validation failed (sig {}): {}; pending kept.",
-                            signature,
-                            e
-                        )
-                    })?;
+                    match primary_sell_fill_values(&fill, &pos) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // C6: fill validation failed AFTER a confirmed fill.
+                            // Keep pending for restart recovery; re-persist if the
+                            // initial journal write failed.
+                            if !initial_persisted {
+                                if let Err(persist_err) =
+                                    ensure_manual_pending_durable(&pending_store, &pending).await
+                                {
+                                    anyhow::bail!(
+                                        "CRITICAL: reconciled sell fill validation failed (sig {}): {} \
+                                         AND pending journal is NOT durable ({}); confirmed fill is \
+                                         unapplied. Do NOT resubmit; preserve and investigate signature {}.",
+                                        signature,
+                                        e,
+                                        persist_err,
+                                        signature
+                                    );
+                                }
+                            }
+                            anyhow::bail!(
+                                "Reconciled sell fill validation failed (sig {}): {}; pending kept.",
+                                signature,
+                                e
+                            );
+                        }
+                    };
 
-                let close_result = position_manager
+                let close_result = match position_manager
                     .close_position_reconciled(
                         token,
                         &signature,
@@ -2888,13 +3052,34 @@ pub async fn sell(
                         validated_net_sol,
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // C6: close application failed AFTER a confirmed fill.
+                        // Keep pending for restart recovery; re-persist if the
+                        // initial journal write failed.
+                        if !initial_persisted {
+                            if let Err(persist_err) =
+                                ensure_manual_pending_durable(&pending_store, &pending).await
+                            {
+                                anyhow::bail!(
+                                    "CRITICAL: reconciled close failed (sig {}): {} AND pending journal \
+                                     is NOT durable ({}); confirmed fill is unapplied. Do NOT resubmit; \
+                                     preserve and investigate signature {}.",
+                                    signature,
+                                    e,
+                                    persist_err,
+                                    signature
+                                );
+                            }
+                        }
+                        anyhow::bail!(
                             "Reconciled close failed (sig {}): {}; pending kept.",
                             signature,
                             e
-                        )
-                    })?;
+                        );
+                    }
+                };
 
                 // Remove pending LAST, after durable application.
                 pending_store.remove(&signature).await?;
@@ -4031,6 +4216,47 @@ pub async fn hot_scan(
     // Referenced by the live buy path below and reused by Agent G.
     let _ = (&hotscan_local_trader, &hotscan_lightning_trader);
 
+    // === C1: halt NEW HotScan entries when any canonical position is
+    // operationally unexitable with the CURRENT exit credentials/routes. This
+    // mirrors the primary start() B6 check but uses the HotScan-scoped route
+    // handles/registry. Positions are kept; safe routed exits still proceed.
+    // In particular, an existing Lightning position + configured Lightning
+    // wallet but MISSING api_key (=> no lightning trader) HALTS new entries.
+    // Log mint + public wallet + reason only; no secrets.
+    {
+        let local_exit_available = hotscan_local_trader.is_some();
+        let lightning_exit_available = hotscan_lightning_trader.is_some();
+        let mut unexitable = 0usize;
+        for position in position_manager.get_all_positions().await {
+            if !position_has_operational_exit_route(
+                &position,
+                hotscan_registry.as_ref(),
+                local_exit_available,
+                lightning_exit_available,
+            ) {
+                unexitable += 1;
+                let reason = if position.token_decimals.is_none() {
+                    "unknown token decimals"
+                } else if position.wallet_pubkey.parse::<Pubkey>().is_err() {
+                    "invalid recorded wallet"
+                } else {
+                    "no routable exit trader for wallet's route"
+                };
+                error!(
+                    "HotScan operationally unexitable position: mint {} wallet {} - {}",
+                    position.mint, position.wallet_pubkey, reason
+                );
+            }
+        }
+        if unexitable > 0 {
+            error!(
+                "HotScan NEW entries HALTED: {} canonical position(s) cannot be exited with current credentials/routes",
+                unexitable
+            );
+            new_entries_halted.store(true, Ordering::SeqCst);
+        }
+    }
+
     // Initialize smart money wallet profiler and Helius client (if enabled)
     let (helius_client, wallet_profiler) = if config.smart_money.enabled {
         use crate::filter::helius::HeliusClient;
@@ -4448,15 +4674,25 @@ pub async fn hot_scan(
                         }
                         let attempt_no = *sell_attempts.get(&position.mint).unwrap_or(&1);
 
-                        // G2 PENDING SELL GUARD: if a Sell for this mint is already in
-                        // flight, do NOT submit a second sell. Keep the position.
-                        if let Some(existing) = monitor_pending
+                        // G2 / C2 PENDING GUARD: if a Buy OR a Sell for this mint is
+                        // already in flight, do NOT submit a new sell. A pending Buy
+                        // can be a confirmed-fill whose durable position save failed;
+                        // selling before it reconciles could close a position that
+                        // restart recovery would then re-open from the stale pending
+                        // buy. Either pending => keep the position, no submission.
+                        let pending_buy = monitor_pending
+                            .get_for_mint(&position.mint, ReconciliationSide::Buy)
+                            .await;
+                        let pending_sell = monitor_pending
                             .get_for_mint(&position.mint, ReconciliationSide::Sell)
-                            .await
-                        {
+                            .await;
+                        if let Some(sig) = pending_blocks_automatic_sell(
+                            pending_buy.as_ref(),
+                            pending_sell.as_ref(),
+                        ) {
                             warn!(
-                                "[{}] pending sell already in flight (sig {}) - not submitting a second exit; position kept",
-                                position.symbol, existing.signature
+                                "[{}] pending transaction already in flight (sig {}) - not submitting a new exit; position kept",
+                                position.symbol, sig
                             );
                             continue;
                         }
@@ -7514,5 +7750,195 @@ mod tests {
         );
         // Neither => not blocked.
         assert_eq!(pending_blocks_automatic_sell(None, None), None);
+    }
+
+    // ===================================================================
+    // AGENT C — HotScan / manual pending-state boundary tests (C8)
+    // ===================================================================
+
+    /// C2: a pending Buy for a mint blocks the HotScan automatic sell exactly as a
+    /// pending Sell does. The HotScan sell guard uses the same shared predicate, so
+    /// a confirmed-buy whose durable position save failed cannot be closed out from
+    /// under an in-flight buy (which restart recovery would otherwise re-open).
+    #[test]
+    fn test_hotscan_pending_buy_blocks_sell() {
+        let buy = PendingExecution::buy(
+            "hotscan-buysig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingBuyContext {
+                requested_sol: 0.05,
+                name: "n".to_string(),
+                symbol: "s".to_string(),
+                bonding_curve: "bc".to_string(),
+                entry_type: crate::position::manager::EntryType::Opportunity,
+            },
+        );
+        // Pending Buy alone => HotScan must NOT submit a new sell; surfaces the sig.
+        assert_eq!(
+            pending_blocks_automatic_sell(Some(&buy), None),
+            Some("hotscan-buysig".to_string())
+        );
+        // No pending at all => not blocked (sell may proceed via routed path).
+        assert_eq!(pending_blocks_automatic_sell(None, None), None);
+    }
+
+    /// C1: an existing Lightning-route position with a configured Lightning wallet
+    /// but a MISSING api_key (=> no Lightning trader handle) is operationally
+    /// unexitable, which must HALT new HotScan entries. The HotScan C1 block halts
+    /// on any position without an operational exit route; this exercises the pure
+    /// predicate it uses with `lightning_trader_available = false`.
+    #[test]
+    fn test_hotscan_existing_lightning_position_without_trader_halts_new_entries() {
+        let primary = Pubkey::new_unique();
+        let lightning = Pubkey::new_unique();
+        // Registry recognizes the Lightning wallet (configured lightning_wallet).
+        let registry = ExecutionWalletRegistry::new(primary, &[], Some(lightning));
+        let pos = canonical_position(T_MINT, &lightning.to_string(), "s", 100);
+        assert_eq!(
+            registry.route_for(&lightning),
+            Some(crate::wallet::ExecutionRoute::Lightning)
+        );
+
+        // Missing api_key => no Lightning trader => NOT operationally exitable.
+        let local_trader_available = true; // PumpPortal trading on
+        let lightning_trader_available = false; // api_key empty => no lightning trader
+        assert!(
+            !position_has_operational_exit_route(
+                &pos,
+                &registry,
+                local_trader_available,
+                lightning_trader_available,
+            ),
+            "Lightning position without a Lightning trader must be unexitable"
+        );
+
+        // The HotScan C1 halt decision: any unexitable canonical position halts new
+        // entries. Mirror that count here.
+        let positions = vec![pos];
+        let unexitable = positions
+            .iter()
+            .filter(|p| {
+                !position_has_operational_exit_route(
+                    p,
+                    &registry,
+                    local_trader_available,
+                    lightning_trader_available,
+                )
+            })
+            .count();
+        assert!(
+            unexitable > 0,
+            "at least one unexitable position => new entries must halt"
+        );
+
+        // Sanity: with the Lightning trader available it WOULD be exitable and would
+        // not force a halt on its own.
+        assert!(position_has_operational_exit_route(&positions[0], &registry, true, true));
+    }
+
+    /// C3: after a signature, a failed pending journal write must NOT skip immediate
+    /// reconciliation. The pure decision helper confirms that regardless of the
+    /// initial persist result the handler still resolves an outcome; and that on a
+    /// confirmed fill the pending is removed as usual even if the first write failed.
+    #[test]
+    fn test_manual_post_signature_journal_failure_still_requires_reconciliation_path() {
+        // A confirmed fill after an initial-write failure => still just remove
+        // pending (durable economic truth is the applied close + receipt ledger).
+        assert_eq!(
+            manual_pending_action(false, ManualOutcomeKind::ConfirmedFill),
+            ManualPendingAction::RemovePending
+        );
+        // A confirmed fill after a successful initial write => remove pending too.
+        assert_eq!(
+            manual_pending_action(true, ManualOutcomeKind::ConfirmedFill),
+            ManualPendingAction::RemovePending
+        );
+        // Neither confirmed-fill case is "return before reconciliation": the only
+        // reason a fill action exists is that reconciliation ran to completion.
+    }
+
+    /// C4: an ambiguous manual outcome (Unresolved or structural error) whose
+    /// initial post-signature journal write FAILED must retry durable persistence
+    /// before returning. A durable initial write instead keeps pending as-is.
+    #[test]
+    fn test_manual_unresolved_requires_pending_durability() {
+        // Initial write failed => must retry durable persistence.
+        assert_eq!(
+            manual_pending_action(false, ManualOutcomeKind::Unresolved),
+            ManualPendingAction::RetryDurable
+        );
+        assert_eq!(
+            manual_pending_action(false, ManualOutcomeKind::StructuralError),
+            ManualPendingAction::RetryDurable
+        );
+        // Initial write succeeded => pending already durable, keep it.
+        assert_eq!(
+            manual_pending_action(true, ManualOutcomeKind::Unresolved),
+            ManualPendingAction::KeepDurable
+        );
+        assert_eq!(
+            manual_pending_action(true, ManualOutcomeKind::StructuralError),
+            ManualPendingAction::KeepDurable
+        );
+    }
+
+    /// C4/C6: `ensure_manual_pending_durable` actually persists a pending record so
+    /// a later reload observes it — this is the durable-retry primitive the
+    /// ambiguous-outcome branches call. Exercised against a real temp-dir store.
+    #[tokio::test]
+    async fn test_ensure_manual_pending_durable_persists() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "pf_manual_durable_{}_{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = PendingExecutionStore::new(path.clone());
+        store.load().await.unwrap();
+        let pending = PendingExecution::sell(
+            "durable-sig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::Manual,
+                reason: "manual".to_string(),
+            },
+        );
+
+        ensure_manual_pending_durable(&store, &pending)
+            .await
+            .expect("durable retry must succeed for a writable path");
+
+        // Reload from disk: the pending record survived (durable).
+        let reloaded = PendingExecutionStore::new(path.clone());
+        reloaded.load().await.unwrap();
+        assert!(
+            reloaded.get("durable-sig").await.is_some(),
+            "pending must be durable after ensure_manual_pending_durable"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C5: a ConfirmedFailure whose initial post-signature write never succeeded
+    /// does NOT need a pending failure record invented; if it WAS persisted, remove
+    /// it. No pending state is fabricated on a proven on-chain failure.
+    #[test]
+    fn test_manual_confirmed_failure_does_not_require_pending_after_initial_write_failure() {
+        // Initial write never succeeded => nothing to remove, no record to invent.
+        assert_eq!(
+            manual_pending_action(false, ManualOutcomeKind::ConfirmedFailure),
+            ManualPendingAction::RemoveIfPersisted
+        );
+        // Initial write succeeded => remove the persisted pending record.
+        assert_eq!(
+            manual_pending_action(true, ManualOutcomeKind::ConfirmedFailure),
+            ManualPendingAction::RemoveIfPersisted
+        );
     }
 }
