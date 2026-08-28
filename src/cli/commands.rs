@@ -4755,6 +4755,14 @@ pub async fn hot_scan(
         std::time::Duration::from_millis(config.rpc.timeout_ms),
     ));
 
+    // MPT-001 Agent G: authoritative market oracle for the HotScan auto-BUY gate.
+    // hot_scan is a standalone entry point (not start()), so the oracle is
+    // constructed here from the HotScan RPC client and used directly in the buy
+    // loop (which runs in this function body, not a spawned task). DexScreener
+    // stays discovery/display only; no DexScreener price may substitute for a
+    // fresh executable quote at submit time (G1/G2).
+    let market_oracle = Arc::new(PumpMarketOracle::new(rpc_client.clone()));
+
     // Initialize trader - Force Local API if configured (0.5% fee vs 1% for Lightning)
     let use_local_api = config.pumpportal.api_key.is_empty() || config.pumpportal.force_local_api;
     let trader = if config.pumpportal.use_for_trading {
@@ -6076,20 +6084,89 @@ pub async fn hot_scan(
                                 }
                             );
 
+                            // === MPT-001 Agent G: authoritative market-admission gate ===
+                            // Immediately before the LIVE auto-buy submit, fetch a fresh,
+                            // exact-size, same-venue executable quote. The DexScreener fields
+                            // used above (candidate filtering / momentum ranking / display) can
+                            // NEVER substitute for this quote (G1). A quote error is a
+                            // market-admission failure (UnsupportedQuoteMint / no curve-or-pool
+                            // MarketData), NOT a fill-rate failure: no transaction, no
+                            // ExecutionRecord failure, no failed_mints blacklist, no pending —
+                            // just skip this candidate (G2).
+                            let exact_lamports = match sol_to_lamports_exact(final_buy_amount) {
+                                Some(l) => l,
+                                None => {
+                                    warn!(
+                                        "Market gate: rejecting HotScan buy of {} - unrepresentable SOL size {} for lamport quote",
+                                        token.symbol, final_buy_amount
+                                    );
+                                    continue;
+                                }
+                            };
+                            let mint_pubkey = match Pubkey::from_str(&token.mint) {
+                                Ok(pk) => pk,
+                                Err(e) => {
+                                    warn!(
+                                        "Market gate: rejecting HotScan buy of {} - invalid mint {}: {}",
+                                        token.symbol, token.mint, e
+                                    );
+                                    continue;
+                                }
+                            };
+                            let buy_quote_result = market_oracle
+                                .quote_buy_sol(&mint_pubkey, exact_lamports)
+                                .await;
+                            // Pure, network-free classification of the quote result into a
+                            // route-pinned submit decision or a no-submit market skip (G2/G3).
+                            let buy_pool = match hotscan_buy_decision(&buy_quote_result) {
+                                HotScanBuyDecision::Submit(pool) => pool,
+                                HotScanBuyDecision::SkipMarketUnsupported => {
+                                    // market unsupported: not a transaction failure.
+                                    if let Err(e) = buy_quote_result {
+                                        warn!(
+                                            "Market gate: market unsupported for HotScan buy of {} ({} lamports): {} - skipping (no transaction submitted, not blacklisted)",
+                                            token.symbol, exact_lamports, e
+                                        );
+                                    }
+                                    continue;
+                                }
+                            };
+                            // Safe: Submit(_) implies the quote was Ok.
+                            let buy_quote = buy_quote_result.expect("submit decision implies Ok quote");
+                            info!(
+                                "Market gate PASSED for HotScan buy of {}: venue={:?} pool={:?} expected_base_raw={} expected_price={:?} quote_slot={}",
+                                token.symbol,
+                                buy_quote.venue,
+                                buy_pool,
+                                buy_quote.base_amount_raw,
+                                buy_quote.expected_price_sol_per_token,
+                                buy_quote.slot
+                            );
+
+                            // MPT-001 Agent G3: route-pinned to the quoted venue (no Auto). Same
+                            // mint / final SOL amount / configured slippage+priority as before.
+                            let buy_start = std::time::Instant::now();
                             let buy_result = if use_local_api {
                                 route_trader
-                                    .buy_local(
+                                    .buy_local_with_pool(
                                         &token.mint,
                                         final_buy_amount,
                                         slippage,
                                         priority_fee,
                                         &trading_keypair,
                                         &rpc_client,
+                                        buy_pool,
                                     )
                                     .await
                             } else {
                                 route_trader
-                                    .buy(&token.mint, final_buy_amount, slippage, priority_fee)
+                                    .buy_with_pool(
+                                        &token.mint,
+                                        final_buy_amount,
+                                        slippage,
+                                        priority_fee,
+                                        buy_pool,
+                                    )
                                     .await
                             };
 
@@ -6536,6 +6613,33 @@ fn hotscan_execution_wallet(
 /// FINAL buy amount (after the creator multiplier), NOT the base amount (F3/F7).
 fn hotscan_risk_check_amount(final_buy_amount: f64) -> f64 {
     final_buy_amount
+}
+
+/// MPT-001 Agent G: the pre-send decision for a HotScan auto-BUY after the fresh
+/// executable market quote (G1/G2/G3). A scanner (DexScreener) price can NEVER
+/// become this decision — only the on-chain quote result can. `Submit` carries the
+/// route-pinned pool (Pump=>Pump, PumpSwap=>PumpAmm) derived from the quote venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotScanBuyDecision {
+    /// The market quote succeeded: submit the buy pinned to this pool (never Auto).
+    Submit(PoolType),
+    /// The market quote failed (UnsupportedQuoteMint / MarketData). No transaction
+    /// is submitted and this is NOT a fill-rate/transaction failure, so the mint is
+    /// NOT blacklisted and no ExecutionRecord failure is recorded (G2).
+    SkipMarketUnsupported,
+}
+
+/// Pure classifier mapping a fresh `quote_buy_sol` result to a HotScan buy
+/// decision (G2/G3), extracted so the gate is testable without any network. On a
+/// successful quote the venue is route-pinned via `pumpportal_pool_for_venue`; on
+/// any quote error the decision is a no-submit market-admission skip.
+fn hotscan_buy_decision(
+    quote: &crate::error::Result<crate::market::ExecutableQuote>,
+) -> HotScanBuyDecision {
+    match quote {
+        Ok(q) => HotScanBuyDecision::Submit(pumpportal_pool_for_venue(q.venue)),
+        Err(_) => HotScanBuyDecision::SkipMarketUnsupported,
+    }
 }
 
 /// Pure fill-validation boundary for the primary buy path. Extracts the canonical
@@ -7621,6 +7725,73 @@ mod tests {
 
         let none_case: Option<f64> = None;
         assert!(none_case.is_none()); // None => unquoted path, no fabricated price
+    }
+
+    // --- MPT-001 Agent G5: HotScan buy market-truth pure tests --------------
+
+    fn hotscan_test_buy_quote(venue: MarketVenue) -> crate::market::ExecutableQuote {
+        crate::market::ExecutableQuote {
+            mint: Pubkey::new_unique(),
+            side: crate::market::MarketSide::Buy,
+            venue,
+            quote_asset: crate::market::QuoteAsset::Sol,
+            base_decimals: 6,
+            quote_decimals: 9,
+            base_amount_raw: 1_000_000,
+            quote_amount_raw: 50_000_000,
+            expected_price_sol_per_token: Some(0.000_05),
+            protocol_fee_bps: 100,
+            creator_fee_bps: 0,
+            lp_fee_bps: 0,
+            slot: 42,
+            quoted_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_hotscan_scanner_price_cannot_become_execution_reference() {
+        // G1: the buy decision is driven ONLY by the fresh on-chain quote result,
+        // never by a DexScreener/scanner price. A scanner price cannot construct a
+        // Submit decision; only an Ok(quote) can. With no quote (Err), the sole
+        // possible decision is a no-submit market skip, regardless of any scanner
+        // momentum/price the candidate carried.
+        let no_quote: crate::error::Result<crate::market::ExecutableQuote> =
+            Err(crate::error::Error::MarketData("no curve/pool state".into()));
+        assert_eq!(
+            hotscan_buy_decision(&no_quote),
+            HotScanBuyDecision::SkipMarketUnsupported
+        );
+    }
+
+    #[test]
+    fn test_hotscan_pump_quote_pins_pump() {
+        // G3: a Pump bonding-curve buy quote pins PoolType::Pump (never Auto).
+        let quote = Ok(hotscan_test_buy_quote(MarketVenue::PumpBondingCurve));
+        let decision = hotscan_buy_decision(&quote);
+        assert_eq!(decision, HotScanBuyDecision::Submit(PoolType::Pump));
+        assert_ne!(decision, HotScanBuyDecision::Submit(PoolType::Auto));
+    }
+
+    #[test]
+    fn test_hotscan_pumpswap_quote_pins_pumpamm() {
+        // G3: a canonical PumpSwap buy quote pins PoolType::PumpAmm (never Auto).
+        let quote = Ok(hotscan_test_buy_quote(MarketVenue::PumpSwapCanonical));
+        let decision = hotscan_buy_decision(&quote);
+        assert_eq!(decision, HotScanBuyDecision::Submit(PoolType::PumpAmm));
+        assert_ne!(decision, HotScanBuyDecision::Submit(PoolType::Auto));
+    }
+
+    #[test]
+    fn test_hotscan_unsupported_quote_mint_is_no_submit() {
+        // G2: an UnsupportedQuoteMint (or MarketData) quote produces a no-submit
+        // market-admission skip — NOT a Submit decision, so no transaction and no
+        // blacklist/fill-rate failure downstream.
+        let unsupported: crate::error::Result<crate::market::ExecutableQuote> = Err(
+            crate::error::Error::UnsupportedQuoteMint("USDC-quoted".into()),
+        );
+        let decision = hotscan_buy_decision(&unsupported);
+        assert_eq!(decision, HotScanBuyDecision::SkipMarketUnsupported);
+        assert!(!matches!(decision, HotScanBuyDecision::Submit(_)));
     }
 
     #[test]
