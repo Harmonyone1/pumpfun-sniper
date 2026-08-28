@@ -76,28 +76,51 @@ pub fn plan_pending_outcome(
 ) -> Result<PendingRecoveryPlan> {
     match outcome {
         ReconciliationOutcome::ConfirmedFailure {
-            signature: _,
+            signature,
             error,
             observed_after_ms,
-        } => Ok(PendingRecoveryPlan::ConfirmedFailure {
-            pending: pending.clone(),
-            error,
-            observed_after_ms,
-        }),
+        } => {
+            if signature != pending.signature {
+                return Err(Error::TransactionReconciliation(format!(
+                    "recovery outcome signature mismatch (ConfirmedFailure): pending '{}' observed '{}'",
+                    pending.signature, signature
+                )));
+            }
+            Ok(PendingRecoveryPlan::ConfirmedFailure {
+                pending: pending.clone(),
+                error,
+                observed_after_ms,
+            })
+        }
 
         ReconciliationOutcome::Unresolved {
-            signature: _,
+            signature,
             reason,
             observed_after_ms,
-        } => Ok(PendingRecoveryPlan::Unresolved {
-            pending: pending.clone(),
-            reason,
-            observed_after_ms,
-        }),
+        } => {
+            if signature != pending.signature {
+                return Err(Error::TransactionReconciliation(format!(
+                    "recovery outcome signature mismatch (Unresolved): pending '{}' observed '{}'",
+                    pending.signature, signature
+                )));
+            }
+            Ok(PendingRecoveryPlan::Unresolved {
+                pending: pending.clone(),
+                reason,
+                observed_after_ms,
+            })
+        }
 
         ReconciliationOutcome::ConfirmedFill(fill) => {
             // Identity validation: the observed fill must be for exactly this
-            // wallet/mint/side. Anything else means we looked at the wrong tx.
+            // signature/wallet/mint/side. Anything else means we looked at the
+            // wrong tx.
+            if fill.signature != pending.signature {
+                return Err(Error::TransactionReconciliation(format!(
+                    "recovery outcome signature mismatch (ConfirmedFill): pending '{}' observed '{}'",
+                    pending.signature, fill.signature
+                )));
+            }
             if fill.wallet != pending.wallet {
                 return Err(Error::TransactionReconciliation(format!(
                     "reconciled fill wallet '{}' does not match pending '{}' wallet '{}'",
@@ -543,5 +566,39 @@ mod tests {
             }
             other => panic!("expected Unresolved, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_pending_buy_confirmed_fill_wrong_signature_is_error() {
+        let pending = buy_pending();
+        let mut fill = buy_fill();
+        fill.signature = "someOtherSignature".to_string();
+        let err =
+            plan_pending_outcome(&pending, ReconciliationOutcome::ConfirmedFill(fill)).unwrap_err();
+        assert!(matches!(err, Error::TransactionReconciliation(_)));
+    }
+
+    #[test]
+    fn test_confirmed_failure_wrong_signature_is_error() {
+        let pending = buy_pending();
+        let outcome = ReconciliationOutcome::ConfirmedFailure {
+            signature: "someOtherSignature".to_string(),
+            error: "InstructionError".to_string(),
+            observed_after_ms: 42,
+        };
+        let err = plan_pending_outcome(&pending, outcome).unwrap_err();
+        assert!(matches!(err, Error::TransactionReconciliation(_)));
+    }
+
+    #[test]
+    fn test_unresolved_wrong_signature_is_error() {
+        let pending = sell_pending(PendingSellIntent::Full);
+        let outcome = ReconciliationOutcome::Unresolved {
+            signature: "someOtherSignature".to_string(),
+            reason: "timed out".to_string(),
+            observed_after_ms: 15_000,
+        };
+        let err = plan_pending_outcome(&pending, outcome).unwrap_err();
+        assert!(matches!(err, Error::TransactionReconciliation(_)));
     }
 }
