@@ -42,6 +42,12 @@ pub enum PendingSellIntent {
     Full,
     /// Partial quick-profit skim.
     QuickProfit,
+    /// Second partial profit skim.
+    SecondProfit,
+    /// Operator-initiated manual sell.
+    Manual,
+    /// Kill-switch forced exit.
+    KillSwitch,
 }
 
 /// Sell intent captured at submission time.
@@ -558,6 +564,54 @@ mod tests {
         assert!(matches!(got.context, PendingExecutionContext::Buy(_)));
 
         cleanup(&path);
+    }
+
+    #[test]
+    fn test_pending_sell_intent_serde_round_trip_all_variants() {
+        // Each variant must serialize to its snake_case wire form and round-trip.
+        let cases = [
+            (PendingSellIntent::Full, "\"full\""),
+            (PendingSellIntent::QuickProfit, "\"quick_profit\""),
+            (PendingSellIntent::SecondProfit, "\"second_profit\""),
+            (PendingSellIntent::Manual, "\"manual\""),
+            (PendingSellIntent::KillSwitch, "\"kill_switch\""),
+        ];
+        for (intent, wire) in cases {
+            let json = serde_json::to_string(&intent).unwrap();
+            assert_eq!(json, wire, "unexpected wire form for {:?}", intent);
+            let back: PendingSellIntent = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, intent);
+        }
+    }
+
+    #[test]
+    fn test_existing_sell_intent_wire_forms_still_deserialize() {
+        // Existing journal JSON (full / quick_profit) must still deserialize
+        // unchanged after adding the new variants.
+        let full: PendingSellIntent = serde_json::from_str("\"full\"").unwrap();
+        assert_eq!(full, PendingSellIntent::Full);
+        let qp: PendingSellIntent = serde_json::from_str("\"quick_profit\"").unwrap();
+        assert_eq!(qp, PendingSellIntent::QuickProfit);
+    }
+
+    #[test]
+    fn test_pending_sell_context_round_trip_new_intents() {
+        // Full PendingSellContext round-trip carrying each new intent variant.
+        for intent in [
+            PendingSellIntent::SecondProfit,
+            PendingSellIntent::Manual,
+            PendingSellIntent::KillSwitch,
+        ] {
+            let ctx = PendingSellContext {
+                requested_amount: "123456".to_string(),
+                intent,
+                reason: "test".to_string(),
+            };
+            let json = serde_json::to_string(&ctx).unwrap();
+            let back: PendingSellContext = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ctx);
+            assert_eq!(back.intent, intent);
+        }
     }
 
     #[tokio::test]
