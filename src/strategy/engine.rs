@@ -526,6 +526,43 @@ impl StrategyEngine {
         chain_health.record_tx(true);
     }
 
+    /// Record a reconciled successful execution that also had a real same-venue
+    /// pre-send executable QUOTE. Records success + latency + fill-rate AND a
+    /// quote-to-fill drift sample (spec Section 26.4). `expected_price` must be
+    /// finite > 0. Keep `record_reconciled_execution` for unquoted emergency paths.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_reconciled_quoted_execution(
+        &mut self,
+        mint: &str,
+        is_buy: bool,
+        requested_size_sol: f64,
+        filled_size_sol: f64,
+        expected_price: f64,
+        actual_price: f64,
+        latency_ms: u64,
+        tx_sig: &str,
+    ) {
+        let mut feedback = self.execution_feedback.write().await;
+        feedback.record_reconciled_quoted_success(
+            mint,
+            if is_buy {
+                super::types::Side::Buy
+            } else {
+                super::types::Side::Sell
+            },
+            requested_size_sol,
+            filled_size_sol,
+            expected_price,
+            actual_price,
+            latency_ms,
+            tx_sig,
+        );
+        drop(feedback);
+
+        let mut chain_health = self.chain_health.write().await;
+        chain_health.record_tx(true);
+    }
+
     /// Record a partial exit against the portfolio governor: reduce the tracked
     /// position in place and record the realized PnL once. Returns false when
     /// the position is absent or the remaining size is invalid.

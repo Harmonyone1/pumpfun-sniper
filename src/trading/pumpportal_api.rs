@@ -34,7 +34,14 @@ pub enum TradeAction {
 }
 
 /// Pool type for trading
-#[derive(Debug, Clone, Serialize)]
+///
+/// Serde wire strings (PumpPortal `pool` field):
+/// - `Pump` => "pump"
+/// - `Raydium` => "raydium"
+/// - `PumpAmm` => "pump-amm" (explicit rename; `rename_all = "lowercase"` would
+///   otherwise produce "pumpamm", which the router does not accept)
+/// - `Auto` => "auto"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolType {
     Pump,
@@ -242,6 +249,29 @@ impl PumpPortalTrader {
         slippage_pct: u32,
         priority_fee: f64,
     ) -> Result<String> {
+        self.sell_with_pool(mint, amount, slippage_pct, priority_fee, PoolType::Auto)
+            .await
+    }
+
+    /// Sell tokens using Lightning API with a route-pinned pool.
+    ///
+    /// Identical to [`sell`](Self::sell) but submits the given `pool` instead of
+    /// `PoolType::Auto`, so a route-aligned quote can pin its execution venue.
+    ///
+    /// # Arguments
+    /// * `mint` - Token mint address
+    /// * `amount` - Amount to sell (percentage like "100%" or token amount)
+    /// * `slippage_pct` - Slippage percentage
+    /// * `priority_fee` - Priority fee in SOL
+    /// * `pool` - Pool type to pin (Pump, PumpAmm, Auto)
+    pub async fn sell_with_pool(
+        &self,
+        mint: &str,
+        amount: &str,
+        slippage_pct: u32,
+        priority_fee: f64,
+        pool: PoolType,
+    ) -> Result<String> {
         let api_key = self
             .api_key
             .as_ref()
@@ -261,10 +291,10 @@ impl PumpPortalTrader {
             denominated_in_sol: denominated_in_sol.to_string(),
             slippage: slippage_pct,
             priority_fee,
-            pool: Some(PoolType::Auto), // Auto-detect pool (handles graduated tokens)
+            pool: Some(pool),
         };
 
-        info!("Executing sell: {} of token {} (pool: auto)", amount, mint);
+        info!("Executing sell: {} of token {} (pool: {:?})", amount, mint, pool);
 
         let response = self
             .client
@@ -298,6 +328,32 @@ impl PumpPortalTrader {
         })
     }
 
+    /// Build a Local API trade request body.
+    ///
+    /// Pure request-builder used by every Local-API path so that only the `pool`
+    /// (and action/amount) is threaded through — signing/submission are unchanged.
+    fn build_local_trade_request(
+        action: TradeAction,
+        mint: &str,
+        amount: String,
+        denominated_in_sol: &str,
+        slippage_pct: u32,
+        priority_fee: f64,
+        public_key: &str,
+        pool: PoolType,
+    ) -> LocalTradeRequest {
+        LocalTradeRequest {
+            action,
+            mint: mint.to_string(),
+            amount,
+            denominated_in_sol: denominated_in_sol.to_string(),
+            slippage: slippage_pct,
+            priority_fee,
+            public_key: public_key.to_string(),
+            pool: Some(pool),
+        }
+    }
+
     /// Get unsigned transaction for buy (Local API)
     ///
     /// Use this if you want to sign the transaction yourself
@@ -310,18 +366,39 @@ impl PumpPortalTrader {
         priority_fee: f64,
         public_key: &str,
     ) -> Result<Vec<u8>> {
-        let request = LocalTradeRequest {
-            action: TradeAction::Buy,
-            mint: mint.to_string(),
-            amount: sol_amount.to_string(),
-            denominated_in_sol: "true".to_string(),
-            slippage: slippage_pct,
+        self.get_buy_transaction_with_pool(
+            mint,
+            sol_amount,
+            slippage_pct,
             priority_fee,
-            public_key: public_key.to_string(),
-            pool: Some(PoolType::Auto), // Auto-detect pool
-        };
+            public_key,
+            PoolType::Auto,
+        )
+        .await
+    }
 
-        debug!("Getting buy transaction from Local API (pool: auto)");
+    /// Get unsigned buy transaction (Local API) with a route-pinned pool.
+    pub async fn get_buy_transaction_with_pool(
+        &self,
+        mint: &str,
+        sol_amount: f64,
+        slippage_pct: u32,
+        priority_fee: f64,
+        public_key: &str,
+        pool: PoolType,
+    ) -> Result<Vec<u8>> {
+        let request = Self::build_local_trade_request(
+            TradeAction::Buy,
+            mint,
+            sol_amount.to_string(),
+            "true",
+            slippage_pct,
+            priority_fee,
+            public_key,
+            pool,
+        );
+
+        debug!("Getting buy transaction from Local API (pool: {:?})", pool);
 
         let response = self
             .client
@@ -366,24 +443,45 @@ impl PumpPortalTrader {
         priority_fee: f64,
         public_key: &str,
     ) -> Result<Vec<u8>> {
+        self.get_sell_transaction_with_pool(
+            mint,
+            amount,
+            slippage_pct,
+            priority_fee,
+            public_key,
+            PoolType::Auto,
+        )
+        .await
+    }
+
+    /// Get unsigned sell transaction (Local API) with a route-pinned pool.
+    pub async fn get_sell_transaction_with_pool(
+        &self,
+        mint: &str,
+        amount: &str,
+        slippage_pct: u32,
+        priority_fee: f64,
+        public_key: &str,
+        pool: PoolType,
+    ) -> Result<Vec<u8>> {
         let denominated_in_sol = if amount.ends_with('%') {
             "false"
         } else {
             "false"
         };
 
-        let request = LocalTradeRequest {
-            action: TradeAction::Sell,
-            mint: mint.to_string(),
-            amount: amount.to_string(),
-            denominated_in_sol: denominated_in_sol.to_string(),
-            slippage: slippage_pct,
+        let request = Self::build_local_trade_request(
+            TradeAction::Sell,
+            mint,
+            amount.to_string(),
+            denominated_in_sol,
+            slippage_pct,
             priority_fee,
-            public_key: public_key.to_string(),
-            pool: Some(PoolType::Auto), // Auto-detect pool (handles graduated tokens)
-        };
+            public_key,
+            pool,
+        );
 
-        debug!("Getting sell transaction from Local API (pool: auto)");
+        debug!("Getting sell transaction from Local API (pool: {:?})", pool);
 
         let response = self
             .client
@@ -439,16 +537,50 @@ impl PumpPortalTrader {
         keypair: &Keypair,
         rpc_client: &RpcClient,
     ) -> Result<String> {
+        self.buy_local_with_pool(
+            mint,
+            sol_amount,
+            slippage_pct,
+            priority_fee,
+            keypair,
+            rpc_client,
+            PoolType::Auto,
+        )
+        .await
+    }
+
+    /// Execute a buy using Local API with a route-pinned pool.
+    ///
+    /// Identical to [`buy_local`](Self::buy_local) but requests the unsigned
+    /// transaction for the given `pool`. Signing and submission are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn buy_local_with_pool(
+        &self,
+        mint: &str,
+        sol_amount: f64,
+        slippage_pct: u32,
+        priority_fee: f64,
+        keypair: &Keypair,
+        rpc_client: &RpcClient,
+        pool: PoolType,
+    ) -> Result<String> {
         let public_key = keypair.pubkey().to_string();
 
         info!(
-            "Executing local buy: {} SOL for token {} (signer: {})",
-            sol_amount, mint, public_key
+            "Executing local buy: {} SOL for token {} (signer: {}, pool: {:?})",
+            sol_amount, mint, public_key, pool
         );
 
         // Get unsigned transaction from PumpPortal Local API (returns raw bytes)
         let tx_bytes = self
-            .get_buy_transaction(mint, sol_amount, slippage_pct, priority_fee, &public_key)
+            .get_buy_transaction_with_pool(
+                mint,
+                sol_amount,
+                slippage_pct,
+                priority_fee,
+                &public_key,
+                pool,
+            )
             .await?;
 
         debug!(
@@ -646,16 +778,50 @@ impl PumpPortalTrader {
         keypair: &Keypair,
         rpc_client: &RpcClient,
     ) -> Result<String> {
+        self.sell_local_with_pool(
+            mint,
+            amount,
+            slippage_pct,
+            priority_fee,
+            keypair,
+            rpc_client,
+            PoolType::Auto,
+        )
+        .await
+    }
+
+    /// Execute a sell using Local API with a route-pinned pool.
+    ///
+    /// Identical to [`sell_local`](Self::sell_local) but requests the unsigned
+    /// transaction for the given `pool`. Signing and submission are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sell_local_with_pool(
+        &self,
+        mint: &str,
+        amount: &str,
+        slippage_pct: u32,
+        priority_fee: f64,
+        keypair: &Keypair,
+        rpc_client: &RpcClient,
+        pool: PoolType,
+    ) -> Result<String> {
         let public_key = keypair.pubkey().to_string();
 
         info!(
-            "Executing local sell: {} of token {} (signer: {})",
-            amount, mint, public_key
+            "Executing local sell: {} of token {} (signer: {}, pool: {:?})",
+            amount, mint, public_key, pool
         );
 
         // Get unsigned transaction from PumpPortal Local API (returns raw bytes)
         let tx_bytes = self
-            .get_sell_transaction(mint, amount, slippage_pct, priority_fee, &public_key)
+            .get_sell_transaction_with_pool(
+                mint,
+                amount,
+                slippage_pct,
+                priority_fee,
+                &public_key,
+                pool,
+            )
             .await?;
 
         debug!(
@@ -1108,6 +1274,70 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"action\":\"buy\""));
         assert!(json.contains("\"denominatedInSol\":\"true\""));
+    }
+
+    #[test]
+    fn test_pool_type_wire_strings() {
+        // Route pinning depends on exact PumpPortal wire strings.
+        assert_eq!(serde_json::to_string(&PoolType::Pump).unwrap(), "\"pump\"");
+        assert_eq!(
+            serde_json::to_string(&PoolType::PumpAmm).unwrap(),
+            "\"pump-amm\""
+        );
+        assert_eq!(serde_json::to_string(&PoolType::Auto).unwrap(), "\"auto\"");
+    }
+
+    #[test]
+    fn test_sell_with_pool_serializes_pump_amm() {
+        // A pinned PumpAmm Lightning sell must serialize the pool as "pump-amm".
+        let request = TradeRequest {
+            action: TradeAction::Sell,
+            mint: "somemint".to_string(),
+            amount: "100%".to_string(),
+            denominated_in_sol: "false".to_string(),
+            slippage: 25,
+            priority_fee: 0.0005,
+            pool: Some(PoolType::PumpAmm),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            json.contains("\"pool\":\"pump-amm\""),
+            "expected pump-amm pool, got {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_local_trade_request_uses_supplied_pool() {
+        // The Local-API request builder must thread the supplied pool through.
+        let pump = PumpPortalTrader::build_local_trade_request(
+            TradeAction::Buy,
+            "somemint",
+            "0.01".to_string(),
+            "true",
+            25,
+            0.0005,
+            "11111111111111111111111111111111",
+            PoolType::Pump,
+        );
+        assert_eq!(pump.pool, Some(PoolType::Pump));
+        let json = serde_json::to_string(&pump).unwrap();
+        assert!(json.contains("\"pool\":\"pump\""), "got {}", json);
+
+        let amm = PumpPortalTrader::build_local_trade_request(
+            TradeAction::Sell,
+            "somemint",
+            "500000".to_string(),
+            "false",
+            25,
+            0.0005,
+            "11111111111111111111111111111111",
+            PoolType::PumpAmm,
+        );
+        assert_eq!(amm.pool, Some(PoolType::PumpAmm));
+        let json = serde_json::to_string(&amm).unwrap();
+        assert!(json.contains("\"pool\":\"pump-amm\""), "got {}", json);
     }
 
     #[test]

@@ -197,6 +197,34 @@ impl ExecutionFeedback {
         self.record(rec);
     }
 
+    /// Record a reconciled successful execution that also had a real same-venue
+    /// pre-send executable QUOTE. Unlike `record_reconciled_success`, this DOES
+    /// add a drift sample (quote-to-fill execution drift, spec Section 26.4) in
+    /// addition to fill-rate + latency. `expected_price` must be finite > 0.
+    pub fn record_reconciled_quoted_success(
+        &mut self,
+        mint: &str,
+        side: super::types::Side,
+        requested_size_sol: f64,
+        filled_size_sol: f64,
+        expected_price: f64,
+        actual_price: f64,
+        latency_ms: u64,
+        tx_sig: &str,
+    ) {
+        let rec = ExecutionRecord::success_reconciled_quoted(
+            mint.to_string(),
+            side,
+            requested_size_sol,
+            filled_size_sol,
+            expected_price,
+            actual_price,
+            latency_ms,
+            tx_sig.to_string(),
+        );
+        self.record(rec);
+    }
+
     /// Record a failed execution
     pub fn record_failure(
         &mut self,
@@ -433,6 +461,36 @@ mod tests {
         assert_eq!(quality.recent_fill_rate, Some(1.0));
         assert_eq!(quality.recent_avg_slippage, None);
         assert_eq!(feedback.avg_slippage(), None);
+    }
+
+    #[test]
+    fn test_reconciled_quoted_success_records_drift_sample() {
+        let mut feedback = ExecutionFeedback::default();
+
+        // Buy fill 3% worse than quote => +3% drift sample.
+        feedback.record_reconciled_quoted_success(
+            "mint",
+            super::super::types::Side::Buy,
+            0.1,
+            0.1,
+            100.0,
+            103.0,
+            120,
+            "sig1",
+        );
+
+        assert_eq!(feedback.execution_count(), 1);
+        let rec = feedback.recent_executions().front().unwrap();
+        assert_eq!(rec.expected_price, Some(100.0));
+        assert_eq!(rec.actual_price, Some(103.0));
+        let drift = rec.slippage_pct.expect("quoted record must have drift");
+        assert!((drift - 3.0).abs() < 1e-9, "got {}", drift);
+
+        // Unlike the unquoted variant, this DOES create a slippage/drift sample.
+        assert!((feedback.avg_slippage().unwrap() - 3.0).abs() < 1e-9);
+        let quality = feedback.get_quality();
+        assert_eq!(quality.recent_fill_rate, Some(1.0));
+        assert!(quality.recent_avg_slippage.is_some());
     }
 
     #[test]
