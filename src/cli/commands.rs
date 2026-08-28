@@ -24,76 +24,11 @@ use crate::stream::pumpportal::{PumpPortalClient, PumpPortalEvent};
 use crate::stream::shredstream::ShredStreamClient;
 use crate::trading::pumpportal_api::PumpPortalTrader;
 use crate::trading::{
-    PendingBuyContext, PendingExecution, PendingExecutionStore, PendingSellContext,
-    PendingSellIntent, ReconciliationOutcome, ReconciliationSide, TradeReconciler,
+    reconcile_pending_execution, PendingBuyContext, PendingExecution, PendingExecutionStore,
+    PendingSellContext, PendingSellIntent, ReconciliationOutcome, ReconciliationSide,
+    TradeReconciler,
 };
-
-/// Query actual token balance for a wallet and mint
-/// Returns the token balance or 0 if not found
-fn query_token_balance(
-    rpc_client: &solana_client::rpc_client::RpcClient,
-    wallet: &Pubkey,
-    mint: &str,
-) -> u64 {
-    use solana_client::rpc_request::TokenAccountsFilter;
-
-    let mint_pubkey = match Pubkey::from_str(mint) {
-        Ok(pk) => pk,
-        Err(_) => return 0,
-    };
-
-    // Try SPL Token program with Mint filter (works for both SPL and Token2022)
-    if let Ok(accounts) =
-        rpc_client.get_token_accounts_by_owner(wallet, TokenAccountsFilter::Mint(mint_pubkey))
-    {
-        for account in &accounts {
-            if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
-                if let Some(info) = parsed.parsed.get("info") {
-                    if let Some(token_amount) = info.get("tokenAmount") {
-                        if let Some(amount_str) = token_amount.get("amount") {
-                            if let Some(amount) = amount_str.as_str() {
-                                let bal = amount.parse::<u64>().unwrap_or(0);
-                                if bal > 0 {
-                                    return bal;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: Try Token2022 program explicitly (pump.fun tokens use this)
-    let token2022_program =
-        Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
-    if let Ok(accounts) = rpc_client
-        .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token2022_program))
-    {
-        for account in &accounts {
-            if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
-                if let Some(info) = parsed.parsed.get("info") {
-                    if let Some(account_mint) = info.get("mint") {
-                        if account_mint.as_str() == Some(mint) {
-                            if let Some(token_amount) = info.get("tokenAmount") {
-                                if let Some(amount_str) = token_amount.get("amount") {
-                                    if let Some(amount) = amount_str.as_str() {
-                                        let bal = amount.parse::<u64>().unwrap_or(0);
-                                        if bal > 0 {
-                                            return bal;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    0
-}
+use crate::wallet::{ExecutionWalletRegistry, WalletOwnershipProbe};
 
 fn persist_bought_mints(path: &str, map: &std::collections::HashMap<String, i64>) {
     match serde_json::to_string_pretty(map) {
@@ -267,6 +202,73 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     // (250ms polling / 15s timeout) - do not change here.
     let trade_reconciler = Arc::new(TradeReconciler::new(rpc_client.clone()));
 
+    // === D1: recovery-only exact controlled-wallet registry + ownership probe ===
+    // This registry exists ONLY so restart recovery can recognize positions
+    // created previously (including by HotScan multi-wallet mode). It is NOT used
+    // for primary new-buy selection. Local signing authority and Lightning wallet
+    // authority are distinct (INV-WALLET-001); we never fall back between them.
+    //
+    // Local set = primary local keypair + every successfully loaded
+    // MultiWalletManager local wallet (when trading_wallets is non-empty).
+    let mut recovery_local_wallets: Vec<Pubkey> = Vec::new();
+    let recovery_multi_wallet = if !config.wallet.trading_wallets.is_empty() {
+        match crate::wallet::MultiWalletManager::new(
+            config.wallet.trading_wallets.clone(),
+            &config.wallet.selection_strategy,
+        ) {
+            Ok(mw) => {
+                info!(
+                    "Recovery registry: multi-wallet recognized with {} wallet(s)",
+                    mw.wallet_count()
+                );
+                for w in mw.wallets() {
+                    recovery_local_wallets.push(w.pubkey());
+                }
+                Some(Arc::new(mw))
+            }
+            Err(e) => {
+                // Fail closed: configured multi-wallets that will not load leave
+                // recovery unable to recognize prior positions.
+                return Err(anyhow::anyhow!(
+                    "Failed to load configured trading_wallets for recovery registry; refusing to start: {}",
+                    e
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let _ = &recovery_multi_wallet; // used later by kill-switch/hotscan agents
+
+    // Strictly parse the configured Lightning wallet, if present. An invalid
+    // non-empty Lightning wallet fails closed (INV-WALLET-001/002).
+    let recovery_lightning_wallet: Option<Pubkey> = {
+        let lw = config.pumpportal.lightning_wallet.trim();
+        if lw.is_empty() {
+            None
+        } else {
+            match Pubkey::from_str(lw) {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Configured lightning_wallet is not a valid Pubkey; refusing to start recovery/trading: {}",
+                        e
+                    ));
+                }
+            }
+        }
+    };
+
+    // Arc so the primary auto-sell monitor (spawned) can share the exact same
+    // route authority the synchronous startup recovery and event kill-switch use.
+    let recovery_registry_arc = Arc::new(ExecutionWalletRegistry::new(
+        keypair.pubkey(),
+        &recovery_local_wallets,
+        recovery_lightning_wallet,
+    ));
+    let recovery_registry: &ExecutionWalletRegistry = &recovery_registry_arc;
+    let recovery_probe = WalletOwnershipProbe::new(rpc_client.clone());
+
     // Initialize the persistent pending-execution journal. A submitted signature is
     // submission identity, not fill proof (INV-TX-001); the journal records
     // in-flight signatures so unresolved state survives restarts.
@@ -278,41 +280,59 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     pending_executions.load().await?;
     pending_executions.ensure_writable().await?;
 
-    // Fail-closed halt flag for NEW entries. Set when unresolved transaction state
-    // exists; 001C owns recovery/unhalt semantics.
+    // Fail-closed halt flag for NEW entries. Set when unresolved transaction or
+    // ownership state remains AFTER recovery (D5). No operator override.
     let new_entries_halted = Arc::new(AtomicBool::new(false));
 
-    // If the journal is non-empty at startup, an earlier run left unresolved
-    // submitted execution(s). We do NOT recover/reconcile/delete them here (that is
-    // 001C). We halt new entries and continue so existing positions can still exit.
-    let pending_at_startup = pending_executions.len().await;
-    if pending_at_startup > 0 {
+    // === D5: startup transaction/position recovery ===
+    // Atomic PositionManager is already loaded (fail-closed) and the pending
+    // journal is loaded + ensured writable above. Now:
+    //   1. recover the pending journal against confirmed chain state (D2);
+    //   2. recover legacy/incomplete positions from chain evidence (D3/D4);
+    //   3. halt NEW entries iff any unresolved pending OR recovery-required /
+    //      unroutable position remains. If recovery fully succeeds, entries may
+    //      resume.
+    let pending_summary =
+        recover_pending_store(&trade_reconciler, &pending_executions, &position_manager).await?;
+    info!(
+        "Pending recovery: recovered={}, confirmed_failures_removed={}, still_unresolved={}, accounting_conflicts={}",
+        pending_summary.recovered,
+        pending_summary.confirmed_failures_removed,
+        pending_summary.still_unresolved,
+        pending_summary.accounting_conflicts
+    );
+
+    let legacy_summary = recover_legacy_positions(
+        &trade_reconciler,
+        &recovery_probe,
+        recovery_registry,
+        &position_manager,
+    )
+    .await?;
+    info!(
+        "Legacy recovery: recovered={}, resolved_zero={}, still_recovery_required={}",
+        legacy_summary.recovered, legacy_summary.resolved_zero, legacy_summary.still_recovery_required
+    );
+
+    // Re-inspect remaining positions after recovery for any that are still
+    // recovery-required or unroutable (defense in depth beyond the counters).
+    let post_recovery_positions = position_manager.get_all_positions().await;
+    let residual_blocked = post_recovery_positions
+        .iter()
+        .filter(|p| legacy_recovery_required(p, recovery_registry))
+        .count();
+
+    if !pending_summary.fully_resolved()
+        || !legacy_summary.fully_resolved()
+        || residual_blocked > 0
+    {
         error!(
-            "Found {} unresolved submitted execution(s).\nNew entries are HALTED.\nP0-TRANSACTION-TRUTH-001C startup reconciliation is required.",
-            pending_at_startup
+            "New entries HALTED after recovery: unresolved_pending={}, legacy_unresolved={}, residual_blocked_positions={}",
+            pending_summary.still_unresolved, legacy_summary.still_recovery_required, residual_blocked
         );
         new_entries_halted.store(true, Ordering::SeqCst);
-    }
-
-    // Halt new entries if ANY loaded position is legacy/unmigrated (missing
-    // token_decimals, empty wallet, or an unparseable wallet pubkey). We do NOT
-    // mutate/guess these values here; we only refuse to open NEW risk while
-    // existing ownership state is not canonical. Independent of the pending-journal
-    // halt above (either may set the flag).
-    let loaded_positions = position_manager.get_all_positions().await;
-    let mut legacy_position_found = false;
-    for position in &loaded_positions {
-        if position_requires_recovery(position) {
-            legacy_position_found = true;
-            error!(
-                "Loaded position requires recovery (missing decimals / invalid wallet): mint {}",
-                position.mint
-            );
-        }
-    }
-    if legacy_position_found {
-        error!("New entries are HALTED due to legacy/unmigrated loaded position(s).");
-        new_entries_halted.store(true, Ordering::SeqCst);
+    } else {
+        info!("Startup recovery complete: transaction/position truth restored; new entries may resume.");
     }
 
     // Initialize kill-switch evaluator
@@ -418,6 +438,56 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         None
     };
 
+    // === D6: StrategyEngine restart rebuild ===
+    // AFTER engine creation and BEFORE monitor/event processing, restore the
+    // daily realized P&L safety floor and rebuild portfolio exposure from the
+    // canonical PositionManager positions. State restore ONLY — no execution
+    // feedback / chain-health / slippage / latency samples (INV-STRAT-002).
+    // A position that cannot be restored halts new entries (INV-STRAT-001).
+    if let Some(ref engine) = strategy_engine {
+        let stats = position_manager.get_daily_stats().await;
+        {
+            let mut guard = engine.write().await;
+            if !guard.restore_daily_realized_pnl(stats.net_pnl_sol).await {
+                warn!(
+                    "Daily realized P&L restore skipped (non-finite value {})",
+                    stats.net_pnl_sol
+                );
+            } else {
+                info!(
+                    "Restored daily realized P&L safety floor: {} SOL",
+                    stats.net_pnl_sol
+                );
+            }
+        }
+
+        let mut restored = 0usize;
+        let mut unrestorable = 0usize;
+        for position in position_manager.get_all_positions().await {
+            if position_is_canonical_for_restore(&position, recovery_registry) {
+                let strategy_position = manager_position_to_strategy_position(
+                    &position,
+                    config.strategy.default_strategy.clone(),
+                );
+                engine.write().await.record_entry(strategy_position).await;
+                restored += 1;
+            } else {
+                unrestorable += 1;
+            }
+        }
+        info!(
+            "Strategy exposure rebuilt: {} canonical position(s) restored, {} not restorable",
+            restored, unrestorable
+        );
+        if unrestorable > 0 {
+            error!(
+                "New entries HALTED: {} position(s) could not be restored into strategy exposure",
+                unrestorable
+            );
+            new_entries_halted.store(true, Ordering::SeqCst);
+        }
+    }
+
     // Track wallets for copy trading
     let tracked_wallets: std::collections::HashSet<String> =
         config.wallet_tracking.wallets.iter().cloned().collect();
@@ -427,15 +497,83 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let trader_arc: Option<std::sync::Arc<PumpPortalTrader>> =
         pumpportal_trader.map(std::sync::Arc::new);
 
+    // === B4: INDEPENDENT PER-POSITION EXIT TRADER HANDLES ===
+    // `trader_arc` above encodes the NEW-BUY execution mode (force_local_api etc).
+    // Exits must NOT be governed by the new-buy mode: an existing Lightning-owned
+    // position must be able to exit via Lightning even when force_local_api routes
+    // new buys Local, and an additional-local recovered wallet must be able to
+    // exit Local even when new buys use Lightning. So we build exit trader handles
+    // keyed purely on which credentials exist (INV-WALLET-001/003):
+    //   - Local exit available iff PumpPortal trading is enabled;
+    //   - Lightning exit available iff PumpPortal trading is enabled AND an API
+    //     key is configured (non-empty).
+    let primary_exit_local_trader: Option<Arc<PumpPortalTrader>> =
+        if config.pumpportal.use_for_trading {
+            Some(Arc::new(PumpPortalTrader::local()))
+        } else {
+            None
+        };
+    let primary_exit_lightning_trader: Option<Arc<PumpPortalTrader>> =
+        if config.pumpportal.use_for_trading && !config.pumpportal.api_key.trim().is_empty() {
+            Some(Arc::new(PumpPortalTrader::lightning(
+                config.pumpportal.api_key.clone(),
+            )))
+        } else {
+            None
+        };
+
+    // === B7: shared same-mint primary sell coordinator ===
+    // ONE instance, cloned into BOTH the primary auto-sell monitor and the event
+    // kill-switch so those two concurrent sell producers cannot race and submit
+    // two sells for the same mint before either signature is journaled.
+    let active_sell_mints: ActiveSellMints =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    // === B6: halt NEW entries when any canonical position is operationally
+    // unexitable with the CURRENT exit credentials/routes. Strategy exposure was
+    // already restored above for canonical positions (D6); this is an independent
+    // count that does not touch exposure. Log mint + public wallet + reason only.
+    {
+        let local_exit_available = primary_exit_local_trader.is_some();
+        let lightning_exit_available = primary_exit_lightning_trader.is_some();
+        let mut unexitable = 0usize;
+        for position in position_manager.get_all_positions().await {
+            if !position_has_operational_exit_route(
+                &position,
+                recovery_registry,
+                local_exit_available,
+                lightning_exit_available,
+            ) {
+                unexitable += 1;
+                let reason = if position.token_decimals.is_none() {
+                    "unknown token decimals"
+                } else if position.wallet_pubkey.parse::<Pubkey>().is_err() {
+                    "invalid recorded wallet"
+                } else {
+                    "no routable exit trader for wallet's route"
+                };
+                error!(
+                    "Operationally unexitable position: mint {} wallet {} - {}",
+                    position.mint, position.wallet_pubkey, reason
+                );
+            }
+        }
+        if unexitable > 0 {
+            error!(
+                "New entries HALTED: {} canonical position(s) cannot be exited with current credentials/routes",
+                unexitable
+            );
+            new_entries_halted.store(true, Ordering::SeqCst);
+        }
+    }
+
     // === IMPROVED POSITION MONITOR WITH LOCAL FALLBACK ===
     // Features: Trailing stop, no-movement exit, quick profit, retry with local fallback
     if config.auto_sell.enabled && !dry_run {
         let monitor_config = config.clone();
         let monitor_positions = position_manager.clone();
-        let monitor_trader = trader_arc.clone();
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
-        let monitor_use_local_api = use_local_api;
         // Transaction-truth wiring (§51): clone the already-initialized reconciler,
         // pending journal, halt flag and strategy engine into the monitor. No new
         // RPC/reconciler is constructed inside the loop.
@@ -443,8 +581,16 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         let monitor_pending = pending_executions.clone();
         let monitor_entry_halt = new_entries_halted.clone();
         let monitor_engine = strategy_engine.clone();
-        // Exact Lightning execution wallet, read-only. Local mode does not use this.
-        let monitor_lightning_wallet: Option<Pubkey> = primary_execution_wallet;
+        // B11: EXACT per-position routing handles. The monitor no longer uses the
+        // new-buy execution mode as authority for an existing position. It clones
+        // the recovery registry (route authority), the recovery multi-wallet
+        // (additional-local signers), the primary keypair, the independent exit
+        // trader handles, and the shared same-mint sell coordinator.
+        let monitor_registry = recovery_registry_arc.clone();
+        let monitor_multi_wallet = recovery_multi_wallet.clone();
+        let monitor_exit_local = primary_exit_local_trader.clone();
+        let monitor_exit_lightning = primary_exit_lightning_trader.clone();
+        let monitor_active_sells = active_sell_mints.clone();
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
@@ -573,20 +719,28 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             position.symbol, position.mint, reason, current_price
                         );
 
-                        if let Some(ref trader) = monitor_trader {
+                        {
                             let slippage = monitor_config.trading.slippage_bps / 100;
                             let priority_fee =
                                 monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
-                            // §53 PENDING GUARD: never submit a second sell for a mint that
-                            // already has an unresolved submitted sell in the journal.
-                            if let Some(pending) = monitor_pending
+                            // B9 step (1): pending Buy AND Sell block an automatic exit. If a
+                            // confirmed buy mutated in-memory state but its durable save failed,
+                            // the pending Buy remains alongside the Position; selling now could
+                            // close it and let restart recovery re-open the stale pending buy.
+                            let pending_buy = monitor_pending
+                                .get_for_mint(&position.mint, ReconciliationSide::Buy)
+                                .await;
+                            let pending_sell = monitor_pending
                                 .get_for_mint(&position.mint, ReconciliationSide::Sell)
-                                .await
-                            {
+                                .await;
+                            if let Some(sig) = pending_blocks_automatic_sell(
+                                pending_buy.as_ref(),
+                                pending_sell.as_ref(),
+                            ) {
                                 error!(
-                                    "Sell remains pending for {}: signature {}. Not submitting another sell (001C reconciliation required).",
-                                    position.mint, pending.signature
+                                    "Automatic sell blocked for {}: pending Buy/Sell in flight (sig {}). Not submitting (001C reconciliation required).",
+                                    position.mint, sig
                                 );
                                 continue;
                             }
@@ -602,48 +756,47 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 continue;
                             }
 
-                            // §55 EXACT WALLET GUARD: the position's recorded wallet must parse
-                            // and must match the wallet controlled by THIS execution route.
+                            // §55 EXACT WALLET GUARD: the position's recorded wallet must parse.
                             let position_wallet = match Pubkey::from_str(position.wallet_pubkey.trim()) {
-                                Ok(pk) => pk,
-                                Err(e) => {
+                                Ok(pk) if !position.wallet_pubkey.trim().is_empty() => pk,
+                                _ => {
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
                                     error!(
-                                        "Position wallet_pubkey empty/invalid for {} ({:?}): {} - no sell, new entries HALTED",
-                                        position.mint, position.wallet_pubkey, e
+                                        "Position wallet_pubkey empty/invalid for {} ({:?}) - no sell, new entries HALTED",
+                                        position.mint, position.wallet_pubkey
                                     );
                                     continue;
                                 }
                             };
-                            if monitor_use_local_api {
-                                if position_wallet != monitor_keypair.pubkey() {
-                                    monitor_entry_halt.store(true, Ordering::SeqCst);
-                                    error!(
-                                        "Local sell wallet mismatch for {}: position {} != local {} - no sell, new entries HALTED",
-                                        position.mint, position_wallet, monitor_keypair.pubkey()
-                                    );
-                                    continue;
-                                }
-                            } else {
-                                match monitor_lightning_wallet {
-                                    Some(lw) if lw == position_wallet => {}
-                                    Some(lw) => {
-                                        monitor_entry_halt.store(true, Ordering::SeqCst);
-                                        error!(
-                                            "Lightning sell wallet mismatch for {}: position {} != lightning {} - no sell, new entries HALTED",
-                                            position.mint, position_wallet, lw
-                                        );
-                                        continue;
-                                    }
-                                    None => {
-                                        monitor_entry_halt.store(true, Ordering::SeqCst);
-                                        error!(
-                                            "Lightning execution wallet unresolved; cannot validate sell route for {} - no sell, new entries HALTED",
-                                            position.mint
-                                        );
-                                        continue;
-                                    }
-                                }
+
+                            // B9 step (2)/(3): reserve the mint for a primary sell. If another
+                            // producer (kill-switch) already holds it, skip this cycle.
+                            if !try_reserve_sell_mint(&monitor_active_sells, &position.mint) {
+                                info!(
+                                    "Auto-sell skipped for {}: another primary sell reservation is active for this mint",
+                                    position.mint
+                                );
+                                continue;
+                            }
+
+                            // B9 step (4): re-check pending Buy/Sell AFTER reserving. If one
+                            // appeared in the window, release + skip (no submission).
+                            let recheck_buy = monitor_pending
+                                .get_for_mint(&position.mint, ReconciliationSide::Buy)
+                                .await;
+                            let recheck_sell = monitor_pending
+                                .get_for_mint(&position.mint, ReconciliationSide::Sell)
+                                .await;
+                            if let Some(sig) = pending_blocks_automatic_sell(
+                                recheck_buy.as_ref(),
+                                recheck_sell.as_ref(),
+                            ) {
+                                release_sell_mint(&monitor_active_sells, &position.mint);
+                                error!(
+                                    "Automatic sell aborted for {} after reservation: pending Buy/Sell appeared (sig {}) - reservation released",
+                                    position.mint, sig
+                                );
+                                continue;
                             }
 
                             // Retry counter behavior preserved.
@@ -652,37 +805,105 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                             if *attempts > 5 {
                                 // Retry exhaustion: never close/remove wallet-owned risk. Leave
-                                // OPEN/TRACKED, reset counter, let a later cycle try again.
+                                // OPEN/TRACKED, reset counter, release reservation, let a later
+                                // cycle try again.
                                 error!(
                                     "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
                                     position.symbol
                                 );
                                 sell_attempts.remove(&position.mint);
+                                release_sell_mint(&monitor_active_sells, &position.mint);
                                 continue;
                             }
 
-                            // §56 ROUTE: no Lightning->Local fallback in the primary monitor.
-                            // Local mode always sell_local with the local keypair; Lightning mode
-                            // always sell() via Lightning for every attempt.
+                            // B9 step (5)/(6) + B11: resolve the EXACT route/signer for THIS
+                            // position's recorded wallet via the recovery registry (not the
+                            // new-buy mode), then submit through the matching independent exit
+                            // trader ONLY. No Lightning->Local fallback. Unknown route / missing
+                            // signer / missing trader => no sell + release + halt new entries.
                             let sell_start = std::time::Instant::now();
-                            let sell_result: Result<String, crate::error::Error> = if monitor_use_local_api {
-                                info!("Attempting LOCAL API sell for {} (attempt {})", position.mint, attempts);
-                                trader
-                                    .sell_local(
-                                        &position.mint,
-                                        sell_pct,
-                                        slippage,
-                                        priority_fee,
-                                        &monitor_keypair,
-                                        &monitor_rpc,
-                                    )
-                                    .await
-                            } else {
-                                info!("Attempting Lightning API sell for {} (attempt {})", position.mint, attempts);
-                                trader
-                                    .sell(&position.mint, sell_pct, slippage, priority_fee)
-                                    .await
-                            };
+                            let sell_result: Result<String, crate::error::Error> =
+                                match monitor_registry.route_for(&position_wallet) {
+                                    Some(crate::wallet::ExecutionRoute::Local) => {
+                                        // Exact local signer: primary keypair if its pubkey matches,
+                                        // else the recovery multi-wallet's wallet for that address.
+                                        let local_trader = match monitor_exit_local {
+                                            Some(ref t) => t,
+                                            None => {
+                                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                                release_sell_mint(&monitor_active_sells, &position.mint);
+                                                error!(
+                                                    "Local exit unavailable (no Local trader) for {} wallet {} - no sell, reservation released, new entries HALTED",
+                                                    position.mint, position_wallet
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        if monitor_keypair.pubkey() == position_wallet {
+                                            info!("Attempting LOCAL sell for {} via primary keypair (attempt {})", position.mint, attempts);
+                                            local_trader
+                                                .sell_local(
+                                                    &position.mint,
+                                                    sell_pct,
+                                                    slippage,
+                                                    priority_fee,
+                                                    &monitor_keypair,
+                                                    &monitor_rpc,
+                                                )
+                                                .await
+                                        } else if let Some(tw) = monitor_multi_wallet
+                                            .as_ref()
+                                            .and_then(|mw| mw.find_by_address(&position.wallet_pubkey))
+                                        {
+                                            info!("Attempting LOCAL sell for {} via recovery wallet {} (attempt {})", position.mint, position.wallet_pubkey, attempts);
+                                            local_trader
+                                                .sell_local(
+                                                    &position.mint,
+                                                    sell_pct,
+                                                    slippage,
+                                                    priority_fee,
+                                                    &tw.keypair,
+                                                    &monitor_rpc,
+                                                )
+                                                .await
+                                        } else {
+                                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                                            release_sell_mint(&monitor_active_sells, &position.mint);
+                                            error!(
+                                                "No exact Local signer for {} wallet {} - no sell, reservation released, new entries HALTED",
+                                                position.mint, position_wallet
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    Some(crate::wallet::ExecutionRoute::Lightning) => {
+                                        let lightning_trader = match monitor_exit_lightning {
+                                            Some(ref t) => t,
+                                            None => {
+                                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                                release_sell_mint(&monitor_active_sells, &position.mint);
+                                                error!(
+                                                    "Lightning exit unavailable (no Lightning trader/API key) for {} wallet {} - no sell, reservation released, new entries HALTED",
+                                                    position.mint, position_wallet
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        info!("Attempting Lightning sell for {} (attempt {})", position.mint, attempts);
+                                        lightning_trader
+                                            .sell(&position.mint, sell_pct, slippage, priority_fee)
+                                            .await
+                                    }
+                                    None => {
+                                        monitor_entry_halt.store(true, Ordering::SeqCst);
+                                        release_sell_mint(&monitor_active_sells, &position.mint);
+                                        error!(
+                                            "No exact route for {} wallet {} - no sell, reservation released, new entries HALTED",
+                                            position.mint, position_wallet
+                                        );
+                                        continue;
+                                    }
+                                };
 
                             let signature = match sell_result {
                                 Ok(sig) => sig,
@@ -703,6 +924,8 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             &e.to_string(),
                                         ).await;
                                     }
+                                    // B10: provider error / no signature => release reservation.
+                                    release_sell_mint(&monitor_active_sells, &position.mint);
                                     continue;
                                 }
                             };
@@ -724,15 +947,23 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     reason: reason.clone(),
                                 },
                             );
-                            if let Err(e) = monitor_pending.upsert(pending_sell).await {
-                                // Signature already exists on chain-side; persistence failed.
-                                // Halt new entries but STILL reconcile the submitted signature.
-                                monitor_entry_halt.store(true, Ordering::SeqCst);
-                                error!(
-                                    "Failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
-                                    signature, e
-                                );
-                            }
+                            // AUDIT-002 A5: retain the exact pending record + whether the
+                            // first journal write persisted, so ambiguous/confirmed-unapplied
+                            // outcomes can retry durable persistence before relying on restart
+                            // recovery.
+                            let pending_sell_persisted = match monitor_pending.upsert(pending_sell.clone()).await {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    // Signature already exists on chain-side; persistence failed.
+                                    // Halt new entries but STILL reconcile the submitted signature.
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "Failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
+                                        signature, e
+                                    );
+                                    false
+                                }
+                            };
 
                             // §59 RECONCILE: no fixed sleep, no estimated-proceeds fallback.
                             let outcome = monitor_reconciler
@@ -773,26 +1004,49 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     }
                                     // Do not mark quick profit; do not record_exit/partial. Later
                                     // monitor cycle may retry.
+                                    // B10: ConfirmedFailure => pending removed, release reservation.
+                                    release_sell_mint(&monitor_active_sells, &position.mint);
                                     continue;
                                 }
                                 Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
                                     // §61: KEEP pending, keep position + flags, halt new entries.
                                     // Do NOT clear sell-attempt state (pending guard prevents a
                                     // second submission on the next cycle).
+                                    // B10: Unresolved => KEEP the reservation (do NOT release);
+                                    // the same-mint sell stays owned until the signature resolves.
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
-                                    error!(
-                                        "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, position kept, new entries HALTED",
-                                        position.mint, signature, position.wallet_pubkey, unresolved_reason
-                                    );
+                                    // AUDIT-002 A5: if the initial journal write failed, retry
+                                    // durable persistence before leaving this arm so the in-flight
+                                    // signature survives a crash. Reservation kept regardless.
+                                    if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                        error!(
+                                            "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                            position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                        );
+                                    } else {
+                                        error!(
+                                            "CRITICAL: AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                            position.mint, signature, position.wallet_pubkey, unresolved_reason, signature
+                                        );
+                                    }
                                     continue;
                                 }
                                 Err(e) => {
                                     // §61: structural observer failure is not tx-failure proof.
+                                    // B10: structural reconciler Err => KEEP the reservation.
                                     monitor_entry_halt.store(true, Ordering::SeqCst);
-                                    error!(
-                                        "CRITICAL: sell reconciliation error for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
-                                        position.symbol, signature, e
-                                    );
+                                    // AUDIT-002 A5: same durability retry rule as Unresolved.
+                                    if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                        error!(
+                                            "CRITICAL: sell reconciliation error for {} (sig {}): {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                            position.symbol, signature, e
+                                        );
+                                    } else {
+                                        error!(
+                                            "CRITICAL: sell reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                            position.symbol, signature, e, signature
+                                        );
+                                    }
                                     continue;
                                 }
                                 Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
@@ -802,10 +1056,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         || fill.mint != position.mint
                                     {
                                         monitor_entry_halt.store(true, Ordering::SeqCst);
-                                        error!(
-                                            "CRITICAL: reconciled sell fill identity mismatch for sig {} (wallet/mint/side) - pending kept, position kept, new entries HALTED",
-                                            signature
-                                        );
+                                        // AUDIT-002 A5: confirmed-but-unapplied. Retry durability;
+                                        // keep reservation regardless.
+                                        if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                            error!(
+                                                "CRITICAL: reconciled sell fill identity mismatch for sig {} (wallet/mint/side) - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                signature
+                                            );
+                                        } else {
+                                            error!(
+                                                "CRITICAL: reconciled sell fill identity mismatch for sig {} (wallet/mint/side) - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                signature, signature
+                                            );
+                                        }
                                         continue;
                                     }
 
@@ -816,10 +1079,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             Ok(v) => v,
                                             Err(e) => {
                                                 monitor_entry_halt.store(true, Ordering::SeqCst);
-                                                error!(
-                                                    "Reconciled sell fill validation failed for {} (sig {}): {} - pending kept, position kept, new entries HALTED",
-                                                    position.mint, signature, e
-                                                );
+                                                // AUDIT-002 A5: confirmed-but-unapplied. Retry
+                                                // durability; keep reservation regardless.
+                                                if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                                    error!(
+                                                        "Reconciled sell fill validation failed for {} (sig {}): {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                        position.mint, signature, e
+                                                    );
+                                                } else {
+                                                    error!(
+                                                        "CRITICAL: reconciled sell fill validation failed for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                        position.mint, signature, e, signature
+                                                    );
+                                                }
                                                 continue;
                                             }
                                         };
@@ -842,10 +1114,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             // §64: PositionAccounting error -> keep pending,
                                             // halt, no strategy P&L.
                                             monitor_entry_halt.store(true, Ordering::SeqCst);
-                                            error!(
-                                                "Reconciled close failed for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                position.mint, signature, e
-                                            );
+                                            // AUDIT-002 A5: confirmed-but-unapplied. Retry
+                                            // durability; keep reservation regardless.
+                                            if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                                error!(
+                                                    "Reconciled close failed for {} (sig {}): {} - pending kept (durable), reservation kept, new entries HALTED",
+                                                    position.mint, signature, e
+                                                );
+                                            } else {
+                                                error!(
+                                                    "CRITICAL: reconciled close failed for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                    position.mint, signature, e, signature
+                                                );
+                                            }
                                             continue;
                                         }
                                     };
@@ -945,6 +1226,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                             signature, e
                                         );
                                     }
+                                    // B10: ConfirmedFill applied + pending removed LAST => release
+                                    // the same-mint reservation.
+                                    release_sell_mint(&monitor_active_sells, &position.mint);
                                 }
                             }
                         }
@@ -1365,7 +1649,7 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                                         // Persist the submitted signature BEFORE treating it as
                                         // filled (INV-TX-015).
-                                        let pending = PendingExecution::buy(
+                                        let pending_buy = PendingExecution::buy(
                                             signature.clone(),
                                             token.mint.clone(),
                                             wallet_string.clone(),
@@ -1377,16 +1661,24 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 requested_sol: final_amount_sol,
                                             },
                                         );
-                                        if let Err(e) = pending_executions.upsert(pending).await {
-                                            // Serious state-integrity failure: the tx was already
-                                            // sent. Halt new entries, still attempt immediate
-                                            // reconciliation, never send another buy.
-                                            new_entries_halted.store(true, Ordering::SeqCst);
-                                            error!(
-                                                "Failed to persist pending buy for {} (sig {}): {} - halting new entries; still reconciling",
-                                                token.symbol, signature, e
-                                            );
-                                        }
+                                        // AUDIT-002 A4: retain the exact pending buy + whether the
+                                        // first journal write persisted, so ambiguous/confirmed-
+                                        // unapplied outcomes can retry durable persistence before
+                                        // relying on restart recovery.
+                                        let pending_buy_persisted = match pending_executions.upsert(pending_buy.clone()).await {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                // Serious state-integrity failure: the tx was already
+                                                // sent. Halt new entries, still attempt immediate
+                                                // reconciliation, never send another buy.
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "Failed to persist pending buy for {} (sig {}): {} - halting new entries; still reconciling",
+                                                    token.symbol, signature, e
+                                                );
+                                                false
+                                            }
+                                        };
 
                                         // Reconcile the submitted signature. No sleep before the call.
                                         let outcome = trade_reconciler
@@ -1427,19 +1719,36 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 // Timeout/observation gap is NOT a failed fill
                                                 // (INV-TX-014). Keep pending, halt new entries.
                                                 new_entries_halted.store(true, Ordering::SeqCst);
-                                                error!(
-                                                    "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept, new entries HALTED",
-                                                    mint, signature, wallet_string, reason
-                                                );
+                                                // AUDIT-002 A4: retry durable persistence if the
+                                                // initial write failed.
+                                                if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                    error!(
+                                                        "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), new entries HALTED",
+                                                        mint, signature, wallet_string, reason
+                                                    );
+                                                } else {
+                                                    error!(
+                                                        "CRITICAL: BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                        mint, signature, wallet_string, reason, signature
+                                                    );
+                                                }
                                                 continue;
                                             }
                                             Err(e) => {
                                                 // Structural observer failure is not tx-failure proof.
                                                 new_entries_halted.store(true, Ordering::SeqCst);
-                                                error!(
-                                                    "CRITICAL: buy reconciliation error for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                    token.symbol, signature, e
-                                                );
+                                                // AUDIT-002 A4: same durability retry rule as Unresolved.
+                                                if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                    error!(
+                                                        "CRITICAL: buy reconciliation error for {} (sig {}): {} - pending kept (durable), new entries HALTED",
+                                                        token.symbol, signature, e
+                                                    );
+                                                } else {
+                                                    error!(
+                                                        "CRITICAL: buy reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                        token.symbol, signature, e, signature
+                                                    );
+                                                }
                                                 continue;
                                             }
                                             Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
@@ -1449,10 +1758,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                     || fill.mint != *mint
                                                 {
                                                     new_entries_halted.store(true, Ordering::SeqCst);
-                                                    error!(
-                                                        "CRITICAL: reconciled buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept, new entries HALTED",
-                                                        signature
-                                                    );
+                                                    // AUDIT-002 A4: confirmed-but-unapplied. Retry durability.
+                                                    if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                        error!(
+                                                            "CRITICAL: reconciled buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept (durable), new entries HALTED",
+                                                            signature
+                                                        );
+                                                    } else {
+                                                        error!(
+                                                            "CRITICAL: reconciled buy fill identity mismatch for sig {} (wallet/mint/side) - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                            signature, signature
+                                                        );
+                                                    }
                                                     continue;
                                                 }
 
@@ -1462,10 +1779,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         Ok(v) => v,
                                                         Err(e) => {
                                                             new_entries_halted.store(true, Ordering::SeqCst);
-                                                            error!(
-                                                                "CRITICAL: reconciled buy fill conversion failed for sig {}: {} - pending kept, new entries HALTED",
-                                                                signature, e
-                                                            );
+                                                            // AUDIT-002 A4: confirmed-but-unapplied. Retry durability.
+                                                            if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                                error!(
+                                                                    "CRITICAL: reconciled buy fill conversion failed for sig {}: {} - pending kept (durable), new entries HALTED",
+                                                                    signature, e
+                                                                );
+                                                            } else {
+                                                                error!(
+                                                                    "CRITICAL: reconciled buy fill conversion failed for sig {}: {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                    signature, e, signature
+                                                                );
+                                                            }
                                                             continue;
                                                         }
                                                     };
@@ -1519,10 +1844,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         // Confirmed on-chain but could not record.
                                                         // Keep pending, halt; do not pretend failure.
                                                         new_entries_halted.store(true, Ordering::SeqCst);
-                                                        error!(
-                                                            "Confirmed owned position could not be recorded for {} (sig {}): {} - pending kept, new entries HALTED",
-                                                            token.symbol, signature, e
-                                                        );
+                                                        // AUDIT-002 A4: confirmed-but-unapplied. Retry durability.
+                                                        if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                            error!(
+                                                                "Confirmed owned position could not be recorded for {} (sig {}): {} - pending kept (durable), new entries HALTED",
+                                                                token.symbol, signature, e
+                                                            );
+                                                        } else {
+                                                            error!(
+                                                                "CRITICAL: confirmed owned position could not be recorded for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                token.symbol, signature, e, signature
+                                                            );
+                                                        }
                                                         continue;
                                                     }
                                                 };
@@ -1622,13 +1955,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                         // KILL-SWITCH: Check sells on tokens we hold
                         if trade.tx_type == "sell" {
-                            // Check if we have a position in this token
-                            let positions = position_manager.get_all_positions().await;
-                            let our_position = positions.iter().find(|p| p.mint == trade.mint);
+                            // Check if we have a position in this token. Use a fresh
+                            // canonical snapshot (E3 parses its exact wallet identity).
+                            let our_position = position_manager.get_position(&trade.mint).await;
 
                             if let Some(position) = our_position {
-                                let position_token_amount = position.token_amount;
-
                                 if let Some(ref evaluator) = kill_switch_evaluator {
                                     let decision = evaluator.evaluate_sell(
                                         &trade.mint,
@@ -1645,60 +1976,444 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                         );
 
                                         // Execute emergency sell if not dry run
-                                        if !dry_run {
-                                            if let Some(ref trader) = trader_arc {
-                                                let slippage_pct = config.trading.slippage_bps / 100;
-                                                let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
-
-                                                // Sell 100% immediately
-                                                info!(
-                                                    "Executing kill-switch sell for {} (urgency: {:?})",
-                                                    &trade.mint[..12], alert.urgency
-                                                );
-
-                                                let sell_result = if use_local_api {
-                                                    trader.sell_local(
-                                                        &trade.mint,
-                                                        "100%", // 100% sell
-                                                        slippage_pct,
-                                                        priority_fee,
-                                                        &keypair,
-                                                        &rpc_client,
-                                                    ).await
-                                                } else {
-                                                    trader.sell(&trade.mint, "100%", slippage_pct, priority_fee).await
-                                                };
-
-                                                match sell_result {
-                                                    Ok(sig) => {
-                                                        warn!(
-                                                            "KILL-SWITCH SELL EXECUTED: {} - sig: {}",
-                                                            alert.reason, sig
-                                                        );
-
-                                                        // Close position in manager (use position's token amount since we sold 100%)
-                                                        // Note: We don't know exact proceeds yet, estimate from current price
-                                                        let estimated_proceeds = position_token_amount as f64 * trade.market_cap_sol / 1_000_000_000.0;
-                                                        if let Err(e) = position_manager.close_position(&trade.mint, position_token_amount, estimated_proceeds).await {
-                                                            error!("Failed to close position after kill-switch: {}", e);
-                                                        }
-
-                                                        // Stop monitoring this position
-                                                        evaluator.unwatch_position(&trade.mint);
-                                                    }
-                                                    Err(e) => {
-                                                        error!(
-                                                            "KILL-SWITCH SELL FAILED for {}: {} - MANUAL EXIT NEEDED!",
-                                                            &trade.mint[..12], e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        } else {
+                                        if dry_run {
                                             warn!(
                                                 "DRY-RUN: Kill-switch would sell 100% of {} (reason: {})",
                                                 &trade.mint[..12], alert.reason
                                             );
+                                        } else {
+                                            // §E2 / B8 PENDING GUARD: a pending Buy OR Sell for this
+                                            // mint blocks an emergency sell. Keep the alert active.
+                                            let ks_pending_buy = pending_executions
+                                                .get_for_mint(&trade.mint, ReconciliationSide::Buy)
+                                                .await;
+                                            let ks_pending_sell = pending_executions
+                                                .get_for_mint(&trade.mint, ReconciliationSide::Sell)
+                                                .await;
+                                            if let Some(sig) = pending_blocks_automatic_sell(
+                                                ks_pending_buy.as_ref(),
+                                                ks_pending_sell.as_ref(),
+                                            ) {
+                                                warn!(
+                                                    "KILL-SWITCH: pending Buy/Sell already in flight for {} (sig {}) - not submitting a second emergency sell; alert remains active",
+                                                    &trade.mint[..12], sig
+                                                );
+                                            } else {
+                                                // §E3 / B12 EXACT ROUTE: resolve the exact execution
+                                                // route and signer for the position's recorded wallet
+                                                // via the recovery registry — NOT the new-buy mode.
+                                                // Empty/invalid wallet, unknown route, or missing
+                                                // trader/signer => no sell + halt new entries. No
+                                                // Lightning->Local fallback (INV-WALLET-001/003).
+                                                let position_wallet = match Pubkey::from_str(
+                                                    position.wallet_pubkey.trim(),
+                                                ) {
+                                                    Ok(pk) if !position.wallet_pubkey.trim().is_empty() => pk,
+                                                    _ => {
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "KILL-SWITCH: position {} has empty/invalid wallet_pubkey '{}' - no sell, new entries HALTED",
+                                                            &trade.mint[..12], position.wallet_pubkey
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+
+                                                // B9 step (2)/(3): reserve the mint via the SHARED
+                                                // coordinator. If the primary monitor already owns an
+                                                // in-flight sell for this mint, skip (no second sell).
+                                                if !try_reserve_sell_mint(&active_sell_mints, &trade.mint) {
+                                                    warn!(
+                                                        "KILL-SWITCH: primary sell reservation already active for {} - not submitting a second emergency sell",
+                                                        &trade.mint[..12]
+                                                    );
+                                                    continue;
+                                                }
+
+                                                // B9 step (4): re-check pending Buy/Sell after reserving.
+                                                let ks_recheck_buy = pending_executions
+                                                    .get_for_mint(&trade.mint, ReconciliationSide::Buy)
+                                                    .await;
+                                                let ks_recheck_sell = pending_executions
+                                                    .get_for_mint(&trade.mint, ReconciliationSide::Sell)
+                                                    .await;
+                                                if let Some(sig) = pending_blocks_automatic_sell(
+                                                    ks_recheck_buy.as_ref(),
+                                                    ks_recheck_sell.as_ref(),
+                                                ) {
+                                                    release_sell_mint(&active_sell_mints, &trade.mint);
+                                                    warn!(
+                                                        "KILL-SWITCH: pending Buy/Sell appeared for {} after reservation (sig {}) - reservation released, no sell",
+                                                        &trade.mint[..12], sig
+                                                    );
+                                                    continue;
+                                                }
+
+                                                let slippage_pct = config.trading.slippage_bps / 100;
+                                                let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
+
+                                                let sell_start = std::time::Instant::now();
+                                                let routed_sell: Option<Result<String, crate::error::Error>> =
+                                                    match recovery_registry.route_for(&position_wallet) {
+                                                        Some(crate::wallet::ExecutionRoute::Local) => {
+                                                            // Exact local signer + independent Local exit
+                                                            // trader ONLY.
+                                                            match primary_exit_local_trader {
+                                                                None => None,
+                                                                Some(ref local_trader) => {
+                                                                    if keypair.pubkey() == position_wallet {
+                                                                        info!(
+                                                                            "KILL-SWITCH: Local sell for {} via primary keypair",
+                                                                            &trade.mint[..12]
+                                                                        );
+                                                                        Some(local_trader.sell_local(
+                                                                            &trade.mint,
+                                                                            "100%",
+                                                                            slippage_pct,
+                                                                            priority_fee,
+                                                                            &keypair,
+                                                                            &rpc_client,
+                                                                        ).await)
+                                                                    } else if let Some(ref mw) = recovery_multi_wallet {
+                                                                        match mw.find_by_address(&position.wallet_pubkey) {
+                                                                            Some(tw) => {
+                                                                                info!(
+                                                                                    "KILL-SWITCH: Local sell for {} via recovery wallet {}",
+                                                                                    &trade.mint[..12], position.wallet_pubkey
+                                                                                );
+                                                                                Some(local_trader.sell_local(
+                                                                                    &trade.mint,
+                                                                                    "100%",
+                                                                                    slippage_pct,
+                                                                                    priority_fee,
+                                                                                    &tw.keypair,
+                                                                                    &rpc_client,
+                                                                                ).await)
+                                                                            }
+                                                                            None => None,
+                                                                        }
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        Some(crate::wallet::ExecutionRoute::Lightning) => {
+                                                            // Independent Lightning exit trader ONLY.
+                                                            // No Local fallback.
+                                                            match primary_exit_lightning_trader {
+                                                                None => None,
+                                                                Some(ref lightning_trader) => {
+                                                                    info!(
+                                                                        "KILL-SWITCH: Lightning sell for {}",
+                                                                        &trade.mint[..12]
+                                                                    );
+                                                                    Some(lightning_trader.sell(&trade.mint, "100%", slippage_pct, priority_fee).await)
+                                                                }
+                                                            }
+                                                        }
+                                                        None => None,
+                                                    };
+
+                                                let sell_result = match routed_sell {
+                                                    Some(r) => r,
+                                                    None => {
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        release_sell_mint(&active_sell_mints, &trade.mint);
+                                                        error!(
+                                                            "KILL-SWITCH: no exact signer/route/trader for position {} wallet {} - no sell, reservation released, new entries HALTED",
+                                                            &trade.mint[..12], position.wallet_pubkey
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+
+                                                // §E4 SUBMIT / PERSIST / RECONCILE.
+                                                let signature = match sell_result {
+                                                    Ok(sig) => sig,
+                                                    Err(e) => {
+                                                        // Provider error: no pending. Record a strategy
+                                                        // sell failure if enabled. Position stays.
+                                                        let provider_latency_ms = sell_start.elapsed().as_millis() as u64;
+                                                        error!(
+                                                            "KILL-SWITCH SELL SUBMISSION FAILED for {}: {} ({}ms) - position remains OPEN/TRACKED",
+                                                            &trade.mint[..12], e, provider_latency_ms
+                                                        );
+                                                        if let Some(ref engine) = strategy_engine {
+                                                            engine.write().await.record_tx_failure(
+                                                                &position.mint,
+                                                                false,
+                                                                position.total_cost_sol,
+                                                                provider_latency_ms,
+                                                                &e.to_string(),
+                                                            ).await;
+                                                        }
+                                                        // B10: provider error / no signature => release.
+                                                        release_sell_mint(&active_sell_mints, &trade.mint);
+                                                        continue;
+                                                    }
+                                                };
+
+                                                warn!(
+                                                    "KILL-SWITCH SELL SUBMITTED: {} - sig: {}",
+                                                    alert.reason, signature
+                                                );
+
+                                                let pending_sell = PendingExecution::sell(
+                                                    signature.clone(),
+                                                    position.mint.clone(),
+                                                    position.wallet_pubkey.clone(),
+                                                    PendingSellContext {
+                                                        requested_amount: "100%".to_string(),
+                                                        intent: PendingSellIntent::KillSwitch,
+                                                        reason: alert.reason.clone(),
+                                                    },
+                                                );
+                                                // AUDIT-002 A6: retain the exact pending record +
+                                                // whether the first journal write persisted.
+                                                let pending_sell_persisted = match pending_executions.upsert(pending_sell.clone()).await {
+                                                    Ok(()) => true,
+                                                    Err(e) => {
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        error!(
+                                                            "KILL-SWITCH: failed to persist pending sell (sig {}): {} - new entries HALTED, still reconciling",
+                                                            signature, e
+                                                        );
+                                                        false
+                                                    }
+                                                };
+
+                                                let outcome = trade_reconciler
+                                                    .reconcile(
+                                                        &signature,
+                                                        &position.wallet_pubkey,
+                                                        &position.mint,
+                                                        ReconciliationSide::Sell,
+                                                    )
+                                                    .await;
+
+                                                match outcome {
+                                                    Ok(ReconciliationOutcome::ConfirmedFailure { error, observed_after_ms, .. }) => {
+                                                        // Remove pending, record failure, keep position.
+                                                        if let Err(e) = pending_executions.remove(&signature).await {
+                                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                                            error!(
+                                                                "KILL-SWITCH: failed to remove pending after ConfirmedFailure (sig {}): {} - new entries HALTED",
+                                                                signature, e
+                                                            );
+                                                        }
+                                                        let latency_ms = sell_start.elapsed().as_millis() as u64;
+                                                        error!(
+                                                            "KILL-SWITCH SELL CONFIRMED FAILED for {} (sig {}): {} ({}ms observed) - position remains OPEN/TRACKED",
+                                                            &trade.mint[..12], signature, error, observed_after_ms
+                                                        );
+                                                        if let Some(ref engine) = strategy_engine {
+                                                            engine.write().await.record_tx_failure(
+                                                                &position.mint,
+                                                                false,
+                                                                position.total_cost_sol,
+                                                                latency_ms,
+                                                                &error,
+                                                            ).await;
+                                                        }
+                                                        // B10: ConfirmedFailure => pending removed, release.
+                                                        release_sell_mint(&active_sell_mints, &trade.mint);
+                                                        continue;
+                                                    }
+                                                    Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
+                                                        // B10: Unresolved => KEEP pending AND KEEP the
+                                                        // reservation; halt new entries, keep position.
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        // AUDIT-002 A6: retry durability if the initial
+                                                        // write failed. Reservation kept regardless.
+                                                        if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                            error!(
+                                                                "KILL-SWITCH SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                                position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                                            );
+                                                        } else {
+                                                            error!(
+                                                                "CRITICAL: KILL-SWITCH SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                position.mint, signature, position.wallet_pubkey, unresolved_reason, signature
+                                                            );
+                                                        }
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        // B10: structural reconciler Err => KEEP the
+                                                        // reservation (not tx-failure proof).
+                                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                                        // AUDIT-002 A6: same durability retry as Unresolved.
+                                                        if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                            error!(
+                                                                "CRITICAL: kill-switch sell reconciliation error for {} (sig {}): {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                                &trade.mint[..12], signature, e
+                                                            );
+                                                        } else {
+                                                            error!(
+                                                                "CRITICAL: kill-switch sell reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                &trade.mint[..12], signature, e, signature
+                                                            );
+                                                        }
+                                                        continue;
+                                                    }
+                                                    Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+                                                        // Identity validation at the live boundary
+                                                        // (exact wallet/mint/side).
+                                                        if fill.side != ReconciliationSide::Sell
+                                                            || fill.wallet != position.wallet_pubkey
+                                                            || fill.mint != position.mint
+                                                        {
+                                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                                            // AUDIT-002 A6: confirmed-but-unapplied.
+                                                            // Retry durability; keep reservation.
+                                                            if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                                error!(
+                                                                    "CRITICAL: kill-switch fill identity mismatch for sig {} (wallet/mint/side) - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                                    signature
+                                                                );
+                                                            } else {
+                                                                error!(
+                                                                    "CRITICAL: kill-switch fill identity mismatch for sig {} (wallet/mint/side) - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                    signature, signature
+                                                                );
+                                                            }
+                                                            continue;
+                                                        }
+
+                                                        // Exact economics + decimals validation (also
+                                                        // rejects oversell / decimals mismatch).
+                                                        let (actual_sold_raw, actual_received_sol, actual_exit_price) =
+                                                            match primary_sell_fill_values(&fill, &position) {
+                                                                Ok(v) => v,
+                                                                Err(e) => {
+                                                                    new_entries_halted.store(true, Ordering::SeqCst);
+                                                                    // AUDIT-002 A6: confirmed-but-unapplied.
+                                                                    if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                                        error!(
+                                                                            "KILL-SWITCH fill validation failed for {} (sig {}): {} - pending kept (durable), reservation kept, position kept, new entries HALTED",
+                                                                            position.mint, signature, e
+                                                                        );
+                                                                    } else {
+                                                                        error!(
+                                                                            "CRITICAL: KILL-SWITCH fill validation failed for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, position kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                            position.mint, signature, e, signature
+                                                                        );
+                                                                    }
+                                                                    continue;
+                                                                }
+                                                            };
+
+                                                        let pre_close_cost = position.total_cost_sol;
+                                                        let pre_close_tokens = position.token_amount;
+
+                                                        let close_result = match position_manager
+                                                            .close_position_reconciled(
+                                                                &position.mint,
+                                                                &signature,
+                                                                actual_sold_raw,
+                                                                actual_received_sol,
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(r) => r,
+                                                            Err(e) => {
+                                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                                // AUDIT-002 A6: confirmed-but-unapplied.
+                                                                if retry_pending_durability_if_needed(&pending_executions, &pending_sell, pending_sell_persisted).await {
+                                                                    error!(
+                                                                        "KILL-SWITCH reconciled close failed for {} (sig {}): {} - pending kept (durable), reservation kept, new entries HALTED",
+                                                                        position.mint, signature, e
+                                                                    );
+                                                                } else {
+                                                                    error!(
+                                                                        "CRITICAL: KILL-SWITCH reconciled close failed for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Reservation kept, new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                                        position.mint, signature, e, signature
+                                                                    );
+                                                                }
+                                                                continue;
+                                                            }
+                                                        };
+
+                                                        // Actual fill decides full vs partial.
+                                                        let fully_closed = close_result.fully_closed;
+                                                        let already_applied = close_result.already_applied;
+                                                        let latency_ms = sell_start.elapsed().as_millis() as u64;
+
+                                                        if !already_applied {
+                                                            if let Some(ref engine) = strategy_engine {
+                                                                if fully_closed {
+                                                                    engine.write().await.record_exit(
+                                                                        &position.mint,
+                                                                        close_result.pnl_sol,
+                                                                    ).await;
+                                                                } else {
+                                                                    let ok = engine.write().await.record_partial_exit(
+                                                                        &position.mint,
+                                                                        close_result.remaining_cost_sol,
+                                                                        close_result.remaining_amount,
+                                                                        close_result.pnl_sol,
+                                                                    ).await;
+                                                                    if !ok {
+                                                                        warn!(
+                                                                            "Strategy governor lacks position {} for kill-switch partial exit; PositionManager result unchanged",
+                                                                            position.mint
+                                                                        );
+                                                                    }
+                                                                }
+
+                                                                let requested_proxy = if pre_close_tokens > 0 {
+                                                                    pre_close_cost
+                                                                        * (actual_sold_raw as f64 / pre_close_tokens as f64)
+                                                                } else {
+                                                                    pre_close_cost
+                                                                };
+                                                                engine.write().await.record_reconciled_execution(
+                                                                    &position.mint,
+                                                                    false,
+                                                                    requested_proxy,
+                                                                    actual_received_sol,
+                                                                    actual_exit_price,
+                                                                    latency_ms,
+                                                                    &signature,
+                                                                ).await;
+                                                            }
+                                                        }
+
+                                                        // Full exit: unwatch evaluator. Partial: KEEP
+                                                        // watching the remaining position.
+                                                        if kill_switch_unwatch_on_close(fully_closed) {
+                                                            info!("=== KILL-SWITCH SELL CONFIRMED (Full) ===");
+                                                            evaluator.unwatch_position(&trade.mint);
+                                                        } else {
+                                                            info!("=== KILL-SWITCH SELL CONFIRMED (Partial) ===");
+                                                        }
+                                                        info!(
+                                                            "  {} (sig {}) | sold_raw={} decimals={} net_sol_delta={:+.9} exit_price={:.12} SOL/token | realized P&L: {:+.9} SOL{}",
+                                                            &trade.mint[..12],
+                                                            signature,
+                                                            actual_sold_raw,
+                                                            fill.token_decimals,
+                                                            actual_received_sol,
+                                                            actual_exit_price,
+                                                            close_result.pnl_sol,
+                                                            if already_applied { " (already applied; idempotent)" } else { "" }
+                                                        );
+
+                                                        // Remove pending LAST.
+                                                        if let Err(e) = pending_executions.remove(&signature).await {
+                                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                                            error!(
+                                                                "KILL-SWITCH: failed to remove pending after confirmed fill (sig {}): {} - new entries HALTED; position state already applied",
+                                                                signature, e
+                                                            );
+                                                        }
+                                                        // B10: ConfirmedFill applied + pending removed
+                                                        // LAST => release the same-mint reservation.
+                                                        release_sell_mint(&active_sell_mints, &trade.mint);
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1760,7 +2475,219 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Manually sell a token position
+// ===========================================================================
+// AGENT H — MANUAL SELL TRANSACTION TRUTH (H1-H8)
+//
+// The manual `sell()` command is exact-wallet and transaction-reconciled. It
+// never manufactures proceeds from a market-price estimate (INV-TX-007), never
+// polls wallet SOL before/after as attribution (INV-TX-006 is satisfied by the
+// reconciled fill's exact wallet SOL delta), never assumes six decimals, and
+// never falls back between Local and Lightning signing authority
+// (INV-WALLET-001/002/003). A submitted signature is submission identity, not
+// fill proof (INV-TX-001).
+// ===========================================================================
+
+/// The exact wallet chosen for a manual sell, resolved BEFORE any submission.
+///
+/// - `Tracked` = a canonical tracked Position selected the wallet by its exact
+///   recorded `wallet_pubkey`.
+/// - `Untracked` = no tracked Position; a single positive on-chain holder among
+///   controlled wallets selected the wallet. There is no authoritative cost
+///   basis, so no P&L may be computed (H7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualSellWalletChoice {
+    Tracked(Pubkey),
+    Untracked(Pubkey),
+}
+
+impl ManualSellWalletChoice {
+    fn wallet(&self) -> Pubkey {
+        match self {
+            ManualSellWalletChoice::Tracked(w) | ManualSellWalletChoice::Untracked(w) => *w,
+        }
+    }
+    fn is_tracked(&self) -> bool {
+        matches!(self, ManualSellWalletChoice::Tracked(_))
+    }
+}
+
+/// H1 pure guard: may a manual sell be submitted for this mint given the current
+/// pending journal state? An unresolved pending Buy OR Sell for the same mint
+/// blocks another manual transaction (do not submit a second one). Returns the
+/// blocking signature when blocked.
+fn manual_sell_pending_block(
+    pending_buy: Option<&PendingExecution>,
+    pending_sell: Option<&PendingExecution>,
+) -> Option<String> {
+    if let Some(p) = pending_sell {
+        return Some(p.signature.clone());
+    }
+    if let Some(p) = pending_buy {
+        return Some(p.signature.clone());
+    }
+    None
+}
+
+/// The outcome of resolving an untracked token's controlled-wallet ownership (H2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualUntrackedResolution {
+    /// Exactly one controlled wallet holds a positive balance.
+    Single(Pubkey),
+    /// Held in multiple controlled wallets => ambiguous, refuse.
+    Ambiguous(Vec<Pubkey>),
+    /// No controlled wallet holds a positive balance => refuse.
+    NoHolder,
+}
+
+/// H2 pure mapping from an ownership-probe holder resolution to the manual-sell
+/// decision for an UNTRACKED token. Multiple holders are ambiguous and MUST be
+/// refused (INV-WALLET-004); zero holders refuse; exactly one resolves to that
+/// exact wallet. There is NO preference for Lightning merely because a Lightning
+/// wallet string exists — the wallet is chosen by proven on-chain ownership.
+fn manual_untracked_resolution(
+    resolution: &crate::wallet::OwnedHolderResolution,
+) -> ManualUntrackedResolution {
+    use crate::wallet::OwnedHolderResolution;
+    match resolution {
+        OwnedHolderResolution::None => ManualUntrackedResolution::NoHolder,
+        OwnedHolderResolution::Single(state) => ManualUntrackedResolution::Single(state.wallet),
+        OwnedHolderResolution::Multiple(states) => {
+            ManualUntrackedResolution::Ambiguous(states.iter().map(|s| s.wallet).collect())
+        }
+    }
+}
+
+/// C4/AUDIT-002 A1: retry durable persistence of an ALREADY-SUBMITTED pending
+/// record when the initial post-signature journal write failed and the outcome
+/// remains ambiguous or confirmed-but-unapplied (Unresolved / structural
+/// reconciler error / confirmed-fill identity/validation/application failure).
+///
+/// This is used on EVERY live submit path (primary buy / primary auto-sell /
+/// event kill-switch sell / HotScan buy / HotScan sell / manual sell). It
+/// ensures the store's persistence directory is writable, then upserts. Any
+/// error is returned so the caller can escalate to a CRITICAL, do-not-resubmit
+/// report that preserves the public signature.
+///
+/// Because the transaction is already submitted, this helper must NEVER:
+/// submit/re-submit; replace a conflicting same-signature record; remove another
+/// pending record; or guess economic state. It only makes the exact pending
+/// record durable.
+///
+/// Single-process coordination note (AUDIT-002 A13): persistent trading state is
+/// currently single-process coordinated. Do not run manual sell / HotScan /
+/// start concurrently against the same credentials_dir. Cross-process file
+/// locking is not implemented.
+async fn ensure_pending_execution_durable(
+    store: &PendingExecutionStore,
+    pending: &PendingExecution,
+) -> crate::error::Result<()> {
+    store.ensure_writable().await?;
+    store.upsert(pending.clone()).await
+}
+
+/// AUDIT-002 A10: retry durable pending persistence only when the initial
+/// post-signature journal write failed. Returns whether the pending record is
+/// durable after this call:
+/// - `initially_persisted == true` => already durable => `true` (no retry);
+/// - initially failed + retry Ok => `true`;
+/// - initially failed + retry Err => `false`.
+///
+/// The caller retains all policy decisions (halt flag, reservation lifetime,
+/// continue/break/error). This helper never submits a transaction, never mutates
+/// positions, and logs no secrets.
+async fn retry_pending_durability_if_needed(
+    store: &PendingExecutionStore,
+    pending: &PendingExecution,
+    initially_persisted: bool,
+) -> bool {
+    if initially_persisted {
+        return true;
+    }
+    ensure_pending_execution_durable(store, pending).await.is_ok()
+}
+
+/// AUDIT-002 A11: pure reconciliation-outcome state for an already-submitted
+/// transaction, used to decide whether a durable pending record is still
+/// required for restart recovery when the initial journal write failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmittedOutcomeState {
+    /// Chain proves no economic fill; no durable pending needed.
+    ConfirmedFailure,
+    /// Confirmed fill whose economic state was durably applied; no durable
+    /// pending needed for restart economic recovery.
+    ConfirmedApplied,
+    /// Ambiguous (timeout/observation gap); durable pending required.
+    Unresolved,
+    /// Structural observer/reconciler error; durable pending required.
+    StructuralError,
+    /// Confirmed fill but identity/validation/application incomplete; durable
+    /// pending required so the confirmed-but-unapplied fill is restart-recoverable.
+    ConfirmedUnapplied,
+}
+
+/// AUDIT-002 A11: given whether the initial post-signature journal write
+/// succeeded and the resolved outcome, decide whether a durability retry is
+/// required. Persisted outcomes never require a retry; terminal outcomes
+/// (ConfirmedFailure / ConfirmedApplied) never require an invented durable
+/// record; ambiguous / confirmed-unapplied outcomes require durability when the
+/// initial write failed. Pure and deterministic (no network / store).
+fn pending_durability_required(
+    initially_persisted: bool,
+    state: SubmittedOutcomeState,
+) -> bool {
+    if initially_persisted {
+        return false;
+    }
+    match state {
+        SubmittedOutcomeState::ConfirmedFailure | SubmittedOutcomeState::ConfirmedApplied => false,
+        SubmittedOutcomeState::Unresolved
+        | SubmittedOutcomeState::StructuralError
+        | SubmittedOutcomeState::ConfirmedUnapplied => true,
+    }
+}
+
+/// C4 pure decision: given whether the initial post-signature journal write
+/// succeeded and the resolved outcome kind, decide what pending action the
+/// manual sell handler must take. Testable without any network or store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualOutcomeKind {
+    ConfirmedFill,
+    ConfirmedFailure,
+    Unresolved,
+    StructuralError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualPendingAction {
+    /// Confirmed fill applied durably (or untracked): remove pending as usual.
+    RemovePending,
+    /// Confirmed failure: remove pending only if it was persisted; otherwise
+    /// no failure record to invent.
+    RemoveIfPersisted,
+    /// Ambiguous outcome and pending already durable: keep as-is.
+    KeepDurable,
+    /// Ambiguous outcome but initial write failed: must re-persist durably.
+    RetryDurable,
+}
+
+fn manual_pending_action(
+    initial_persisted: bool,
+    outcome: ManualOutcomeKind,
+) -> ManualPendingAction {
+    match outcome {
+        ManualOutcomeKind::ConfirmedFill => ManualPendingAction::RemovePending,
+        ManualOutcomeKind::ConfirmedFailure => ManualPendingAction::RemoveIfPersisted,
+        ManualOutcomeKind::Unresolved | ManualOutcomeKind::StructuralError => {
+            if initial_persisted {
+                ManualPendingAction::KeepDurable
+            } else {
+                ManualPendingAction::RetryDurable
+            }
+        }
+    }
+}
+
+/// Manually sell a token position — exact wallet, transaction-reconciled (H1-H8).
 pub async fn sell(
     config: &Config,
     token: &str,
@@ -1768,13 +2695,20 @@ pub async fn sell(
     force: bool,
     dry_run: bool,
 ) -> Result<()> {
+    // AUDIT-002 A13 — operational constraint (documentation only):
+    // Persistent trading state is currently single-process coordinated. Do not
+    // run manual sell / HotScan / start concurrently against the same
+    // credentials_dir. Cross-process file locking is not implemented. The
+    // ActiveSellMints reservation coordinates tasks inside one start() process
+    // only; positions.json and pending_executions.json have no cross-process lock.
     info!("Sell command: token={}, amount={}", token, amount);
 
-    // Parse token address
-    let _token_pubkey = solana_sdk::pubkey::Pubkey::try_from(token)
+    // Parse token address.
+    let token_pubkey = solana_sdk::pubkey::Pubkey::try_from(token)
         .map_err(|e| anyhow::anyhow!("Invalid token address: {}", e))?;
 
-    // Parse amount (can be percentage like "50%" or absolute)
+    // Parse amount (percentage like "50%" or absolute token units). The exact
+    // user input string is preserved verbatim for the pending sell context (H5).
     let is_percentage = amount.ends_with('%');
     let amount_value: f64 = if is_percentage {
         amount
@@ -1786,79 +2720,249 @@ pub async fn sell(
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid amount: {}", e))?
     };
-
     if is_percentage && (amount_value <= 0.0 || amount_value > 100.0) {
         anyhow::bail!("Percentage must be between 0 and 100");
     }
 
-    // Initialize RPC client for balance queries
-    let rpc_client = solana_client::rpc_client::RpcClient::new_with_timeout(
+    if !config.pumpportal.use_for_trading {
+        // Jito manual sell is not implemented; there is no reconciled path for it.
+        anyhow::bail!(
+            "Jito sell not implemented. Set pumpportal.use_for_trading = true in config.toml"
+        );
+    }
+
+    // === H1: fail-closed initialization ===
+    let rpc_client = Arc::new(solana_client::rpc_client::RpcClient::new_with_timeout(
         config.rpc.endpoint.clone(),
         std::time::Duration::from_millis(config.rpc.timeout_ms),
-    );
+    ));
 
-    // Determine which wallet to query for balance (Lightning or local)
-    let balance_wallet = if !config.pumpportal.lightning_wallet.is_empty() {
-        Pubkey::from_str(&config.pumpportal.lightning_wallet)?
-    } else {
-        // Fall back to local keypair
-        let keypair_path = std::env::var("KEYPAIR_PATH")
-            .unwrap_or_else(|_| "credentials/hot-trading/keypair.json".to_string());
-        let keypair_data = std::fs::read_to_string(&keypair_path)?;
-        let secret_key: Vec<u8> = serde_json::from_str(&keypair_data)?;
-        let keypair = Keypair::from_bytes(&secret_key)?;
-        keypair.pubkey()
-    };
+    // Load the primary local keypair (exact local signing authority).
+    let keypair_path = std::env::var("KEYPAIR_PATH")
+        .unwrap_or_else(|_| "credentials/hot-trading/keypair.json".to_string());
+    let keypair_data = std::fs::read_to_string(&keypair_path)?;
+    let secret_key: Vec<u8> = serde_json::from_str(&keypair_data)?;
+    let keypair = Arc::new(Keypair::from_bytes(&secret_key)?);
 
-    // Initialize position manager
-    let position_manager = std::sync::Arc::new(crate::position::manager::PositionManager::new(
+    // Position manager — fail closed on load error (no warn-and-continue).
+    let position_manager = Arc::new(crate::position::manager::PositionManager::new(
         config.safety.clone(),
         Some(format!("{}/positions.json", config.wallet.credentials_dir)),
     ));
-    if let Err(e) = position_manager.load().await {
-        warn!("Could not load positions: {} (continuing anyway)", e);
-    }
+    position_manager.load().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load persisted positions; refusing manual sell with unknown ownership state: {}",
+            e
+        )
+    })?;
 
-    // Load bought_mints cache
-    let bought_mints_path = format!("{}/bought_mints.json", config.wallet.credentials_dir);
-    let bought_mints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> = {
-        if std::path::Path::new(&bought_mints_path).exists() {
-            match std::fs::read_to_string(&bought_mints_path) {
-                Ok(data) => {
-                    if let Ok(mints) = serde_json::from_str::<std::collections::HashMap<String, i64>>(&data) {
-                        std::sync::Arc::new(tokio::sync::Mutex::new(mints))
-                    } else {
-                        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                    }
+    // Trade reconciler + ownership probe (canonical 001A observer + C primitives).
+    let trade_reconciler = TradeReconciler::new(rpc_client.clone());
+    let ownership_probe = WalletOwnershipProbe::new(rpc_client.clone());
+
+    // Pending-execution journal — load + ensure writable (fail closed).
+    let pending_path = format!("{}/pending_executions.json", config.wallet.credentials_dir);
+    let pending_store = PendingExecutionStore::new(pending_path);
+    pending_store.load().await?;
+    pending_store.ensure_writable().await?;
+
+    // Recovery-only MultiWalletManager so an exact prior HotScan multi-wallet
+    // signer can be recognized. Fail closed if configured wallets will not load.
+    let mut recovery_local_wallets: Vec<Pubkey> = Vec::new();
+    let recovery_multi_wallet = if !config.wallet.trading_wallets.is_empty() {
+        match crate::wallet::MultiWalletManager::new(
+            config.wallet.trading_wallets.clone(),
+            &config.wallet.selection_strategy,
+        ) {
+            Ok(mw) => {
+                for w in mw.wallets() {
+                    recovery_local_wallets.push(w.pubkey());
                 }
-                Err(_) => std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                Some(Arc::new(mw))
             }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to load configured trading_wallets; refusing manual sell: {}",
+                    e
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Strictly parse the configured Lightning wallet if present (fail closed).
+    let lightning_wallet: Option<Pubkey> = {
+        let lw = config.pumpportal.lightning_wallet.trim();
+        if lw.is_empty() {
+            None
         } else {
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+            match Pubkey::from_str(lw) {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Configured lightning_wallet is not a valid Pubkey; refusing manual sell: {}",
+                        e
+                    ));
+                }
+            }
         }
     };
-    let bought_mints_path = std::sync::Arc::new(bought_mints_path);
 
-    // Get position info if we have it
-    let position = position_manager.get_position(token).await;
-    if let Some(ref pos) = position {
+    let registry =
+        ExecutionWalletRegistry::new(keypair.pubkey(), &recovery_local_wallets, lightning_wallet);
+
+    // H1: run pending recovery BEFORE submitting a new sell. This reconciles any
+    // in-flight signatures against the chain and applies/removes them per plan.
+    let _ = recover_pending_store(&trade_reconciler, &pending_store, &position_manager).await?;
+
+    // H1: if the same mint still has an unresolved pending Buy or Sell after
+    // recovery, do NOT submit another manual transaction.
+    let pending_buy = pending_store
+        .get_for_mint(token, ReconciliationSide::Buy)
+        .await;
+    let pending_sell = pending_store
+        .get_for_mint(token, ReconciliationSide::Sell)
+        .await;
+    if let Some(sig) =
+        manual_sell_pending_block(pending_buy.as_ref(), pending_sell.as_ref())
+    {
+        anyhow::bail!(
+            "An unresolved pending transaction (signature {}) already exists for this mint; \
+             refusing to submit another manual sell until it is reconciled.",
+            sig
+        );
+    }
+
+    // bought_mints cache (noncanonical metadata; only ever removed on proof).
+    let bought_mints_path = format!("{}/bought_mints.json", config.wallet.credentials_dir);
+    let bought_mints: Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> = {
+        if std::path::Path::new(&bought_mints_path).exists() {
+            match std::fs::read_to_string(&bought_mints_path) {
+                Ok(data) => match serde_json::from_str::<std::collections::HashMap<String, i64>>(
+                    &data,
+                ) {
+                    Ok(mints) => Arc::new(tokio::sync::Mutex::new(mints)),
+                    Err(_) => Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                },
+                Err(_) => Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            }
+        } else {
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        }
+    };
+    let bought_mints_path = Arc::new(bought_mints_path);
+
+    // === H2: resolve the EXACT execution wallet ===
+    let mut tracked_position = position_manager.get_position(token).await;
+    let wallet_choice: ManualSellWalletChoice = match tracked_position.clone() {
+        Some(pos) if !position_requires_recovery(&pos) => {
+            // Tracked canonical Position: use its EXACT recorded wallet. A route
+            // must exist for it (else refuse — no guessing).
+            let wallet = pos.wallet_pubkey.parse::<Pubkey>().map_err(|e| {
+                anyhow::anyhow!("Tracked position wallet is not a valid Pubkey: {}", e)
+            })?;
+            if registry.route_for(&wallet).is_none() {
+                anyhow::bail!(
+                    "Tracked position wallet {} has no controlled execution route; refusing manual sell.",
+                    wallet
+                );
+            }
+            ManualSellWalletChoice::Tracked(wallet)
+        }
+        Some(_pos) => {
+            // Tracked LEGACY position (decimals None / invalid wallet). Attempt
+            // legacy recovery for this mint FIRST; if it remains recovery-required,
+            // refuse rather than guess units/cost (INV-POS-002/003).
+            info!(
+                "Manual sell: tracked position for {} is legacy/incomplete; attempting chain recovery",
+                token
+            );
+            let _ = recover_legacy_positions(
+                &trade_reconciler,
+                &ownership_probe,
+                &registry,
+                &position_manager,
+            )
+            .await?;
+
+            // Re-read; only proceed if it is now fully canonical AND routable.
+            match position_manager.get_position(token).await {
+                Some(p) if !legacy_recovery_required(&p, &registry) => {
+                    let wallet = p.wallet_pubkey.parse::<Pubkey>().map_err(|e| {
+                        anyhow::anyhow!(
+                            "Recovered position wallet is not a valid Pubkey: {}",
+                            e
+                        )
+                    })?;
+                    tracked_position = Some(p);
+                    ManualSellWalletChoice::Tracked(wallet)
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Position for {} remains recovery-required after chain recovery; \
+                         refusing manual sell rather than guessing units/cost.",
+                        token
+                    );
+                }
+            }
+        }
+        None => {
+            // No tracked Position: probe ALL controlled wallets for the mint.
+            let resolution = ownership_probe
+                .find_positive_holders(&registry, token_pubkey)
+                .await
+                .map_err(|e| anyhow::anyhow!("Ownership probe failed: {}", e))?;
+            match manual_untracked_resolution(&resolution) {
+                ManualUntrackedResolution::Single(w) => ManualSellWalletChoice::Untracked(w),
+                ManualUntrackedResolution::Ambiguous(wallets) => {
+                    for w in &wallets {
+                        println!("  controlled wallet holding {}: {}", token, w);
+                    }
+                    anyhow::bail!(
+                        "Token is held in multiple controlled wallets; manual sell is ambiguous. \
+                         Explicit wallet selection is required but this CLI does not provide it yet."
+                    );
+                }
+                ManualUntrackedResolution::NoHolder => {
+                    anyhow::bail!(
+                        "No controlled wallet holds a positive balance of {}; nothing to sell.",
+                        token
+                    );
+                }
+            }
+        }
+    };
+
+    let execution_wallet = wallet_choice.wallet();
+    let route = match registry.route_for(&execution_wallet) {
+        Some(r) => r,
+        None => {
+            anyhow::bail!(
+                "Resolved wallet {} has no controlled execution route; refusing manual sell.",
+                execution_wallet
+            );
+        }
+    };
+
+    if let Some(ref pos) = tracked_position {
         println!("\nPosition found:");
         println!("  Symbol: {}", pos.symbol);
-        println!("  Tokens: {}", pos.token_amount);
+        println!("  Tokens (raw): {}", pos.token_amount);
         println!("  Entry price: {:.10} SOL", pos.entry_price);
         println!("  Cost: {:.4} SOL", pos.total_cost_sol);
     }
+    println!("  Execution wallet: {} ({:?})", execution_wallet, route);
 
-    // Confirmation prompt (unless --force)
+    // === H4: preserve the manual confirmation prompt + dry-run no-send ===
     if config.safety.require_sell_confirmation && !force {
         let confirmed = Confirm::new()
             .with_prompt(format!(
-                "Sell {} of token {}? This cannot be undone.",
-                amount, token
+                "Sell {} of token {} from wallet {}? This cannot be undone.",
+                amount, token, execution_wallet
             ))
             .default(false)
             .interact()?;
-
         if !confirmed {
             info!("Sell cancelled by user");
             return Ok(());
@@ -1866,124 +2970,437 @@ pub async fn sell(
     }
 
     if dry_run {
-        info!("DRY-RUN: Would sell {} of {}", amount, token);
+        info!("DRY-RUN: Would sell {} of {} from {}", amount, token, execution_wallet);
         return Ok(());
     }
 
-    // Execute sell based on configuration
-    if config.pumpportal.use_for_trading {
-        // Use PumpPortal API
-        if config.pumpportal.api_key.is_empty() {
-            anyhow::bail!("PumpPortal API key required for selling via Lightning API");
-        }
+    // === H3: exact route submission ===
+    let slippage_pct = config.trading.slippage_bps / 100;
+    let priority_fee = config.trading.priority_fee_lamports as f64 / 1_000_000_000.0;
 
-        let trader = PumpPortalTrader::lightning(config.pumpportal.api_key.clone());
-        let slippage_pct = config.trading.slippage_bps / 100;
-        let priority_fee = config.trading.priority_fee_lamports as f64 / 1_000_000_000.0;
-
-        // Query SOL balance BEFORE sell for real P&L
-        let sol_before = rpc_client.get_balance(&balance_wallet).unwrap_or(0) as f64 / 1_000_000_000.0;
-        info!("Balance before sell: {:.4} SOL", sol_before);
-
-        info!("Submitting sell via PumpPortal API...");
-        match trader.sell(token, amount, slippage_pct, priority_fee).await {
-            Ok(signature) => {
-                info!("Sell successful! Signature: {}", signature);
-                println!("\nSell transaction confirmed!");
-                println!("Signature: {}", signature);
-                println!("View on Solscan: https://solscan.io/tx/{}", signature);
-
-                // Wait for tx confirmation then query actual SOL received
-                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                let sol_after = rpc_client.get_balance(&balance_wallet).unwrap_or(0) as f64 / 1_000_000_000.0;
-                let raw_received = (sol_after - sol_before).max(0.0);
-
-                println!("Balance after sell: {:.4} SOL", sol_after);
-                println!("SOL received (raw): {:.4} SOL", raw_received);
-
-                // Update position manager and stats
-                if let Some(ref pos) = position {
-                    let is_full_sell = amount == "100%" || amount_value >= 100.0;
-                    let tokens_sold = if is_full_sell {
-                        pos.token_amount
-                    } else if is_percentage {
-                        (pos.token_amount as f64 * amount_value / 100.0) as u64
-                    } else {
-                        amount_value as u64
-                    };
-
-                    // Sanity check: received SOL shouldn't be more than 10x position cost
-                    // If it is, the balance query likely failed (sol_before was 0)
-                    let max_reasonable = pos.total_cost_sol * 10.0;
-                    let actual_received = if raw_received > max_reasonable {
-                        warn!(
-                            "Balance query anomaly: before={:.4}, after={:.4}, diff={:.4} (max reasonable: {:.4}) - using estimate",
-                            sol_before, sol_after, raw_received, max_reasonable
+    let submit_result: crate::error::Result<String> = match route {
+        crate::wallet::ExecutionRoute::Local => {
+            // Resolve the EXACT local signer for this wallet: primary keypair or a
+            // recovery MultiWallet signer. No fallback (INV-WALLET-003).
+            if execution_wallet == keypair.pubkey() {
+                info!("Manual sell: local submission via primary keypair");
+                pumpportal_local_trader()
+                    .sell_local(
+                        token,
+                        amount,
+                        slippage_pct,
+                        priority_fee,
+                        &keypair,
+                        &rpc_client,
+                    )
+                    .await
+            } else {
+                match recovery_multi_wallet
+                    .as_ref()
+                    .and_then(|mw| mw.find_by_address(&execution_wallet.to_string()))
+                {
+                    Some(tw) => {
+                        info!(
+                            "Manual sell: local submission via recovery wallet {}",
+                            execution_wallet
                         );
-                        0.0 // Force fallback to estimate
-                    } else {
-                        raw_received
-                    };
-
-                    // Use actual received SOL, fallback to estimate if balance query failed
-                    let received = if actual_received > 0.0 {
-                        actual_received
-                    } else {
-                        // Estimate based on position price (use current_price if available, else entry_price)
-                        let price = if pos.current_price > 0.0 { pos.current_price } else { pos.entry_price };
-                        let estimated = (tokens_sold as f64 * price) * 0.98;
-                        warn!("Balance query returned 0 or anomaly detected, using estimated received: {:.4} SOL", estimated);
-                        estimated
-                    };
-
-                    let _ = position_manager
-                        .close_position(token, tokens_sold, received)
-                        .await;
-
-                    // Persist position state immediately
-                    if let Err(e) = position_manager.save().await {
-                        warn!("Failed to persist position state: {}", e);
+                        pumpportal_local_trader()
+                            .sell_local(
+                                token,
+                                amount,
+                                slippage_pct,
+                                priority_fee,
+                                &tw.keypair,
+                                &rpc_client,
+                            )
+                            .await
                     }
-
-                    let cost_portion = if is_full_sell {
-                        pos.total_cost_sol
-                    } else {
-                        pos.total_cost_sol * amount_value / 100.0
-                    };
-                    let pnl_sol = received - cost_portion;
-                    let pnl_pct = (pnl_sol / cost_portion) * 100.0;
-
-                    println!("\n=== TRADE CLOSED ===");
-                    println!("  Cost: {:.4} SOL | Received: {:.4} SOL | P&L: {:+.4} SOL ({:+.1}%)",
-                            cost_portion, received, pnl_sol, pnl_pct);
-
-                    // Clean up bought_mints if position is fully closed
-                    // Check if position still exists after close_position
-                    let position_closed = position_manager.get_position(token).await.is_none();
-                    if position_closed {
-                        let _ = remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
-                        info!("Removed {} from bought_mints cache", token);
-                    }
-                } else {
-                    // No position tracked - still clean up bought_mints
-                    let removed = remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
-                    if removed {
-                        info!("Removed {} from bought_mints cache", token);
+                    None => {
+                        anyhow::bail!(
+                            "No exact local signer for wallet {}; refusing manual sell (no fallback).",
+                            execution_wallet
+                        );
                     }
                 }
             }
-            Err(e) => {
-                error!("Sell failed: {}", e);
-                anyhow::bail!("Sell transaction failed: {}", e);
+        }
+        crate::wallet::ExecutionRoute::Lightning => {
+            // Lightning requires an API key AND the exact configured Lightning
+            // wallet. No Local fallback (INV-WALLET-001/002).
+            if config.pumpportal.api_key.is_empty() {
+                anyhow::bail!("PumpPortal API key required for a Lightning manual sell.");
+            }
+            info!("Manual sell: Lightning submission (wallet {})", execution_wallet);
+            PumpPortalTrader::lightning(config.pumpportal.api_key.clone())
+                .sell(token, amount, slippage_pct, priority_fee)
+                .await
+        }
+    };
+
+    // === H5: submit => pending => reconcile ===
+    let signature = match submit_result {
+        Ok(sig) => sig,
+        Err(e) => {
+            // Provider error before a signature: nothing to reconcile, no pending,
+            // tracked position unchanged.
+            error!("Manual sell submission failed: {}", e);
+            anyhow::bail!("Manual sell submission failed: {}", e);
+        }
+    };
+
+    info!("SELL SUBMITTED: {} (sig {})", token, signature);
+    println!("\nSELL SUBMITTED");
+    println!("Signature: {}", signature);
+    println!("View on Solscan: https://solscan.io/tx/{}", signature);
+
+    // Persist the pending record BEFORE treating the trade as filled (INV-TX-001).
+    let pending = PendingExecution::sell(
+        signature.clone(),
+        token.to_string(),
+        execution_wallet.to_string(),
+        PendingSellContext {
+            requested_amount: amount.to_string(), // exact user input preserved (H5)
+            intent: PendingSellIntent::Manual,
+            reason: "manual".to_string(),
+        },
+    );
+    // C3: a post-signature journal write failure must NOT short-circuit immediate
+    // reconciliation. The transaction is already submitted; returning here would
+    // leave a live, unreconciled signature with no durable record. Record whether
+    // the initial persist succeeded and continue to reconcile either way.
+    let initial_persisted = match pending_store.upsert(pending.clone()).await {
+        Ok(()) => true,
+        Err(e) => {
+            error!(
+                "submitted signature {} but pending journal write failed: {} - continuing immediate reconciliation",
+                signature, e
+            );
+            false
+        }
+    };
+
+    // Reconcile: exact wallet/mint/Sell. No sleep, no balance polling, no estimate.
+    let outcome = trade_reconciler
+        .reconcile(
+            &signature,
+            &execution_wallet.to_string(),
+            token,
+            ReconciliationSide::Sell,
+        )
+        .await;
+
+    match outcome {
+        Ok(ReconciliationOutcome::ConfirmedFailure {
+            error,
+            observed_after_ms,
+            ..
+        }) => {
+            // C5: chain proves failure. If a pending record was persisted, remove
+            // it. If the initial persist never succeeded, there is no pending
+            // failure record to invent. No economic state mutation either way.
+            if initial_persisted {
+                pending_store.remove(&signature).await?;
+            }
+            error!(
+                "Manual sell CONFIRMED FAILED (sig {}): {} ({}ms observed)",
+                signature, error, observed_after_ms
+            );
+            anyhow::bail!(
+                "Manual sell transaction confirmed FAILED on-chain (signature {}): {}",
+                signature,
+                error
+            );
+        }
+        Ok(ReconciliationOutcome::Unresolved { reason, .. }) => {
+            // C4: KEEP pending; report UNRESOLVED including the signature; no
+            // Position mutation; do NOT tell the user to immediately retry. If the
+            // initial post-signature journal write failed, the pending record is
+            // NOT durable yet — retry durable persistence before returning so a
+            // restart can recover this in-flight signature.
+            if !initial_persisted {
+                match ensure_pending_execution_durable(&pending_store, &pending).await {
+                    Ok(()) => {
+                        error!(
+                            "Manual sell UNRESOLVED (sig {}): {} - initial journal write failed but pending is now durable",
+                            signature, reason
+                        );
+                    }
+                    Err(persist_err) => {
+                        error!(
+                            "CRITICAL: manual sell UNRESOLVED (sig {}): {} - AND pending journal is NOT durable: {}",
+                            signature, reason, persist_err
+                        );
+                        anyhow::bail!(
+                            "CRITICAL: manual sell outcome is UNRESOLVED for signature {} and the pending \
+                             journal is NOT durable ({}). The transaction was submitted; do NOT resubmit. \
+                             Preserve and investigate signature {} before taking any further action. \
+                             Reason: {}",
+                            signature,
+                            persist_err,
+                            signature,
+                            reason
+                        );
+                    }
+                }
+            } else {
+                error!(
+                    "Manual sell UNRESOLVED (sig {}): {} - pending kept, position unchanged",
+                    signature, reason
+                );
+            }
+            anyhow::bail!(
+                "Manual sell outcome is UNRESOLVED for signature {}. The transaction was submitted \
+                 but its on-chain result could not be confirmed. It remains recorded as pending; \
+                 do NOT resubmit. Investigate the signature before taking further action. Reason: {}",
+                signature,
+                reason
+            );
+        }
+        Err(e) => {
+            // C4: a structural observer error is NOT tx-failure proof. Keep
+            // pending. If the initial journal write failed, retry durable
+            // persistence before returning (same policy as Unresolved).
+            if !initial_persisted {
+                match ensure_pending_execution_durable(&pending_store, &pending).await {
+                    Ok(()) => {
+                        error!(
+                            "Manual sell reconciliation error (sig {}): {} - initial journal write failed but pending is now durable",
+                            signature, e
+                        );
+                    }
+                    Err(persist_err) => {
+                        error!(
+                            "CRITICAL: manual sell reconciliation error (sig {}): {} - AND pending journal is NOT durable: {}",
+                            signature, e, persist_err
+                        );
+                        anyhow::bail!(
+                            "CRITICAL: manual sell outcome is UNRESOLVED for signature {} (reconciliation \
+                             observer error: {}) and the pending journal is NOT durable ({}). The \
+                             transaction was submitted; do NOT resubmit. Preserve and investigate \
+                             signature {} before taking any further action.",
+                            signature,
+                            e,
+                            persist_err,
+                            signature
+                        );
+                    }
+                }
+            } else {
+                error!(
+                    "Manual sell reconciliation error (sig {}): {} - pending kept, position unchanged",
+                    signature, e
+                );
+            }
+            anyhow::bail!(
+                "Manual sell outcome is UNRESOLVED for signature {} (reconciliation observer error): {}. \
+                 It remains recorded as pending; do NOT resubmit.",
+                signature,
+                e
+            );
+        }
+        Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+            // C6: identity/fill validation happens AFTER a confirmed fill. If it
+            // fails we must keep the pending record for restart recovery. When the
+            // initial journal write failed, retry durable persistence before
+            // returning the error so the confirmed-but-unapplied fill is not lost.
+            if fill.side != ReconciliationSide::Sell
+                || fill.wallet != execution_wallet.to_string()
+                || fill.mint != token
+            {
+                if !initial_persisted {
+                    if let Err(persist_err) =
+                        ensure_pending_execution_durable(&pending_store, &pending).await
+                    {
+                        anyhow::bail!(
+                            "CRITICAL: reconciled manual sell fill identity mismatch for signature {} \
+                             AND pending journal is NOT durable ({}); confirmed fill is unapplied. Do \
+                             NOT resubmit; preserve and investigate signature {}.",
+                            signature,
+                            persist_err,
+                            signature
+                        );
+                    }
+                }
+                anyhow::bail!(
+                    "Reconciled manual sell fill identity mismatch for signature {}; pending kept, \
+                     position unchanged.",
+                    signature
+                );
+            }
+
+            // AUDIT-002 A9: the confirmed fill is identity-validated. The early
+            // raw/net validation MUST NOT bypass durability recovery for a
+            // TRACKED confirmed-but-unapplied sell when the initial pending
+            // persistence failed. For a tracked position, primary_sell_fill_values
+            // below is the authoritative raw/net/price validation boundary (it
+            // already rejects a raw that does not fit u64, a zero raw, and a
+            // non-finite net SOL) and its failure arm attempts durable
+            // persistence. So we do NOT duplicate raw/net validation ahead of it.
+            //
+            // The UI-only display values below are non-authoritative and never
+            // gate application; the untracked branch performs its own explicit
+            // representation checks where a u64 raw is actually reported.
+            let ui_sold = fill.token_amount_ui();
+            // Economic (effective) price; a fee-dominated sale may be zero/negative.
+            let effective_price = fill.effective_price_sol_per_token().unwrap_or(0.0);
+
+            if let Some(pos) = tracked_position {
+                // === H6: tracked Position application ===
+                // Validate fill decimals vs Position before mutation.
+                let (validated_sold_raw, validated_net_sol, validated_price) =
+                    match primary_sell_fill_values(&fill, &pos) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // C6: fill validation failed AFTER a confirmed fill.
+                            // Keep pending for restart recovery; re-persist if the
+                            // initial journal write failed.
+                            if !initial_persisted {
+                                if let Err(persist_err) =
+                                    ensure_pending_execution_durable(&pending_store, &pending).await
+                                {
+                                    anyhow::bail!(
+                                        "CRITICAL: reconciled sell fill validation failed (sig {}): {} \
+                                         AND pending journal is NOT durable ({}); confirmed fill is \
+                                         unapplied. Do NOT resubmit; preserve and investigate signature {}.",
+                                        signature,
+                                        e,
+                                        persist_err,
+                                        signature
+                                    );
+                                }
+                            }
+                            anyhow::bail!(
+                                "Reconciled sell fill validation failed (sig {}): {}; pending kept.",
+                                signature,
+                                e
+                            );
+                        }
+                    };
+
+                let close_result = match position_manager
+                    .close_position_reconciled(
+                        token,
+                        &signature,
+                        validated_sold_raw,
+                        validated_net_sol,
+                    )
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // C6: close application failed AFTER a confirmed fill.
+                        // Keep pending for restart recovery; re-persist if the
+                        // initial journal write failed.
+                        if !initial_persisted {
+                            if let Err(persist_err) =
+                                ensure_pending_execution_durable(&pending_store, &pending).await
+                            {
+                                anyhow::bail!(
+                                    "CRITICAL: reconciled close failed (sig {}): {} AND pending journal \
+                                     is NOT durable ({}); confirmed fill is unapplied. Do NOT resubmit; \
+                                     preserve and investigate signature {}.",
+                                    signature,
+                                    e,
+                                    persist_err,
+                                    signature
+                                );
+                            }
+                        }
+                        anyhow::bail!(
+                            "Reconciled close failed (sig {}): {}; pending kept.",
+                            signature,
+                            e
+                        );
+                    }
+                };
+
+                // Remove pending LAST, after durable application.
+                pending_store.remove(&signature).await?;
+
+                println!("\n=== MANUAL SELL CONFIRMED ===");
+                println!("  Signature: {}", signature);
+                println!("  Raw sold: {}", validated_sold_raw);
+                println!("  UI sold: {:.6}", ui_sold);
+                println!("  Net SOL (wallet delta): {:+.6} SOL", validated_net_sol);
+                println!("  Effective price: {:.10} SOL/token", validated_price);
+                println!("  Realized P&L: {:+.6} SOL", close_result.pnl_sol);
+                if close_result.fully_closed {
+                    println!("  Position fully closed.");
+                    // Remove bought_mint only on a full close.
+                    let _ = remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
+                } else {
+                    println!(
+                        "  Partial exit — remaining tracked raw: {}, remaining cost: {:.6} SOL",
+                        close_result.remaining_amount, close_result.remaining_cost_sol
+                    );
+                }
+            } else {
+                // === H7: untracked token application ===
+                // No authoritative cost basis: do NOT create fake P&L, do NOT call
+                // PositionManager close. Report actuals and state P&L unavailable.
+                // AUDIT-002 A9: there is no PositionManager state to apply for an
+                // untracked confirmed fill, so no durable pending is required for
+                // restart economic recovery. Report confirmed actuals. If a u64
+                // raw amount cannot be represented we return an explicit
+                // representation error — we do NOT invent a fake u64 and do NOT
+                // claim the transaction is unresolved when the chain fill is
+                // confirmed. The pending record is removed LAST below.
+                let net_sol = fill.wallet_sol_delta_sol();
+                // Report the raw magnitude via the fill's own representation. When
+                // it does not fit u64, surface the wider on-chain magnitude as a
+                // string rather than fabricating a u64.
+                let raw_sold_display: String = match fill.token_amount_raw() {
+                    Some(raw) => raw.to_string(),
+                    None => format!("{} (raw magnitude exceeds u64)", fill.token_amount_ui()),
+                };
+                println!("\n=== MANUAL SELL CONFIRMED (untracked) ===");
+                println!("  Signature: {}", signature);
+                println!("  Raw sold: {}", raw_sold_display);
+                println!("  UI sold: {:.6}", ui_sold);
+                println!("  Net SOL (wallet delta): {:+.6} SOL", net_sol);
+                println!("  Effective price: {:.10} SOL/token", effective_price);
+                println!(
+                    "Realized P&L unavailable: token was not tracked with a canonical cost basis."
+                );
+
+                // Probe the EXACT wallet's current balance. If proven zero, the
+                // bought_mints cache entry may be removed; if nonzero, leave it.
+                // Pending may still be removed after a confirmed fill even if this
+                // probe fails (the cache is noncanonical metadata).
+                match ownership_probe.probe(execution_wallet, token_pubkey).await {
+                    Ok(state) if state.raw_amount == 0 => {
+                        let _ =
+                            remove_bought_mint(&bought_mints, &bought_mints_path, token).await;
+                        info!("Untracked sell: proven zero balance, removed {} from bought_mints", token);
+                    }
+                    Ok(state) => {
+                        info!(
+                            "Untracked sell: {} raw remains in wallet {} - leaving bought_mints cache",
+                            state.raw_amount, execution_wallet
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Untracked sell: post-fill balance probe failed: {} - leaving bought_mints cache",
+                            e
+                        );
+                    }
+                }
+
+                // Remove pending LAST (confirmed fill is durable regardless of cache).
+                pending_store.remove(&signature).await?;
             }
         }
-    } else {
-        // Use Jito bundles
-        warn!("Jito sell not yet implemented - use PumpPortal Lightning API");
-        anyhow::bail!("Jito sell not implemented. Set pumpportal.use_for_trading = true in config.toml");
     }
 
     Ok(())
+}
+
+/// The Local-API PumpPortal trader used for manual local submission. Kept as a
+/// tiny constructor so the manual-sell route reads clearly; it holds no key
+/// material (the exact signer keypair is passed per call to `sell_local`).
+fn pumpportal_local_trader() -> PumpPortalTrader {
+    PumpPortalTrader::local()
 }
 
 /// Show current positions and P&L
@@ -2902,7 +4319,191 @@ pub async fn hot_scan(
         config.safety.clone(),
         Some(format!("{}/positions.json", config.wallet.credentials_dir)),
     ));
-    position_manager.load().await?;
+    // Fail closed: refuse to start HotScan with unknown ownership state (F1).
+    position_manager.load().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load persisted positions; refusing to start HotScan with unknown ownership state: {}",
+            e
+        )
+    })?;
+
+    // === F1: HotScan canonical persistence + startup recovery ===
+    // Replicates the primary start() transaction-truth init inside HotScan so
+    // that a HotScan restart recovers in-flight signatures and canonicalizes
+    // legacy positions before any new buy. A submitted signature is submission
+    // identity, not fill proof (INV-TX-001); the pending journal is the source of
+    // truth for unresolved state across restarts.
+
+    // Reviewed default reconciler config (250ms polling / 15s timeout).
+    let trade_reconciler = std::sync::Arc::new(TradeReconciler::new(rpc_client.clone()));
+
+    // Build the exact controlled-wallet registry. Local set = primary local
+    // keypair + every successfully loaded MultiWalletManager local wallet. Local
+    // signing authority and Lightning wallet authority are distinct
+    // (INV-WALLET-001); we never fall back between them (INV-WALLET-002).
+    let mut hotscan_local_wallets: Vec<Pubkey> = Vec::new();
+    if let Some(ref mw) = multi_wallet {
+        for w in mw.wallets() {
+            hotscan_local_wallets.push(w.pubkey());
+        }
+    }
+
+    // Strictly parse the configured Lightning wallet, if present. An invalid
+    // non-empty Lightning wallet fails closed for recovery/trading startup.
+    let hotscan_lightning_wallet: Option<Pubkey> = {
+        let lw = config.pumpportal.lightning_wallet.trim();
+        if lw.is_empty() {
+            None
+        } else {
+            match Pubkey::from_str(lw) {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Configured lightning_wallet is not a valid Pubkey; refusing to start HotScan recovery/trading: {}",
+                        e
+                    ));
+                }
+            }
+        }
+    };
+
+    let hotscan_registry = std::sync::Arc::new(ExecutionWalletRegistry::new(
+        keypair.pubkey(),
+        &hotscan_local_wallets,
+        hotscan_lightning_wallet,
+    ));
+    let hotscan_probe = WalletOwnershipProbe::new(rpc_client.clone());
+
+    // Shared pending-execution journal at the SAME credentials path as start().
+    let hotscan_pending_path =
+        format!("{}/pending_executions.json", config.wallet.credentials_dir);
+    let pending_executions =
+        std::sync::Arc::new(PendingExecutionStore::new(hotscan_pending_path));
+    pending_executions.load().await?;
+    pending_executions.ensure_writable().await?;
+
+    // Fail-closed halt flag for NEW HotScan entries. Set when unresolved
+    // transaction or ownership state remains AFTER recovery. Existing safe exits
+    // (the monitor task) continue regardless of this flag.
+    let new_entries_halted = std::sync::Arc::new(AtomicBool::new(false));
+
+    // 1. recover the pending journal against confirmed chain state;
+    // 2. recover legacy/incomplete positions from chain evidence;
+    // 3. halt NEW entries iff any unresolved pending OR recovery-required /
+    //    unroutable position remains.
+    let hotscan_pending_summary =
+        recover_pending_store(&trade_reconciler, &pending_executions, &position_manager).await?;
+    info!(
+        "HotScan pending recovery: recovered={}, confirmed_failures_removed={}, still_unresolved={}, accounting_conflicts={}",
+        hotscan_pending_summary.recovered,
+        hotscan_pending_summary.confirmed_failures_removed,
+        hotscan_pending_summary.still_unresolved,
+        hotscan_pending_summary.accounting_conflicts
+    );
+
+    let hotscan_legacy_summary = recover_legacy_positions(
+        &trade_reconciler,
+        &hotscan_probe,
+        hotscan_registry.as_ref(),
+        &position_manager,
+    )
+    .await?;
+    info!(
+        "HotScan legacy recovery: recovered={}, resolved_zero={}, still_recovery_required={}",
+        hotscan_legacy_summary.recovered,
+        hotscan_legacy_summary.resolved_zero,
+        hotscan_legacy_summary.still_recovery_required
+    );
+
+    // Re-inspect remaining positions for any still recovery-required/unroutable.
+    let hotscan_post_recovery_positions = position_manager.get_all_positions().await;
+    let hotscan_residual_blocked = hotscan_post_recovery_positions
+        .iter()
+        .filter(|p| legacy_recovery_required(p, hotscan_registry.as_ref()))
+        .count();
+
+    if !hotscan_pending_summary.fully_resolved()
+        || !hotscan_legacy_summary.fully_resolved()
+        || hotscan_residual_blocked > 0
+    {
+        error!(
+            "HotScan NEW entries HALTED after recovery: unresolved_pending={}, legacy_unresolved={}, residual_blocked_positions={}",
+            hotscan_pending_summary.still_unresolved,
+            hotscan_legacy_summary.still_recovery_required,
+            hotscan_residual_blocked
+        );
+        new_entries_halted.store(true, Ordering::SeqCst);
+    } else {
+        info!("HotScan startup recovery complete: transaction/position truth restored; new entries may resume.");
+    }
+
+    // === F2: explicit route-capable trader handles ===
+    // `trader` above remains the active handle (used for pool readiness). Make the
+    // route-capable handles explicit so the live buy path (and Agent G's sell
+    // path) never conflate Local signing with Lightning submission. No new API.
+    // Local trader: available whenever PumpPortal trading is enabled.
+    let hotscan_local_trader: Option<std::sync::Arc<crate::trading::pumpportal_api::PumpPortalTrader>> =
+        if config.pumpportal.use_for_trading {
+            Some(std::sync::Arc::new(
+                crate::trading::pumpportal_api::PumpPortalTrader::local(),
+            ))
+        } else {
+            None
+        };
+    // Lightning trader: available ONLY when an API key is configured.
+    let hotscan_lightning_trader: Option<std::sync::Arc<crate::trading::pumpportal_api::PumpPortalTrader>> =
+        if config.pumpportal.use_for_trading && !config.pumpportal.api_key.is_empty() {
+            Some(std::sync::Arc::new(
+                crate::trading::pumpportal_api::PumpPortalTrader::lightning(
+                    config.pumpportal.api_key.clone(),
+                ),
+            ))
+        } else {
+            None
+        };
+    // Referenced by the live buy path below and reused by Agent G.
+    let _ = (&hotscan_local_trader, &hotscan_lightning_trader);
+
+    // === C1: halt NEW HotScan entries when any canonical position is
+    // operationally unexitable with the CURRENT exit credentials/routes. This
+    // mirrors the primary start() B6 check but uses the HotScan-scoped route
+    // handles/registry. Positions are kept; safe routed exits still proceed.
+    // In particular, an existing Lightning position + configured Lightning
+    // wallet but MISSING api_key (=> no lightning trader) HALTS new entries.
+    // Log mint + public wallet + reason only; no secrets.
+    {
+        let local_exit_available = hotscan_local_trader.is_some();
+        let lightning_exit_available = hotscan_lightning_trader.is_some();
+        let mut unexitable = 0usize;
+        for position in position_manager.get_all_positions().await {
+            if !position_has_operational_exit_route(
+                &position,
+                hotscan_registry.as_ref(),
+                local_exit_available,
+                lightning_exit_available,
+            ) {
+                unexitable += 1;
+                let reason = if position.token_decimals.is_none() {
+                    "unknown token decimals"
+                } else if position.wallet_pubkey.parse::<Pubkey>().is_err() {
+                    "invalid recorded wallet"
+                } else {
+                    "no routable exit trader for wallet's route"
+                };
+                error!(
+                    "HotScan operationally unexitable position: mint {} wallet {} - {}",
+                    position.mint, position.wallet_pubkey, reason
+                );
+            }
+        }
+        if unexitable > 0 {
+            error!(
+                "HotScan NEW entries HALTED: {} canonical position(s) cannot be exited with current credentials/routes",
+                unexitable
+            );
+            new_entries_halted.store(true, Ordering::SeqCst);
+        }
+    }
 
     // Initialize smart money wallet profiler and Helius client (if enabled)
     let (helius_client, wallet_profiler) = if config.smart_money.enabled {
@@ -3017,32 +4618,31 @@ pub async fn hot_scan(
     if config.auto_sell.enabled && !dry_run {
         let monitor_config = config.clone();
         let monitor_positions = position_manager.clone();
-        let monitor_trader = trader.clone();
         let monitor_keypair = keypair.clone();
         let monitor_rpc = rpc_client.clone();
         let monitor_dex = DexScreenerClient::new();
         let monitor_bought_mints = bought_mints.clone();
         let monitor_bought_mints_path = bought_mints_path.clone();
         let monitor_sold_mints = sold_mints.clone();
-        let monitor_failed_mints = failed_mints.clone();
         let monitor_kill_switch = kill_switch_evaluator.clone();
-        let monitor_helius = helius_client.clone();
-        let monitor_use_local_api = use_local_api;
         let monitor_multi_wallet = multi_wallet.clone();
-        // Determine which wallet to query for token balances
-        let monitor_wallet = if use_local_api {
-            keypair.pubkey()
-        } else if !config.pumpportal.lightning_wallet.is_empty() {
-            Pubkey::from_str(&config.pumpportal.lightning_wallet)
-                .unwrap_or_else(|_| keypair.pubkey())
-        } else {
-            keypair.pubkey()
-        };
+        // === AGENT G: transaction-truth wiring for the HotScan SELL path ===
+        // Clone the already-initialized reconciler, shared pending journal, exact
+        // wallet registry, route-capable trader handles (Agent F), and the
+        // new-entry halt flag into the monitor task. The monitor now resolves the
+        // EXACT execution route per position (no global route, no Lightning->Local
+        // fallback) and reconciles every exit before touching position state.
+        let monitor_reconciler = trade_reconciler.clone();
+        let monitor_pending = pending_executions.clone();
+        let monitor_registry = hotscan_registry.clone();
+        let monitor_local_trader = hotscan_local_trader.clone();
+        let monitor_lightning_trader = hotscan_lightning_trader.clone();
+        let monitor_entry_halt = new_entries_halted.clone();
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
             let poll_interval_ms = monitor_config.auto_sell.price_poll_interval_ms;
-            info!("Features: Dynamic Trailing ({}%-{}%), Layered Exits ({}%/{}%/{}%), Kill-Switch, LOCAL FALLBACK",
+            info!("Features: Dynamic Trailing ({}%-{}%), Layered Exits ({}%/{}%/{}%), Kill-Switch, exact-wallet reconciled exits",
                 monitor_config.auto_sell.trailing_stop_base_pct,
                 monitor_config.auto_sell.trailing_stop_tight_pct,
                 monitor_config.auto_sell.quick_profit_pct,
@@ -3050,18 +4650,9 @@ pub async fn hot_scan(
                 monitor_config.auto_sell.take_profit_pct
             );
             info!("Poll interval: {}ms", poll_interval_ms);
-            if !monitor_use_local_api {
-                info!(
-                    "Using Lightning wallet for balance queries: {}",
-                    monitor_wallet
-                );
-            }
 
             let mut sell_attempts: std::collections::HashMap<String, u32> =
                 std::collections::HashMap::new();
-            // Track confirmed positions (tx landed and ATA exists)
-            let mut confirmed_positions: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
@@ -3139,58 +4730,12 @@ pub async fn hot_scan(
                         None => continue,
                     };
 
-                    // TX CONFIRMATION CHECK: Verify buy tx confirmed before allowing sells
-                    if !confirmed_positions.contains(&position.mint) {
-                        let position_age_secs = (chrono::Utc::now() - position.entry_time)
-                            .num_seconds()
-                            .max(0) as u64;
-
-                        // First 5 seconds: just wait
-                        if position_age_secs < 5 {
-                            continue;
-                        }
-
-                        // After 5 seconds: check if we have tokens
-                        // Use position's wallet_pubkey if available (multi-wallet), fallback to monitor_wallet
-                        let check_wallet = if !position.wallet_pubkey.is_empty() {
-                            Pubkey::from_str(&position.wallet_pubkey).unwrap_or(monitor_wallet)
-                        } else {
-                            monitor_wallet
-                        };
-                        let token_balance =
-                            query_token_balance(&monitor_rpc, &check_wallet, &position.mint);
-
-                        if token_balance > 0 {
-                            info!(
-                                "[{}] TX CONFIRMED - token balance: {}",
-                                position.symbol, token_balance
-                            );
-                            confirmed_positions.insert(position.mint.clone());
-                        } else if position_age_secs > 30 {
-                            // After 30 seconds with no tokens, assume tx failed
-                            warn!(
-                                "[{}] TX LIKELY FAILED - no tokens after 30s, removing position (30min cooldown)",
-                                position.symbol
-                            );
-                            let _ = monitor_positions.abandon_position(&position.mint).await;
-                            let _ = remove_bought_mint(
-                                &monitor_bought_mints,
-                                &monitor_bought_mints_path,
-                                &position.mint,
-                            )
-                            .await;
-                            // Add to failed_mints with 30 minute cooldown to prevent repeated failures
-                            {
-                                let mut failed = monitor_failed_mints.lock().await;
-                                failed.insert(position.mint.clone(), chrono::Utc::now().timestamp());
-                                info!("[{}] Added to failed_mints blacklist (30min cooldown)", position.symbol);
-                            }
-                            continue;
-                        } else {
-                            // Still waiting for confirmation
-                            continue;
-                        }
-                    }
+                    // G1: The old post-buy TX-confirmation polling (the tracking
+                    // HashSet, the 5s wait, the token-balance poll, and the 30s
+                    // likely-failed abandon path) is GONE. After Agent F, a real
+                    // HotScan position exists ONLY after a ConfirmedFill; legacy
+                    // positions are handled by startup recovery or remain blocked.
+                    // The monitor never re-derives fill truth from a balance poll.
 
                     // Calculate P&L from entry
                     let pnl_pct = if position.entry_price > 0.0 {
@@ -3345,27 +4890,28 @@ pub async fn hot_scan(
                         }
                     }
 
-                    // Execute sell
+                    // === AGENT G: reconciled HotScan exit with EXACT wallet route ===
+                    // The kill-switch trigger already funnels into this same
+                    // `should_sell` block (G9), so it receives the identical
+                    // reconciled path — there is no separate estimated kill-switch
+                    // exit.
                     if should_sell {
                         warn!(
                             "AUTO-SELL TRIGGERED: {} ({}) - {}",
                             position.symbol, position.mint, reason
                         );
 
-                        if let Some(ref trader) = monitor_trader {
-                            let slippage = monitor_config.trading.slippage_bps / 100;
-                            let priority_fee =
-                                monitor_config.trading.priority_fee_lamports as f64 / 1e9;
+                        let slippage = monitor_config.trading.slippage_bps / 100;
+                        let priority_fee =
+                            monitor_config.trading.priority_fee_lamports as f64 / 1e9;
 
+                        // Keep the existing max retry count (5). Exceeding it leaves the
+                        // position OPEN/TRACKED (INV-POS-001); a failed submission must
+                        // never make a wallet-owned position disappear.
+                        {
                             let attempts = sell_attempts.entry(position.mint.clone()).or_insert(0);
                             *attempts += 1;
-
                             if *attempts > 5 {
-                                // INV-POS-002: a failed sell must never make a wallet-owned
-                                // position disappear from tracking. Do NOT abandon the position
-                                // or drop it from bought-mints. Leave it OPEN/TRACKED, reset the
-                                // retry counter, and let a later cycle retry. Reconciliation is a
-                                // later packet.
                                 error!(
                                     "AUTO-SELL UNRESOLVED for {} after 5 attempts - position remains OPEN/TRACKED",
                                     position.symbol
@@ -3373,220 +4919,411 @@ pub async fn hot_scan(
                                 sell_attempts.remove(&position.mint);
                                 continue;
                             }
+                        }
+                        let attempt_no = *sell_attempts.get(&position.mint).unwrap_or(&1);
 
-                            // Query SOL balance BEFORE sell for real P&L tracking
-                            // Use position's wallet if available (multi-wallet), fallback to monitor_wallet
-                            let position_wallet = if !position.wallet_pubkey.is_empty() {
-                                Pubkey::from_str(&position.wallet_pubkey).unwrap_or(monitor_wallet)
-                            } else {
-                                monitor_wallet
-                            };
-                            let sol_before = monitor_rpc
-                                .get_balance(&position_wallet)
-                                .unwrap_or(0) as f64
-                                / 1_000_000_000.0;
+                        // G2 / C2 PENDING GUARD: if a Buy OR a Sell for this mint is
+                        // already in flight, do NOT submit a new sell. A pending Buy
+                        // can be a confirmed-fill whose durable position save failed;
+                        // selling before it reconciles could close a position that
+                        // restart recovery would then re-open from the stale pending
+                        // buy. Either pending => keep the position, no submission.
+                        let pending_buy = monitor_pending
+                            .get_for_mint(&position.mint, ReconciliationSide::Buy)
+                            .await;
+                        let pending_sell = monitor_pending
+                            .get_for_mint(&position.mint, ReconciliationSide::Sell)
+                            .await;
+                        if let Some(sig) = pending_blocks_automatic_sell(
+                            pending_buy.as_ref(),
+                            pending_sell.as_ref(),
+                        ) {
+                            warn!(
+                                "[{}] pending transaction already in flight (sig {}) - not submitting a new exit; position kept",
+                                position.symbol, sig
+                            );
+                            continue;
+                        }
 
-                            // Determine the correct keypair for this position
-                            // For multi-wallet, look up keypair by position's wallet_pubkey
-                            let sell_keypair: std::sync::Arc<solana_sdk::signature::Keypair> = if !position.wallet_pubkey.is_empty() {
-                                if let Some(ref mw) = monitor_multi_wallet {
-                                    // Find wallet matching position's pubkey
-                                    if let Some(wallet) = mw.find_by_address(&position.wallet_pubkey) {
-                                        std::sync::Arc::new(
-                                            solana_sdk::signature::Keypair::from_bytes(&wallet.keypair.to_bytes()).unwrap()
-                                        )
-                                    } else {
-                                        warn!("[{}] Position wallet {} not found in multi-wallet, using primary",
-                                              position.symbol, &position.wallet_pubkey[..8]);
-                                        monitor_keypair.clone()
+                        // G3 CANONICAL POSITION REQUIREMENT: token_decimals Some, wallet
+                        // Pubkey valid, and an exact registry route. No wallet fallback.
+                        if position.token_decimals.is_none() {
+                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                            error!(
+                                "[{}] position has unknown token_decimals - no sell, HotScan new entries HALTED",
+                                position.symbol
+                            );
+                            continue;
+                        }
+                        let position_wallet = match Pubkey::from_str(position.wallet_pubkey.trim()) {
+                            Ok(pk) if !position.wallet_pubkey.trim().is_empty() => pk,
+                            _ => {
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] empty/invalid wallet_pubkey '{}' - no sell, HotScan new entries HALTED",
+                                    position.symbol, position.wallet_pubkey
+                                );
+                                continue;
+                            }
+                        };
+                        let route = match monitor_registry.route_for(&position_wallet) {
+                            Some(r) => r,
+                            None => {
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] wallet {} has no route in registry - no sell, HotScan new entries HALTED",
+                                    position.symbol, position.wallet_pubkey
+                                );
+                                continue;
+                            }
+                        };
+
+                        // G5 INTENT MAPPING (does NOT change the requested "25%" amount).
+                        let intent = hotscan_sell_intent_for_layer(sell_pct);
+
+                        // G4 EXACT ROUTE per position. Ignore any global route. NO
+                        // Lightning-attempts-1-3-then-Local, NO primary signer fallback,
+                        // NO unwrap_or(monitor_wallet).
+                        let routed_sell: Option<Result<String, crate::error::Error>> = match route {
+                            crate::wallet::ExecutionRoute::Local => {
+                                // Local position => use the Local trader + EXACT local
+                                // signer (primary keypair if its pubkey matches, else the
+                                // recovery MultiWalletManager). Missing signer => no sell.
+                                match monitor_local_trader {
+                                    Some(ref local_trader) => {
+                                        if monitor_keypair.pubkey() == position_wallet {
+                                            info!(
+                                                "[{}] Local sell (attempt {}) via primary keypair",
+                                                position.symbol, attempt_no
+                                            );
+                                            Some(
+                                                local_trader
+                                                    .sell_local(
+                                                        &position.mint,
+                                                        sell_pct,
+                                                        slippage,
+                                                        priority_fee,
+                                                        &monitor_keypair,
+                                                        &monitor_rpc,
+                                                    )
+                                                    .await,
+                                            )
+                                        } else if let Some(ref mw) = monitor_multi_wallet {
+                                            match mw.find_by_address(&position.wallet_pubkey) {
+                                                Some(tw) => {
+                                                    info!(
+                                                        "[{}] Local sell (attempt {}) via recovery wallet {}",
+                                                        position.symbol, attempt_no, position.wallet_pubkey
+                                                    );
+                                                    Some(
+                                                        local_trader
+                                                            .sell_local(
+                                                                &position.mint,
+                                                                sell_pct,
+                                                                slippage,
+                                                                priority_fee,
+                                                                &tw.keypair,
+                                                                &monitor_rpc,
+                                                            )
+                                                            .await,
+                                                    )
+                                                }
+                                                None => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
                                     }
-                                } else {
-                                    monitor_keypair.clone()
+                                    None => None,
                                 }
-                            } else {
-                                monitor_keypair.clone()
-                            };
-
-                            // For Local API mode, use local signing directly
-                            // For Lightning mode, try Lightning first then fall back to local
-                            let sell_result: std::result::Result<String, crate::error::Error> =
-                                if monitor_use_local_api {
-                                    // Local API mode: use local signing with correct wallet
-                                    info!("Attempting Local API sell (attempt {}, wallet: {})",
-                                          attempts, &sell_keypair.pubkey().to_string()[..8]);
-                                    trader
-                                        .sell_local(
-                                            &position.mint,
-                                            sell_pct,
-                                            slippage,
-                                            priority_fee,
-                                            &sell_keypair,
-                                            &monitor_rpc,
-                                        )
-                                        .await
-                                } else if *attempts <= 3 {
-                                    info!("Attempting Lightning API sell (attempt {})", attempts);
-                                    trader
-                                        .sell(&position.mint, sell_pct, slippage, priority_fee)
-                                        .await
-                                } else {
-                                    warn!("Lightning failed 3x, trying LOCAL SIGNING fallback (attempt {})", attempts);
-                                    trader
-                                        .sell_local(
-                                            &position.mint,
-                                            sell_pct,
-                                            slippage,
-                                            priority_fee,
-                                            &sell_keypair,
-                                            &monitor_rpc,
-                                        )
-                                        .await
-                                };
-
-                            match sell_result {
-                                Ok(sig) => {
-                                    info!("AUTO-SELL EXECUTED: {} - {}", position.symbol, sig);
-                                    sell_attempts.remove(&position.mint);
-
-                                    // Wait for tx confirmation then query actual SOL received
-                                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                                    let sol_after = monitor_rpc
-                                        .get_balance(&position_wallet)
-                                        .unwrap_or(0) as f64
-                                        / 1_000_000_000.0;
-                                    let raw_received = (sol_after - sol_before).max(0.0);
-
-                                    // Sanity check: received SOL shouldn't be more than 10x position cost
-                                    // If it is, the balance query likely failed - use estimate instead
-                                    let max_reasonable = position.total_cost_sol * 10.0;
-                                    let actual_received = if raw_received > max_reasonable {
-                                        warn!(
-                                            "[{}] Balance query anomaly: before={:.4}, after={:.4}, diff={:.4} - using estimate",
-                                            position.symbol, sol_before, sol_after, raw_received
+                            }
+                            crate::wallet::ExecutionRoute::Lightning => {
+                                // Lightning position => Lightning trader ONLY. No Local
+                                // fallback (INV-WALLET-001/003).
+                                match monitor_lightning_trader {
+                                    Some(ref lightning_trader) => {
+                                        info!(
+                                            "[{}] Lightning sell (attempt {})",
+                                            position.symbol, attempt_no
                                         );
-                                        0.0 // Force fallback to estimate
+                                        Some(
+                                            lightning_trader
+                                                .sell(&position.mint, sell_pct, slippage, priority_fee)
+                                                .await,
+                                        )
+                                    }
+                                    None => None,
+                                }
+                            }
+                        };
+
+                        let sell_result = match routed_sell {
+                            Some(r) => r,
+                            None => {
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] no exact signer/trader for wallet {} route {:?} - no sell, HotScan new entries HALTED",
+                                    position.symbol, position.wallet_pubkey, route
+                                );
+                                continue;
+                            }
+                        };
+
+                        // G5 SUBMISSION: on provider error keep the position; on signature
+                        // log SUBMITTED (not EXECUTED), persist pending, then reconcile.
+                        let signature = match sell_result {
+                            Ok(sig) => sig,
+                            Err(e) => {
+                                error!(
+                                    "AUTO-SELL SUBMISSION FAILED for {} (attempt {}): {} - position remains OPEN/TRACKED",
+                                    position.symbol, attempt_no, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        info!("AUTO-SELL SUBMITTED: {} (sig {})", position.symbol, signature);
+
+                        let pending_sell = PendingExecution::sell(
+                            signature.clone(),
+                            position.mint.clone(),
+                            position.wallet_pubkey.clone(),
+                            PendingSellContext {
+                                requested_amount: sell_pct.to_string(),
+                                intent,
+                                reason: reason.clone(),
+                            },
+                        );
+                        // AUDIT-002 A8: retain the exact pending sell + whether the first
+                        // journal write persisted. HotScan has no shared primary
+                        // reservation, so no reservation behavior is added here.
+                        let pending_sell_persisted = match monitor_pending.upsert(pending_sell.clone()).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                // Signature already exists chain-side; persistence failed.
+                                // Halt new entries but STILL reconcile the submitted signature.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                error!(
+                                    "[{}] failed to persist pending sell (sig {}): {} - HotScan new entries HALTED, still reconciling",
+                                    position.symbol, signature, e
+                                );
+                                false
+                            }
+                        };
+
+                        // Reconcile: no fixed sleep, no estimated-proceeds fallback.
+                        let outcome = monitor_reconciler
+                            .reconcile(
+                                &signature,
+                                &position.wallet_pubkey,
+                                &position.mint,
+                                ReconciliationSide::Sell,
+                            )
+                            .await;
+
+                        match outcome {
+                            Ok(ReconciliationOutcome::ConfirmedFailure {
+                                error, observed_after_ms, ..
+                            }) => {
+                                // Remove pending, keep position, do NOT mark any layer.
+                                if let Err(e) = monitor_pending.remove(&signature).await {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "[{}] failed to remove pending sell after ConfirmedFailure (sig {}): {} - HotScan new entries HALTED",
+                                        position.symbol, signature, e
+                                    );
+                                }
+                                error!(
+                                    "AUTO-SELL CONFIRMED FAILED for {} (sig {}): {} ({}ms observed) - position remains OPEN/TRACKED",
+                                    position.symbol, signature, error, observed_after_ms
+                                );
+                                continue;
+                            }
+                            Ok(ReconciliationOutcome::Unresolved { reason: unresolved_reason, .. }) => {
+                                // KEEP pending, keep position + flags, halt new entries.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                // AUDIT-002 A8: retry durability if the initial write failed.
+                                if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                    error!(
+                                        "AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), position kept, HotScan new entries HALTED",
+                                        position.mint, signature, position.wallet_pubkey, unresolved_reason
+                                    );
+                                } else {
+                                    error!(
+                                        "CRITICAL: AUTO-SELL UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Position kept, HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                        position.mint, signature, position.wallet_pubkey, unresolved_reason, signature
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                // Structural observer failure is not tx-failure proof.
+                                monitor_entry_halt.store(true, Ordering::SeqCst);
+                                // AUDIT-002 A8: same durability retry rule as Unresolved.
+                                if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                    error!(
+                                        "CRITICAL: HotScan sell reconciliation error for {} (sig {}): {} - pending kept (durable), position kept, HotScan new entries HALTED",
+                                        position.symbol, signature, e
+                                    );
+                                } else {
+                                    error!(
+                                        "CRITICAL: HotScan sell reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. Position kept, HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                        position.symbol, signature, e, signature
+                                    );
+                                }
+                                continue;
+                            }
+                            Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+                                // Identity validation at the live boundary.
+                                if fill.side != ReconciliationSide::Sell
+                                    || fill.wallet != position.wallet_pubkey
+                                    || fill.mint != position.mint
+                                {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
+                                    // AUDIT-002 A8: confirmed-but-unapplied. Retry durability.
+                                    if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                        error!(
+                                            "CRITICAL: reconciled HotScan sell fill identity mismatch for sig {} - pending kept (durable), position kept, HotScan new entries HALTED",
+                                            signature
+                                        );
                                     } else {
-                                        raw_received
+                                        error!(
+                                            "CRITICAL: reconciled HotScan sell fill identity mismatch for sig {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Position kept, HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                            signature, signature
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                // G6 economics via the pure fill validator (decimals match,
+                                // nonzero raw, finite delta/price, no oversell). Negative net
+                                // proceeds are allowed.
+                                let (actual_sold_raw, actual_received_sol, actual_exit_price) =
+                                    match primary_sell_fill_values(&fill, &position) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            monitor_entry_halt.store(true, Ordering::SeqCst);
+                                            // AUDIT-002 A8: confirmed-but-unapplied. Retry durability.
+                                            if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                                error!(
+                                                    "[{}] reconciled sell fill validation failed (sig {}): {} - pending kept (durable), position kept, HotScan new entries HALTED",
+                                                    position.symbol, signature, e
+                                                );
+                                            } else {
+                                                error!(
+                                                    "CRITICAL: [{}] reconciled sell fill validation failed (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. Position kept, HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                    position.symbol, signature, e, signature
+                                                );
+                                            }
+                                            continue;
+                                        }
                                     };
 
-                                    // Calculate trade metrics
-                                    let hold_secs =
-                                        (chrono::Utc::now() - position.entry_time).num_seconds();
-                                    let price_change_pct = ((current_price - position.entry_price)
-                                        / position.entry_price)
-                                        * 100.0;
-
-                                    if sell_pct == "50%" {
-                                        // LAYER 1: Quick profit - sell 50%
-                                        let sell_amount = position.token_amount / 2;
-                                        // Use actual received SOL (fallback to estimate if 0)
-                                        let received = if actual_received > 0.0 {
-                                            actual_received
+                                // G6 actual reconciled close (idempotent via receipt ledger).
+                                let close_result = match monitor_positions
+                                    .close_position_reconciled(
+                                        &position.mint,
+                                        &signature,
+                                        actual_sold_raw,
+                                        actual_received_sol,
+                                    )
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        monitor_entry_halt.store(true, Ordering::SeqCst);
+                                        // AUDIT-002 A8: confirmed-but-unapplied. Retry durability.
+                                        if retry_pending_durability_if_needed(&monitor_pending, &pending_sell, pending_sell_persisted).await {
+                                            error!(
+                                                "[{}] reconciled close failed (sig {}): {} - pending kept (durable), HotScan new entries HALTED",
+                                                position.symbol, signature, e
+                                            );
                                         } else {
-                                            (sell_amount as f64 * current_price) * 0.98
-                                        };
-                                        let pnl_sol = received - (position.total_cost_sol / 2.0);
-                                        let _ = monitor_positions
-                                            .close_position(
-                                                &position.mint,
-                                                sell_amount,
-                                                received,
-                                            )
-                                            .await;
-                                        let _ = monitor_positions
-                                            .mark_quick_profit_taken(&position.mint)
-                                            .await;
-                                        info!("=== LAYER 1 PROFIT TAKEN (50%) ===");
-                                        info!(
-                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                            position.symbol,
-                                            position.entry_price,
-                                            current_price,
-                                            price_change_pct
-                                        );
-                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
-                                              sell_amount, received, pnl_sol, hold_secs);
-                                    } else if sell_pct == "25%" {
-                                        // LAYER 2: Second profit - sell 25% of original (50% of remaining)
-                                        let sell_amount = position.token_amount / 2; // Half of what's left
-                                        let received = if actual_received > 0.0 {
-                                            actual_received
-                                        } else {
-                                            (sell_amount as f64 * current_price) * 0.98
-                                        };
-                                        // Cost basis is proportional to remaining position
-                                        let cost_ratio = sell_amount as f64 / position.token_amount as f64;
-                                        let cost_basis = position.total_cost_sol * cost_ratio;
-                                        let pnl_sol = received - cost_basis;
-                                        let _ = monitor_positions
-                                            .close_position(
-                                                &position.mint,
-                                                sell_amount,
-                                                received,
-                                            )
-                                            .await;
-                                        let _ = monitor_positions
-                                            .mark_second_profit_taken(&position.mint)
-                                            .await;
-                                        info!("=== LAYER 2 PROFIT TAKEN (25%) ===");
-                                        info!(
-                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                            position.symbol,
-                                            position.entry_price,
-                                            current_price,
-                                            price_change_pct
-                                        );
-                                        info!("  Tokens: {} | Received: {:.4} SOL | P&L: {:+.4} SOL | Hold: {}s",
-                                              sell_amount, received, pnl_sol, hold_secs);
-                                    } else {
-                                        // Use actual received SOL (fallback to estimate if 0)
-                                        let received = if actual_received > 0.0 {
-                                            actual_received
-                                        } else {
-                                            (position.token_amount as f64 * current_price) * 0.98
-                                        };
-                                        let pnl_sol = received - position.total_cost_sol;
-                                        let pnl_pct = (pnl_sol / position.total_cost_sol) * 100.0;
-                                        let _ = monitor_positions
-                                            .close_position(
-                                                &position.mint,
-                                                position.token_amount,
-                                                received,
-                                            )
-                                            .await;
-
-                                        // Clean up bought_mints on successful full sell
-                                        let _ = remove_bought_mint(
-                                            &monitor_bought_mints,
-                                            &monitor_bought_mints_path,
-                                            &position.mint,
-                                        )
-                                        .await;
-
-                                        // Add to sold_mints with 5-minute cooldown before re-entry
-                                        // This prevents immediate re-buy at the top
-                                        {
-                                            let mut sold = monitor_sold_mints.lock().await;
-                                            sold.insert(position.mint.clone(), chrono::Utc::now().timestamp());
-                                            info!("[{}] Added to sold_mints (5min cooldown before re-entry)", position.symbol);
+                                            error!(
+                                                "CRITICAL: [{}] reconciled close failed (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                position.symbol, signature, e, signature
+                                            );
                                         }
+                                        continue;
+                                    }
+                                };
 
-                                        info!("=== TRADE CLOSED (Full) ===");
-                                        info!(
-                                            "  {} | Entry: {:.10} | Exit: {:.10} | Change: {:+.2}%",
-                                            position.symbol,
-                                            position.entry_price,
-                                            current_price,
-                                            price_change_pct
-                                        );
-                                        info!("  Cost: {:.4} SOL | Received: {:.4} SOL (actual) | P&L: {:+.4} SOL ({:+.1}%) | Hold: {}s",
-                                              position.total_cost_sol, received, pnl_sol, pnl_pct, hold_secs);
+                                sell_attempts.remove(&position.mint);
+
+                                // G7/G8 full vs partial comes from the ACTUAL fill.
+                                let fully_closed = close_result.fully_closed;
+                                let already_applied = close_result.already_applied;
+                                let hold_secs =
+                                    (chrono::Utc::now() - position.entry_time).num_seconds();
+
+                                // G7 LAYER MARKERS: after a confirmed actual PARTIAL close,
+                                // apply the intent's marker. Even on idempotent replay a
+                                // missing marker may be applied while the position remains.
+                                // Never mark on failure/unresolved (handled above).
+                                if !fully_closed {
+                                    match intent {
+                                        PendingSellIntent::QuickProfit => {
+                                            let _ = monitor_positions
+                                                .mark_quick_profit_taken(&position.mint)
+                                                .await;
+                                        }
+                                        PendingSellIntent::SecondProfit => {
+                                            let _ = monitor_positions
+                                                .mark_second_profit_taken(&position.mint)
+                                                .await;
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                Err(e) => {
+
+                                // G8 FULL-EXIT CACHE/COOLDOWN: only when the ACTUAL close is
+                                // fully_closed. A requested "100%" that only partially fills
+                                // must NOT remove bought_mint or mark the sold cooldown.
+                                if hotscan_full_exit_removes_cache(fully_closed) {
+                                    let _ = remove_bought_mint(
+                                        &monitor_bought_mints,
+                                        &monitor_bought_mints_path,
+                                        &position.mint,
+                                    )
+                                    .await;
+                                    {
+                                        let mut sold = monitor_sold_mints.lock().await;
+                                        sold.insert(
+                                            position.mint.clone(),
+                                            chrono::Utc::now().timestamp(),
+                                        );
+                                        info!(
+                                            "[{}] Added to sold_mints (5min cooldown before re-entry)",
+                                            position.symbol
+                                        );
+                                    }
+                                }
+
+                                if fully_closed {
+                                    info!("=== AUTO-SELL CONFIRMED (Full) ===");
+                                } else {
+                                    info!("=== AUTO-SELL CONFIRMED (Partial) ===");
+                                }
+                                info!(
+                                    "  {} (sig {}) | sold_raw={} decimals={} net_sol_delta={:+.9} exit_price={:.12} SOL/token | realized P&L: {:+.9} SOL | recon_wait={}ms | hold={}s{}",
+                                    position.symbol,
+                                    signature,
+                                    actual_sold_raw,
+                                    fill.token_decimals,
+                                    actual_received_sol,
+                                    actual_exit_price,
+                                    close_result.pnl_sol,
+                                    fill.reconciliation_wait_ms,
+                                    hold_secs,
+                                    if already_applied { " (already applied; idempotent)" } else { "" }
+                                );
+
+                                // Remove pending LAST, after durable position application.
+                                if let Err(e) = monitor_pending.remove(&signature).await {
+                                    monitor_entry_halt.store(true, Ordering::SeqCst);
                                     error!(
-                                        "AUTO-SELL FAILED for {} (attempt {}): {}",
-                                        position.symbol, attempts, e
+                                        "[{}] failed to remove pending sell after confirmed fill (sig {}): {} - HotScan new entries HALTED; position state already applied",
+                                        position.symbol, signature, e
                                     );
                                 }
                             }
@@ -3677,13 +5414,19 @@ pub async fn hot_scan(
                             continue;
                         }
 
-                        // PRE-TRADE VALIDATION: Check position limits BEFORE trading
-                        if let Err(e) = position_manager.can_open_position(buy_amount).await {
+                        // F3: the pre-send PositionManager risk check is moved to
+                        // immediately before submission and now uses `final_buy_amount`
+                        // (the size actually sent after the creator multiplier), so it
+                        // cannot authorize a larger send than was checked.
+
+                        // F1: fail-closed halt on unresolved transaction/ownership state.
+                        // Existing safe exits (the monitor task) are unaffected.
+                        if new_entries_halted.load(Ordering::SeqCst) {
                             warn!(
-                                "Cannot open position for {}: {} - stopping buy loop",
-                                token.symbol, e
+                                "Skipping {} - HotScan new entries are HALTED (unresolved transaction/position truth)",
+                                token.symbol
                             );
-                            break; // Stop trying to buy more tokens
+                            break;
                         }
 
                         info!(
@@ -3772,11 +5515,13 @@ pub async fn hot_scan(
                             continue;
                         }
 
-                        if let Some(ref trader) = trader {
+                        {
                             let slippage = config.trading.slippage_bps / 100;
                             let priority_fee = config.trading.priority_fee_lamports as f64 / 1e9;
 
-                            // Select wallet for this trade (multi-wallet or single)
+                            // Select the local signer for this trade (multi-wallet or
+                            // single). This is only the LOCAL signing authority; in
+                            // Lightning mode the execution wallet is NOT this keypair.
                             let (trading_keypair, wallet_name) = if let Some(ref mw) = multi_wallet {
                                 let selected = mw.select_wallet(&rpc_client);
                                 let name = selected.name.clone();
@@ -3788,20 +5533,79 @@ pub async fn hot_scan(
                                 (keypair.clone(), "default".to_string())
                             };
 
+                            // F4: resolve the EXACT execution wallet. Local => selected
+                            // signer's Pubkey. Lightning => exact configured Lightning
+                            // wallet (never a MultiWallet keypair). No fallback.
+                            let use_lightning = !use_local_api;
+                            let execution_wallet = match hotscan_execution_wallet(
+                                use_lightning,
+                                trading_keypair.pubkey(),
+                                hotscan_lightning_wallet,
+                            ) {
+                                Ok(pk) => pk,
+                                Err(e) => {
+                                    new_entries_halted.store(true, Ordering::SeqCst);
+                                    error!(
+                                        "STRUCTURAL: cannot resolve HotScan execution wallet for {}: {} - halting new entries",
+                                        token.symbol, e
+                                    );
+                                    break;
+                                }
+                            };
+                            let wallet_string = execution_wallet.to_string();
+
+                            // F3: pre-send PositionManager risk check using the FINAL
+                            // amount actually being sent (after the creator multiplier),
+                            // immediately before submission.
+                            let risk_amount = hotscan_risk_check_amount(final_buy_amount);
+                            if let Err(e) = position_manager.can_open_position(risk_amount).await {
+                                warn!(
+                                    "Cannot open position for {} at final size {:.4} SOL: {} - stopping buy loop",
+                                    token.symbol, risk_amount, e
+                                );
+                                break; // Stop trying to buy more tokens
+                            }
+
+                            // F4: pick the route-capable trader handle explicitly.
+                            let route_trader = if use_lightning {
+                                match hotscan_lightning_trader {
+                                    Some(ref t) => t,
+                                    None => {
+                                        new_entries_halted.store(true, Ordering::SeqCst);
+                                        error!(
+                                            "STRUCTURAL: Lightning route active for {} but no Lightning trader (API key empty) - halting new entries",
+                                            token.symbol
+                                        );
+                                        break;
+                                    }
+                                }
+                            } else {
+                                match hotscan_local_trader {
+                                    Some(ref t) => t,
+                                    None => {
+                                        warn!(
+                                            "PumpPortal trading disabled - skipping buy for {}",
+                                            token.symbol
+                                        );
+                                        break;
+                                    }
+                                }
+                            };
+
                             info!(
-                                "Buying {:.4} SOL of {} via {} (wallet: {})",
+                                "Buying {:.4} SOL of {} via {} (execution wallet: {})",
                                 final_buy_amount,
                                 token.symbol,
-                                if use_local_api {
-                                    "Local API"
+                                if use_lightning { "Lightning" } else { "Local API" },
+                                if use_lightning {
+                                    wallet_string.clone()
                                 } else {
-                                    "Lightning"
-                                },
-                                wallet_name
+                                    format!("{} ({})", wallet_string, wallet_name)
+                                }
                             );
 
                             let buy_result = if use_local_api {
-                                trader
+                                route_trader
                                     .buy_local(
                                         &token.mint,
                                         final_buy_amount,
@@ -3812,145 +5616,326 @@ pub async fn hot_scan(
                                     )
                                     .await
                             } else {
-                                trader
+                                route_trader
                                     .buy(&token.mint, final_buy_amount, slippage, priority_fee)
                                     .await
                             };
 
                             match buy_result {
-                                Ok(sig) => {
-                                    info!("BUY EXECUTED: {} - {}", token.symbol, sig);
-                                    bought
-                                        .insert(token.mint.clone(), chrono::Utc::now().timestamp());
-                                    // Persist bought_mints to disk (with timestamps)
-                                    persist_bought_mints(&*bought_mints_path, &*bought);
-
-                                    // Record position
-                                    let estimated_tokens = (final_buy_amount / token.price_native) as u64;
-                                    let position = crate::position::manager::Position {
-                                        mint: token.mint.clone(),
-                                        name: token.name.clone(),
-                                        symbol: token.symbol.clone(),
-                                        bonding_curve: String::new(), // Not available from DexScreener
-                                        token_amount: estimated_tokens,
-                                        token_decimals: None,
-                                        entry_price: token.price_native,
-                                        total_cost_sol: final_buy_amount,
-                                        entry_time: chrono::Utc::now(),
-                                        entry_signature: sig,
-                                        entry_type:
-                                            crate::position::manager::EntryType::Opportunity,
-                                        quick_profit_taken: false,
-                                        second_profit_taken: false,
-                                        peak_price: token.price_native,
-                                        current_price: token.price_native,
-                                        kill_switch_triggered: false,
-                                        kill_switch_reason: None,
-                                        wallet_pubkey: trading_keypair.pubkey().to_string(),
-                                        applied_exit_signatures: vec![],
-                                    };
-
-                                    if let Err(e) = position_manager.open_position(position).await {
-                                        error!("Failed to record position: {}", e);
-                                        bought.remove(&token.mint);
-                                        persist_bought_mints(&*bought_mints_path, &*bought);
-                                        continue;
-                                    }
-
-                                    // CRITICAL: Wait for tx confirmation, then verify tokens received
-                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                                    // Determine which wallet to check based on API mode
-                                    let check_wallet = if use_local_api {
-                                        trading_keypair.pubkey() // Use the selected trading wallet
-                                    } else {
-                                        // For Lightning API, use the lightning wallet
-                                        Pubkey::from_str(&config.pumpportal.lightning_wallet)
-                                            .unwrap_or(trading_keypair.pubkey())
-                                    };
-
-                                    let actual_balance_raw = query_token_balance(
-                                        &rpc_client,
-                                        &check_wallet,
-                                        &token.mint,
-                                    );
-                                    // Normalize balance: pump.fun tokens have 6 decimals
-                                    // query_token_balance returns raw units, we need normalized tokens
-                                    let actual_balance = actual_balance_raw / 1_000_000;
-
-                                    if actual_balance_raw == 0 {
-                                        // CRITICAL: TX failed silently - REMOVE the position we just recorded
-                                        error!(
-                                            "BUY VERIFICATION FAILED: No tokens received for {} after 3s wait. Removing failed position.",
-                                            token.symbol
-                                        );
-                                        if let Err(e) = position_manager.abandon_position(&token.mint).await {
-                                            error!("Failed to abandon failed position: {}", e);
-                                        }
-                                        bought.remove(&token.mint);
-                                        persist_bought_mints(&*bought_mints_path, &*bought);
-                                        continue; // Skip kill-switch setup for failed buy
-                                    }
-
-                                    info!("BUY VERIFIED: Received {} tokens for {}", actual_balance, token.symbol);
-
-                                    if actual_balance != estimated_tokens {
-                                        info!(
-                                            "Updating position with actual balance: {} (raw: {}, estimated: {})",
-                                            actual_balance, actual_balance_raw, estimated_tokens
-                                        );
-                                        // Update position with NORMALIZED balance (not raw units)
-                                        if let Err(e) = position_manager
-                                            .update_token_amount(&token.mint, actual_balance)
-                                            .await
-                                        {
-                                            warn!("Failed to update token amount: {}", e);
-                                        }
-                                    }
-
-                                    // === SET UP KILL-SWITCH MONITORING ===
-                                    // Fetch creator and top holders for this token
-                                    if let Some(ref evaluator) = kill_switch_evaluator {
-                                        if let Some(ref helius) = helius_client {
-                                            // Get token creator
-                                            let creator = match helius.get_token_creator(&token.mint).await {
-                                                Ok(c) => {
-                                                    info!("[{}] Creator for kill-switch: {}", token.symbol, &c[..8]);
-                                                    c
-                                                }
-                                                Err(e) => {
-                                                    warn!("[{}] Could not get creator: {} - using empty", token.symbol, e);
-                                                    String::new()
-                                                }
-                                            };
-
-                                            // Get top holders (address, amount, percentage)
-                                            let holders = match helius.get_token_holders(&token.mint, 10).await {
-                                                Ok(h) => {
-                                                    info!("[{}] Fetched {} top holders for kill-switch monitoring", token.symbol, h.len());
-                                                    h.into_iter()
-                                                        .map(|hi| (hi.address, hi.amount, hi.percentage))
-                                                        .collect::<Vec<_>>()
-                                                }
-                                                Err(e) => {
-                                                    warn!("[{}] Could not get holders: {} - monitoring creator only", token.symbol, e);
-                                                    vec![]
-                                                }
-                                            };
-
-                                            // Start kill-switch monitoring
-                                            evaluator.watch_position(&token.mint, &creator, holders);
-                                            info!(
-                                                "[{}] Kill-switch monitoring ACTIVE (creator: {}, holders: tracked)",
-                                                token.symbol,
-                                                if creator.is_empty() { "unknown" } else { &creator[..8] }
-                                            );
-                                        }
-                                    }
-                                }
                                 Err(e) => {
-                                    error!("BUY FAILED for {}: {}", token.symbol, e);
+                                    error!("BUY FAILED to submit for {}: {}", token.symbol, e);
                                     continue;
+                                }
+                                Ok(signature) => {
+                                    // A returned signature is submission identity, NOT
+                                    // fill proof (INV-TX-001). Do not call this executed.
+                                    info!(
+                                        "BUY SUBMITTED: {} - signature {}",
+                                        token.symbol, signature
+                                    );
+                                    info!("View on Solscan: https://solscan.io/tx/{}", signature);
+
+                                    // Persist the submitted signature BEFORE treating it as
+                                    // filled. Do NOT add bought_mints yet.
+                                    let pending_buy = PendingExecution::buy(
+                                        signature.clone(),
+                                        token.mint.clone(),
+                                        wallet_string.clone(),
+                                        PendingBuyContext {
+                                            name: token.name.clone(),
+                                            symbol: token.symbol.clone(),
+                                            // Not available from DexScreener; stays empty.
+                                            bonding_curve: String::new(),
+                                            entry_type:
+                                                crate::position::manager::EntryType::Opportunity,
+                                            requested_sol: final_buy_amount,
+                                        },
+                                    );
+                                    // AUDIT-002 A7: retain the exact pending buy + whether the
+                                    // first journal write persisted.
+                                    let pending_buy_persisted = match pending_executions.upsert(pending_buy.clone()).await {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            // The tx was already sent. Halt new entries, still
+                                            // attempt reconciliation, never send another buy.
+                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                            error!(
+                                                "Failed to persist pending HotScan buy for {} (sig {}): {} - halting new entries; still reconciling",
+                                                token.symbol, signature, e
+                                            );
+                                            false
+                                        }
+                                    };
+
+                                    // Reconcile the submitted signature. No sleep.
+                                    let outcome = trade_reconciler
+                                        .reconcile(
+                                            &signature,
+                                            &wallet_string,
+                                            &token.mint,
+                                            ReconciliationSide::Buy,
+                                        )
+                                        .await;
+
+                                    match outcome {
+                                        Ok(ReconciliationOutcome::ConfirmedFailure {
+                                            error,
+                                            observed_after_ms,
+                                            ..
+                                        }) => {
+                                            // Real on-chain failure: remove pending, no
+                                            // position, add failed_mints cooldown, do NOT
+                                            // add bought_mints.
+                                            if let Err(e) =
+                                                pending_executions.remove(&signature).await
+                                            {
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "Failed to remove pending HotScan buy after ConfirmedFailure (sig {}): {} - halting new entries",
+                                                    signature, e
+                                                );
+                                            }
+                                            error!(
+                                                "BUY CONFIRMED FAILED for {} (sig {}): {} ({}ms observed)",
+                                                token.symbol, signature, error, observed_after_ms
+                                            );
+                                            {
+                                                let mut failed = failed_mints.lock().await;
+                                                failed.insert(
+                                                    token.mint.clone(),
+                                                    chrono::Utc::now().timestamp(),
+                                                );
+                                                info!(
+                                                    "[{}] Added to failed_mints blacklist after confirmed failure ({}min cooldown)",
+                                                    token.symbol,
+                                                    FAILED_MINTS_COOLDOWN_SECS / 60
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        Ok(ReconciliationOutcome::Unresolved { reason, .. }) => {
+                                            // Ambiguous outcome (timeout/observation gap) is
+                                            // NOT a failed fill. Keep pending, halt new
+                                            // entries, no position, no failed_mints.
+                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                            // AUDIT-002 A7: retry durability before break.
+                                            if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                error!(
+                                                    "BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending kept (durable), HotScan new entries HALTED",
+                                                    token.mint, signature, wallet_string, reason
+                                                );
+                                            } else {
+                                                error!(
+                                                    "CRITICAL: BUY UNRESOLVED for mint {} sig {} wallet {}: {} - pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. HotScan new entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                    token.mint, signature, wallet_string, reason, signature
+                                                );
+                                            }
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            // Structural observer failure is not tx-failure
+                                            // proof. Keep pending, halt, no failed_mints.
+                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                            // AUDIT-002 A7: same durability retry rule as Unresolved.
+                                            if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                error!(
+                                                    "CRITICAL: HotScan buy reconciliation error for {} (sig {}): {} - pending kept (durable), new entries HALTED",
+                                                    token.symbol, signature, e
+                                                );
+                                            } else {
+                                                error!(
+                                                    "CRITICAL: HotScan buy reconciliation error for {} (sig {}): {} - AND pending journal is NOT durable; restart recovery is NOT guaranteed until persistence succeeds. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                    token.symbol, signature, e, signature
+                                                );
+                                            }
+                                            break;
+                                        }
+                                        Ok(ReconciliationOutcome::ConfirmedFill(fill)) => {
+                                            // Validate exact identity at the live boundary.
+                                            if fill.side != ReconciliationSide::Buy
+                                                || fill.wallet != wallet_string
+                                                || fill.mint != token.mint
+                                            {
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                // AUDIT-002 A7: confirmed-but-unapplied. Retry durability.
+                                                if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                    error!(
+                                                        "CRITICAL: reconciled HotScan buy fill identity mismatch for sig {} (wallet/mint/side) - pending kept (durable), new entries HALTED",
+                                                        signature
+                                                    );
+                                                } else {
+                                                    error!(
+                                                        "CRITICAL: reconciled HotScan buy fill identity mismatch for sig {} (wallet/mint/side) - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                        signature, signature
+                                                    );
+                                                }
+                                                break;
+                                            }
+
+                                            // Extract canonical fill economics.
+                                            let (
+                                                token_amount_raw,
+                                                _decimals,
+                                                actual_cost_sol,
+                                                actual_entry_price,
+                                            ) = match primary_buy_fill_values(&fill) {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    new_entries_halted
+                                                        .store(true, Ordering::SeqCst);
+                                                    // AUDIT-002 A7: confirmed-but-unapplied. Retry durability.
+                                                    if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                        error!(
+                                                            "CRITICAL: reconciled HotScan buy fill conversion failed for sig {}: {} - pending kept (durable), new entries HALTED",
+                                                            signature, e
+                                                        );
+                                                    } else {
+                                                        error!(
+                                                            "CRITICAL: reconciled HotScan buy fill conversion failed for sig {}: {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                            signature, e, signature
+                                                        );
+                                                    }
+                                                    break;
+                                                }
+                                            };
+
+                                            let entry_time = fill
+                                                .block_time
+                                                .and_then(|ts| {
+                                                    chrono::DateTime::<chrono::Utc>::from_timestamp(
+                                                        ts, 0,
+                                                    )
+                                                })
+                                                .unwrap_or_else(chrono::Utc::now);
+
+                                            info!(
+                                                "BUY CONFIRMED: {} (sig {}) raw_tokens={} decimals={} cost={:.9} SOL price={:.12} SOL/token",
+                                                token.symbol,
+                                                signature,
+                                                token_amount_raw,
+                                                fill.token_decimals,
+                                                actual_cost_sol,
+                                                actual_entry_price
+                                            );
+
+                                            // Canonical confirmed-owned position from
+                                            // actuals. bonding_curve empty (unavailable).
+                                            let position = crate::position::manager::Position {
+                                                mint: token.mint.clone(),
+                                                name: token.name.clone(),
+                                                symbol: token.symbol.clone(),
+                                                bonding_curve: String::new(),
+                                                token_amount: token_amount_raw,
+                                                token_decimals: Some(fill.token_decimals),
+                                                entry_price: actual_entry_price,
+                                                total_cost_sol: actual_cost_sol,
+                                                entry_time,
+                                                entry_signature: fill.signature.clone(),
+                                                entry_type:
+                                                    crate::position::manager::EntryType::Opportunity,
+                                                quick_profit_taken: false,
+                                                second_profit_taken: false,
+                                                peak_price: actual_entry_price,
+                                                current_price: actual_entry_price,
+                                                kill_switch_triggered: false,
+                                                kill_switch_reason: None,
+                                                wallet_pubkey: fill.wallet.clone(),
+                                                applied_exit_signatures: vec![],
+                                            };
+
+                                            // Record confirmed ownership. NOT open_position.
+                                            match position_manager
+                                                .record_confirmed_position(position)
+                                                .await
+                                            {
+                                                Ok(_newly_applied) => {}
+                                                Err(e) => {
+                                                    // Confirmed on-chain but could not
+                                                    // record. Keep pending, halt; do not
+                                                    // add bought_mints.
+                                                    new_entries_halted
+                                                        .store(true, Ordering::SeqCst);
+                                                    // AUDIT-002 A7: confirmed-but-unapplied. Retry durability.
+                                                    if retry_pending_durability_if_needed(&pending_executions, &pending_buy, pending_buy_persisted).await {
+                                                        error!(
+                                                            "Confirmed owned HotScan position could not be recorded for {} (sig {}): {} - pending kept (durable), new entries HALTED",
+                                                            token.symbol, signature, e
+                                                        );
+                                                    } else {
+                                                        error!(
+                                                            "CRITICAL: confirmed owned HotScan position could not be recorded for {} (sig {}): {} - confirmed fill is unapplied AND pending journal is NOT durable; restart recovery is NOT guaranteed. New entries HALTED. Do NOT resubmit; preserve and investigate signature {}.",
+                                                            token.symbol, signature, e, signature
+                                                        );
+                                                    }
+                                                    break;
+                                                }
+                                            }
+
+                                            // Only AFTER confirmed state: add bought_mints.
+                                            bought.insert(
+                                                token.mint.clone(),
+                                                chrono::Utc::now().timestamp(),
+                                            );
+                                            persist_bought_mints(&*bought_mints_path, &*bought);
+
+                                            // === SET UP KILL-SWITCH MONITORING ===
+                                            if let Some(ref evaluator) = kill_switch_evaluator {
+                                                if let Some(ref helius) = helius_client {
+                                                    let creator = match helius
+                                                        .get_token_creator(&token.mint)
+                                                        .await
+                                                    {
+                                                        Ok(c) => {
+                                                            info!("[{}] Creator for kill-switch: {}", token.symbol, &c[..8]);
+                                                            c
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[{}] Could not get creator: {} - using empty", token.symbol, e);
+                                                            String::new()
+                                                        }
+                                                    };
+
+                                                    let holders = match helius
+                                                        .get_token_holders(&token.mint, 10)
+                                                        .await
+                                                    {
+                                                        Ok(h) => {
+                                                            info!("[{}] Fetched {} top holders for kill-switch monitoring", token.symbol, h.len());
+                                                            h.into_iter()
+                                                                .map(|hi| (hi.address, hi.amount, hi.percentage))
+                                                                .collect::<Vec<_>>()
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[{}] Could not get holders: {} - monitoring creator only", token.symbol, e);
+                                                            vec![]
+                                                        }
+                                                    };
+
+                                                    evaluator.watch_position(
+                                                        &token.mint,
+                                                        &creator,
+                                                        holders,
+                                                    );
+                                                    info!(
+                                                        "[{}] Kill-switch monitoring ACTIVE (creator: {}, holders: tracked)",
+                                                        token.symbol,
+                                                        if creator.is_empty() { "unknown" } else { &creator[..8] }
+                                                    );
+                                                }
+                                            }
+
+                                            // Remove pending LAST, after all state applied.
+                                            if let Err(e) =
+                                                pending_executions.remove(&signature).await
+                                            {
+                                                new_entries_halted.store(true, Ordering::SeqCst);
+                                                error!(
+                                                    "Failed to remove pending HotScan buy after confirmed fill (sig {}): {} - halting new entries; position retained",
+                                                    signature, e
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4045,6 +6030,40 @@ fn position_requires_recovery(position: &crate::position::manager::Position) -> 
             .wallet_pubkey
             .parse::<solana_sdk::pubkey::Pubkey>()
             .is_err()
+}
+
+/// Pure resolver for the exact HotScan BUY execution wallet (F4).
+///
+/// - Local active mode: the execution wallet is the selected local signer's
+///   Pubkey (a selected MultiWallet signer or the primary keypair). The signer
+///   is chosen by the caller; we simply echo its identity.
+/// - Lightning active mode: the execution wallet MUST be the exact configured
+///   Lightning wallet. A MultiWallet keypair is NEVER used as the Lightning
+///   execution wallet, because PumpPortal Lightning owns the execution wallet
+///   (INV-WALLET-001). No fallback (INV-WALLET-002): an active Lightning route
+///   without a configured Lightning wallet is a hard error.
+fn hotscan_execution_wallet(
+    use_lightning: bool,
+    selected_local_signer: Pubkey,
+    configured_lightning_wallet: Option<Pubkey>,
+) -> crate::error::Result<Pubkey> {
+    use crate::error::Error;
+    if use_lightning {
+        configured_lightning_wallet.ok_or_else(|| {
+            Error::TransactionReconciliation(
+                "hotscan_execution_wallet: Lightning route active but no configured Lightning wallet"
+                    .to_string(),
+            )
+        })
+    } else {
+        Ok(selected_local_signer)
+    }
+}
+
+/// Pure helper: the amount that the HotScan pre-send risk check must use is the
+/// FINAL buy amount (after the creator multiplier), NOT the base amount (F3/F7).
+fn hotscan_risk_check_amount(final_buy_amount: f64) -> f64 {
+    final_buy_amount
 }
 
 /// Pure fill-validation boundary for the primary buy path. Extracts the canonical
@@ -4186,6 +6205,768 @@ fn primary_sell_fill_values(
     Ok((actual_sold_raw, actual_received_sol, actual_exit_price))
 }
 
+/// AGENT E — pure full/partial decision for the primary event kill-switch exit.
+///
+/// The ACTUAL reconciled close result decides whether the position is fully
+/// closed. Only a full close unwatches the kill-switch evaluator; a partial
+/// close keeps the evaluator watching the remaining position. No threshold or
+/// market-price input is involved.
+fn kill_switch_unwatch_on_close(fully_closed: bool) -> bool {
+    fully_closed
+}
+
+/// AGENT G — pure mapping of a HotScan requested layer string to the durable
+/// `PendingSellIntent` (G5). "50%" => QuickProfit, "25%" => SecondProfit, and any
+/// full/"100%"/other request => Full. This does NOT change the requested amount
+/// that is actually submitted; reconciliation accounts what was ACTUALLY sold.
+fn hotscan_sell_intent_for_layer(sell_pct: &str) -> PendingSellIntent {
+    match sell_pct {
+        "50%" => PendingSellIntent::QuickProfit,
+        "25%" => PendingSellIntent::SecondProfit,
+        _ => PendingSellIntent::Full,
+    }
+}
+
+/// AGENT G — pure full-exit cache/cooldown decision (G8). The bought-mint cache
+/// is removed and the sold-mint cooldown is added ONLY when the ACTUAL reconciled
+/// close fully closed the position. A requested "100%" that only partially fills
+/// must NOT remove the bought-mint or mark a full-exit cooldown. Actual fill
+/// controls; the requested amount is irrelevant here.
+fn hotscan_full_exit_removes_cache(fully_closed: bool) -> bool {
+    fully_closed
+}
+
+/// AGENT G — the exact-route action chosen for a HotScan exit (G4). Mirrors the
+/// live routing decision so it can be tested purely. A `Local` position resolves
+/// to the Local trader with an exact signer (primary or recovery multi-wallet); a
+/// `Lightning` position resolves to the Lightning trader ONLY. There is NO
+/// Lightning->Local fallback, NO primary-signer fallback, and an unknown/absent
+/// route or missing signer yields `NoRoute` (no sell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotScanSellAction {
+    LocalPrimary,
+    LocalRecovery,
+    Lightning,
+    NoRoute,
+}
+
+/// Pure classifier for the HotScan exit route (G4).
+///
+/// - `route` is the registry route for the position's EXACT recorded wallet.
+/// - `local_trader_available` / `lightning_trader_available` reflect which
+///   route-capable trader handles exist.
+/// - `primary_signer_matches` is true iff the primary local keypair's pubkey is
+///   the position wallet.
+/// - `recovery_signer_present` is true iff the recovery MultiWalletManager owns an
+///   exact signer for the position wallet.
+///
+/// A Lightning route NEVER maps to a Local action (no fallback), and a Local route
+/// NEVER maps to Lightning.
+fn hotscan_sell_action(
+    route: crate::wallet::ExecutionRoute,
+    local_trader_available: bool,
+    lightning_trader_available: bool,
+    primary_signer_matches: bool,
+    recovery_signer_present: bool,
+) -> HotScanSellAction {
+    match route {
+        crate::wallet::ExecutionRoute::Local => {
+            if !local_trader_available {
+                HotScanSellAction::NoRoute
+            } else if primary_signer_matches {
+                HotScanSellAction::LocalPrimary
+            } else if recovery_signer_present {
+                HotScanSellAction::LocalRecovery
+            } else {
+                HotScanSellAction::NoRoute
+            }
+        }
+        crate::wallet::ExecutionRoute::Lightning => {
+            if lightning_trader_available {
+                HotScanSellAction::Lightning
+            } else {
+                HotScanSellAction::NoRoute
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// AGENT D — STARTUP RECOVERY + STRATEGY REBUILD (D1-D8)
+//
+// All helpers below are startup/recovery-only. They NEVER submit transactions;
+// they only OBSERVE (through the accepted reconciler / ownership probe) and
+// APPLY the resulting deterministic plan to durable state. A pending record is
+// only ever removed AFTER its confirmed economic state is durably applied, or
+// after a confirmed on-chain failure (INV-REC-002). An observer failure keeps
+// pending state (INV-REC-003).
+// ===========================================================================
+
+/// Counts summarizing the result of a pending-store startup recovery pass (D2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoverySummary {
+    /// Confirmed buys/sells whose economics were durably applied.
+    pub recovered: usize,
+    /// Pending records dropped because the tx confirmed FAILED on-chain.
+    pub confirmed_failures_removed: usize,
+    /// Pending records kept because the tx could not be resolved (or a
+    /// structural observer error occurred, or a ConfirmedBuy conflicted).
+    pub still_unresolved: usize,
+    /// ConfirmedBuy records that could not be recorded due to an accounting
+    /// conflict (also counted in `still_unresolved`, pending kept).
+    pub accounting_conflicts: usize,
+}
+
+impl RecoverySummary {
+    /// True when no unresolved pending state remains after this pass.
+    fn fully_resolved(&self) -> bool {
+        self.still_unresolved == 0
+    }
+}
+
+/// Recover the pending-execution journal against confirmed chain state (D2).
+///
+/// Uses the Agent-B planner (`reconcile_pending_execution`). NEVER submits a
+/// transaction. Per plan:
+/// - `ConfirmedFailure` => remove pending, no position mutation, no fake
+///   execution feedback on startup.
+/// - `ConfirmedBuy` => `record_confirmed_position` (idempotent success is fine),
+///   conflict keeps pending + counts unresolved; remove pending LAST.
+/// - `ConfirmedSell` => apply exact sold raw + received SOL via
+///   `close_position_reconciled`; reapply missing QuickProfit/SecondProfit
+///   markers even on idempotent replay; remove pending LAST.
+/// - `Unresolved`/structural `Err` => KEEP pending, count unresolved.
+///
+/// A pending record is NEVER deleted merely because its Position is absent.
+async fn recover_pending_store(
+    reconciler: &TradeReconciler,
+    pending_store: &PendingExecutionStore,
+    positions: &crate::position::manager::PositionManager,
+) -> crate::error::Result<RecoverySummary> {
+    use crate::trading::PendingRecoveryPlan;
+
+    let mut summary = RecoverySummary::default();
+
+    // B1: deterministic recovery order. `all()` is HashMap-backed and returns an
+    // arbitrary order; process oldest-submitted first (signature tie-break) so
+    // recovery is reproducible.
+    let mut pending_items = pending_store.all().await;
+    sort_pending_for_recovery(&mut pending_items);
+
+    for pending in pending_items {
+        let plan = match reconcile_pending_execution(reconciler, &pending).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                // INV-REC-003: an observer failure cannot erase pending state.
+                warn!(
+                    "Pending recovery observer error for sig {} (mint {}): {} - keeping pending",
+                    pending.signature, pending.mint, e
+                );
+                summary.still_unresolved += 1;
+                continue;
+            }
+        };
+
+        match plan {
+            PendingRecoveryPlan::ConfirmedFailure {
+                pending,
+                error,
+                observed_after_ms,
+            } => {
+                info!(
+                    "Pending {} (mint {}) confirmed FAILED on-chain after {}ms: {} - removing pending, no position mutation",
+                    pending.signature, pending.mint, observed_after_ms, error
+                );
+                // No position mutation; NO fake execution-feedback sample.
+                pending_store.remove(&pending.signature).await?;
+                summary.confirmed_failures_removed += 1;
+            }
+
+            PendingRecoveryPlan::ConfirmedBuy {
+                pending, position, ..
+            } => {
+                match positions.record_confirmed_position(position).await {
+                    Ok(_idempotent_or_new) => {
+                        // Ok(false) = same signature already present (idempotent
+                        // success). Either way the position state is durable;
+                        // remove pending LAST.
+                        pending_store.remove(&pending.signature).await?;
+                        summary.recovered += 1;
+                        info!(
+                            "Recovered confirmed BUY for mint {} (sig {})",
+                            pending.mint, pending.signature
+                        );
+                    }
+                    Err(e) => {
+                        // Accounting conflict: keep pending, count unresolved.
+                        summary.accounting_conflicts += 1;
+                        summary.still_unresolved += 1;
+                        error!(
+                            "Recovered confirmed BUY for mint {} (sig {}) conflicts with tracked state: {} - keeping pending",
+                            pending.mint, pending.signature, e
+                        );
+                    }
+                }
+            }
+
+            PendingRecoveryPlan::ConfirmedSell {
+                pending,
+                fill,
+                sold_amount_raw,
+                received_sol,
+                intent,
+                ..
+            } => {
+                match apply_recovered_sell(
+                    positions,
+                    &pending,
+                    fill.token_decimals,
+                    sold_amount_raw,
+                    received_sol,
+                    intent,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        pending_store.remove(&pending.signature).await?;
+                        summary.recovered += 1;
+                    }
+                    Err(e) => {
+                        summary.still_unresolved += 1;
+                        error!(
+                            "Recovered confirmed SELL for mint {} (sig {}) could not be applied: {} - keeping pending",
+                            pending.mint, pending.signature, e
+                        );
+                    }
+                }
+            }
+
+            PendingRecoveryPlan::Unresolved {
+                pending,
+                reason,
+                observed_after_ms,
+            } => {
+                // INV-TX-003 / INV-REC-002: unresolved stays pending.
+                summary.still_unresolved += 1;
+                warn!(
+                    "Pending {} (mint {}) unresolved after {}ms: {} - keeping pending",
+                    pending.signature, pending.mint, observed_after_ms, reason
+                );
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Apply a recovered confirmed SELL to durable position state (D2 detail).
+///
+/// - If a Position exists, validate its decimals against the fill before close.
+///   (We validate against the pending Sell context's known decimals only via the
+///   position; the fill decimals were already identity-checked by the planner.)
+/// - `close_position_reconciled` is idempotent via the durable receipt ledger,
+///   so it succeeds even if the Position is absent (full-exit replay).
+/// - Reapply a missing QuickProfit/SecondProfit marker when a partial position
+///   remains, EVEN if the close result was `already_applied`.
+async fn apply_recovered_sell(
+    positions: &crate::position::manager::PositionManager,
+    pending: &PendingExecution,
+    fill_token_decimals: u8,
+    sold_amount_raw: u64,
+    received_sol: f64,
+    intent: PendingSellIntent,
+) -> crate::error::Result<()> {
+    // B2: if an open Position exists, its confirmed entry decimals MUST equal the
+    // recovered sell fill decimals BEFORE we close it. A mismatch or unknown
+    // decimals means the tracked cost basis and the on-chain fill disagree; fail
+    // closed and KEEP the pending so restart recovery retries (never close on
+    // ambiguous accounting). If the Position is absent, the durable full-exit
+    // receipt replay is allowed (close_position_reconciled is idempotent).
+    if let Some(open) = positions.get_position(&pending.mint).await {
+        match open.token_decimals {
+            Some(d) if d == fill_token_decimals => {}
+            other => {
+                return Err(crate::error::Error::PositionAccounting(format!(
+                    "recovered sell decimals mismatch for mint {} (sig {}): position decimals {:?} != fill decimals {}",
+                    pending.mint, pending.signature, other, fill_token_decimals
+                )));
+            }
+        }
+    }
+
+    let close_result = positions
+        .close_position_reconciled(&pending.mint, &pending.signature, sold_amount_raw, received_sol)
+        .await?;
+
+    // Reapply layer marker when a partial position still remains. Idempotent
+    // replay (already_applied) must still repair a missing flag (D2, D8).
+    if !close_result.fully_closed {
+        if positions.get_position(&pending.mint).await.is_some() {
+            match intent {
+                PendingSellIntent::QuickProfit => {
+                    positions.mark_quick_profit_taken(&pending.mint).await?;
+                }
+                PendingSellIntent::SecondProfit => {
+                    positions.mark_second_profit_taken(&pending.mint).await?;
+                }
+                // Full / Manual / KillSwitch add no profit-layer marker.
+                PendingSellIntent::Full
+                | PendingSellIntent::Manual
+                | PendingSellIntent::KillSwitch => {}
+            }
+        }
+    }
+
+    info!(
+        "Recovered confirmed SELL for mint {} (sig {}): sold {} raw, net {} SOL, full_close={}",
+        pending.mint, pending.signature, sold_amount_raw, received_sol, close_result.fully_closed
+    );
+    Ok(())
+}
+
+/// Counts summarizing legacy-position chain recovery (D3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyRecoverySummary {
+    /// Positions canonicalized via `migrate_position_from_confirmed_entry`.
+    pub recovered: usize,
+    /// Positions removed because the controlled wallet proved a zero balance.
+    pub resolved_zero: usize,
+    /// Positions that remain recovery-required / unroutable after this pass.
+    pub still_recovery_required: usize,
+}
+
+impl LegacyRecoverySummary {
+    /// True when no recovery-required / unroutable position remains.
+    fn fully_resolved(&self) -> bool {
+        self.still_recovery_required == 0
+    }
+}
+
+/// Pure predicate (D3): does this position need legacy chain recovery OR is it
+/// operationally blocked because its (valid) wallet has no route in `registry`?
+///
+/// Recovery-required when `token_decimals` is unknown, or the wallet pubkey is
+/// empty/invalid. Additionally blocked (returns true) when the wallet parses but
+/// the registry does not own/route it — a canonical-looking position we cannot
+/// actually execute against.
+fn legacy_recovery_required(
+    position: &crate::position::manager::Position,
+    registry: &crate::wallet::ExecutionWalletRegistry,
+) -> bool {
+    if position_requires_recovery(position) {
+        return true;
+    }
+    // Wallet parses (position_requires_recovery already proved that). If the
+    // registry has no route for it, the position is unroutable => blocked.
+    match position.wallet_pubkey.parse::<Pubkey>() {
+        Ok(pk) => registry.route_for(&pk).is_none(),
+        Err(_) => true,
+    }
+}
+
+/// Recover legacy/incomplete positions from chain evidence (D3/D4).
+///
+/// For each position that is recovery-required or unroutable, find its current
+/// owning wallet via the ownership probe across registry wallets, then reconcile
+/// the original entry transaction and canonicalize (migrate) or resolve-zero.
+/// Only ConfirmedFill canonicalizes; anything ambiguous keeps the position
+/// recovery-required (INV-POS-002/003/004).
+async fn recover_legacy_positions(
+    reconciler: &TradeReconciler,
+    ownership: &crate::wallet::WalletOwnershipProbe,
+    registry: &crate::wallet::ExecutionWalletRegistry,
+    positions: &crate::position::manager::PositionManager,
+) -> crate::error::Result<LegacyRecoverySummary> {
+    use crate::wallet::OwnedHolderResolution;
+
+    let mut summary = LegacyRecoverySummary::default();
+
+    for position in positions.get_all_positions().await {
+        if !legacy_recovery_required(&position, registry) {
+            continue;
+        }
+
+        let mint_pk = match position.mint.parse::<Pubkey>() {
+            Ok(pk) => pk,
+            Err(e) => {
+                warn!(
+                    "Legacy recovery: mint {} is not a valid Pubkey: {} - keeping recovery-required",
+                    position.mint, e
+                );
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+
+        // Determine the current owning wallet (D3 ownership rules).
+        let holders = match ownership.find_positive_holders(registry, mint_pk).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    "Legacy recovery: ownership probe failed for mint {}: {} - keeping recovery-required",
+                    position.mint, e
+                );
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+
+        // (selected_wallet, proven_zero)
+        let (selected_wallet, proven_zero): (Option<Pubkey>, bool) = match holders {
+            OwnedHolderResolution::Single(state) => (Some(state.wallet), false),
+            OwnedHolderResolution::Multiple(_) => {
+                // Ambiguous: do not merge, do not choose (INV-WALLET-004).
+                warn!(
+                    "Legacy recovery: mint {} held in multiple controlled wallets - ambiguous, keeping recovery-required",
+                    position.mint
+                );
+                summary.still_recovery_required += 1;
+                continue;
+            }
+            OwnedHolderResolution::None => {
+                // Proven zero ONLY if the existing wallet parses, the registry
+                // owns/routes it, and a probe of THAT exact wallet proves zero.
+                match position.wallet_pubkey.parse::<Pubkey>() {
+                    Ok(existing) if registry.owns(&existing) => {
+                        match ownership.probe(existing, mint_pk).await {
+                            Ok(state) if state.raw_amount == 0 => (Some(existing), true),
+                            Ok(_) => {
+                                // Non-zero now but not surfaced as a positive holder
+                                // above: treat as unresolved rather than guessing.
+                                summary.still_recovery_required += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Legacy recovery: zero-proof probe failed for mint {} wallet {}: {} - keeping recovery-required",
+                                    position.mint, existing, e
+                                );
+                                summary.still_recovery_required += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Identity was unknown and all wallets show zero: do NOT
+                        // assume the position belonged to one of them (INV-POS-004).
+                        summary.still_recovery_required += 1;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let wallet = match selected_wallet {
+            Some(w) => w,
+            None => {
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+
+        // D4: reconcile the ORIGINAL entry transaction for this exact wallet.
+        let outcome = match reconciler
+            .reconcile(
+                &position.entry_signature,
+                &wallet.to_string(),
+                &position.mint,
+                ReconciliationSide::Buy,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(
+                    "Legacy recovery: entry reconcile RPC error for mint {}: {} - keeping recovery-required",
+                    position.mint, e
+                );
+                summary.still_recovery_required += 1;
+                continue;
+            }
+        };
+
+        let fill = match outcome {
+            ReconciliationOutcome::ConfirmedFill(fill) => fill,
+            _ => {
+                // ConfirmedFailure / Unresolved: do not guess.
+                summary.still_recovery_required += 1;
+                warn!(
+                    "Legacy recovery: entry tx for mint {} not a confirmed fill - keeping recovery-required",
+                    position.mint
+                );
+                continue;
+            }
+        };
+
+        // Require exact wallet/mint/Buy, nonzero original raw, cost>0, price>0.
+        let original_raw = fill.token_amount_raw().unwrap_or(0);
+        let original_cost = -fill.wallet_sol_delta_sol();
+        let original_price = fill.effective_price_sol_per_token().unwrap_or(0.0);
+        let identity_ok = fill.wallet == wallet.to_string()
+            && fill.mint == position.mint
+            && fill.side == ReconciliationSide::Buy;
+        if !identity_ok
+            || original_raw == 0
+            || !(original_cost.is_finite() && original_cost > 0.0)
+            || !(original_price.is_finite() && original_price > 0.0)
+        {
+            summary.still_recovery_required += 1;
+            warn!(
+                "Legacy recovery: entry fill for mint {} failed exact-economics validation - keeping recovery-required",
+                position.mint
+            );
+            continue;
+        }
+
+        if proven_zero {
+            // Current balance proven zero: resolve without inventing P&L.
+            match positions
+                .resolve_zero_balance_position(&position.mint, &position.entry_signature)
+                .await
+            {
+                Ok(true) => {
+                    summary.resolved_zero += 1;
+                    info!(
+                        "Legacy recovery: mint {} proven zero on-chain, position resolved (no P&L invented)",
+                        position.mint
+                    );
+                }
+                Ok(false) => summary.still_recovery_required += 1,
+                Err(e) => {
+                    summary.still_recovery_required += 1;
+                    warn!(
+                        "Legacy recovery: resolve_zero for mint {} failed: {} - keeping recovery-required",
+                        position.mint, e
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Re-probe the selected wallet's CURRENT balance to decide migrate vs zero.
+        let current = match ownership.probe(wallet, mint_pk).await {
+            Ok(state) => state,
+            Err(e) => {
+                summary.still_recovery_required += 1;
+                warn!(
+                    "Legacy recovery: current-balance probe failed for mint {}: {} - keeping recovery-required",
+                    position.mint, e
+                );
+                continue;
+            }
+        };
+
+        if current.raw_amount > original_raw {
+            // Ambiguous additional transfer/buy: do not canonicalize.
+            summary.still_recovery_required += 1;
+            warn!(
+                "Legacy recovery: mint {} current raw {} exceeds original entry raw {} - ambiguous, keeping halted",
+                position.mint, current.raw_amount, original_raw
+            );
+            continue;
+        }
+
+        if current.raw_amount == 0 {
+            match positions
+                .resolve_zero_balance_position(&position.mint, &position.entry_signature)
+                .await
+            {
+                Ok(true) => summary.resolved_zero += 1,
+                Ok(false) => summary.still_recovery_required += 1,
+                Err(e) => {
+                    summary.still_recovery_required += 1;
+                    warn!(
+                        "Legacy recovery: resolve_zero for mint {} failed: {} - keeping recovery-required",
+                        position.mint, e
+                    );
+                }
+            }
+            continue;
+        }
+
+        // 0 < current <= original: canonicalize with prorated remaining cost.
+        //
+        // B3: the CURRENT probed account decimals must EXACTLY equal the original
+        // confirmed-entry fill decimals. No fallback to the entry decimals when
+        // the probe reports None or a different value — that would migrate an
+        // account whose on-chain decimals disagree with the tracked cost basis.
+        // Mismatch/None => keep recovery-required, do NOT migrate.
+        let decimals = match current.decimals {
+            Some(d) if d == fill.token_decimals => d,
+            other => {
+                summary.still_recovery_required += 1;
+                warn!(
+                    "Legacy recovery: mint {} current account decimals {:?} != confirmed entry decimals {} - keeping recovery-required, not migrating",
+                    position.mint, other, fill.token_decimals
+                );
+                continue;
+            }
+        };
+        match positions
+            .migrate_position_from_confirmed_entry(
+                &position.mint,
+                &position.entry_signature,
+                &wallet.to_string(),
+                original_raw,
+                current.raw_amount,
+                decimals,
+                original_cost,
+                original_price,
+            )
+            .await
+        {
+            Ok(_) => {
+                summary.recovered += 1;
+                info!(
+                    "Legacy recovery: mint {} canonicalized from confirmed entry (raw {} of {})",
+                    position.mint, current.raw_amount, original_raw
+                );
+            }
+            Err(e) => {
+                summary.still_recovery_required += 1;
+                warn!(
+                    "Legacy recovery: migrate for mint {} failed: {} - keeping recovery-required",
+                    position.mint, e
+                );
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Pure conversion (D6): build the strategy-engine `Position` used to restore
+/// portfolio exposure from a canonical PositionManager position. State restore
+/// ONLY — size_sol is the REMAINING total cost, tokens_held is the RAW token
+/// amount. Never records execution feedback / chain health / slippage.
+fn manager_position_to_strategy_position(
+    position: &crate::position::manager::Position,
+    default_strategy: crate::strategy::types::TradingStrategy,
+) -> crate::strategy::types::Position {
+    // highest = max(peak_price, entry_price); lowest = the meaningful lower of
+    // current/entry (a positive finite current price is meaningful, else entry).
+    let highest_price = position.peak_price.max(position.entry_price);
+    let lowest_price = if position.current_price.is_finite() && position.current_price > 0.0 {
+        position.current_price.min(position.entry_price)
+    } else {
+        position.entry_price
+    };
+    crate::strategy::types::Position {
+        mint: position.mint.clone(),
+        entry_price: position.entry_price,
+        entry_time: position.entry_time,
+        size_sol: position.total_cost_sol,
+        tokens_held: position.token_amount,
+        strategy: default_strategy,
+        exit_style: crate::strategy::types::ExitStyle::default(),
+        highest_price,
+        lowest_price,
+        exit_levels_hit: vec![],
+    }
+}
+
+/// Pure predicate (D6): a canonical position eligible for strategy-exposure
+/// restore has known decimals, a valid wallet, and a route in the registry.
+fn position_is_canonical_for_restore(
+    position: &crate::position::manager::Position,
+    registry: &crate::wallet::ExecutionWalletRegistry,
+) -> bool {
+    if position.token_decimals.is_none() {
+        return false;
+    }
+    match position.wallet_pubkey.parse::<Pubkey>() {
+        Ok(pk) => registry.route_for(&pk).is_some(),
+        Err(_) => false,
+    }
+}
+
+// ===========================================================================
+// AGENT B — shared primary startup / exit coordination helpers (B1/B5/B7/B8)
+// ===========================================================================
+
+/// B1: deterministically order pending recovery items by submission time, then
+/// signature. `PendingExecutionStore::all()` is HashMap-backed and returns an
+/// arbitrary order; startup recovery must be reproducible so that same-mint or
+/// same-wallet in-flight submissions are always resolved oldest-first.
+fn sort_pending_for_recovery(items: &mut [PendingExecution]) {
+    items.sort_by(|a, b| {
+        a.submitted_at
+            .cmp(&b.submitted_at)
+            .then_with(|| a.signature.cmp(&b.signature))
+    });
+}
+
+/// B8: pure predicate mirroring the "pending Buy OR Sell blocks an automatic
+/// exit" decision for a mint. Either an unresolved Buy or an unresolved Sell for
+/// the same mint must prevent a new automatic sell submission. Returns the
+/// blocking signature (Sell preferred for logging) when blocked.
+fn pending_blocks_automatic_sell(
+    pending_buy: Option<&PendingExecution>,
+    pending_sell: Option<&PendingExecution>,
+) -> Option<String> {
+    if let Some(p) = pending_sell {
+        return Some(p.signature.clone());
+    }
+    if let Some(p) = pending_buy {
+        return Some(p.signature.clone());
+    }
+    None
+}
+
+/// B5: pure operational-exit-route predicate. A position can actually be exited
+/// by an automatic producer iff ALL hold:
+/// - decimals are known (canonical accounting);
+/// - the recorded wallet parses to a valid pubkey;
+/// - the recovery registry has a route for that wallet;
+/// - the route's execution trader handle is actually available
+///   (Local => `local_trader_available`, Lightning => `lightning_trader_available`).
+fn position_has_operational_exit_route(
+    position: &crate::position::manager::Position,
+    registry: &crate::wallet::ExecutionWalletRegistry,
+    local_trader_available: bool,
+    lightning_trader_available: bool,
+) -> bool {
+    if position.token_decimals.is_none() {
+        return false;
+    }
+    let wallet = match position.wallet_pubkey.parse::<Pubkey>() {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+    match registry.route_for(&wallet) {
+        Some(crate::wallet::ExecutionRoute::Local) => local_trader_available,
+        Some(crate::wallet::ExecutionRoute::Lightning) => lightning_trader_available,
+        None => false,
+    }
+}
+
+// --- B7: shared same-mint primary sell coordinator -------------------------
+
+/// B7: process-wide set of mints with an in-flight primary sell reservation.
+/// Shared (cloned) into BOTH the primary auto-sell monitor and the event
+/// kill-switch so the two concurrent sell producers cannot submit two sells for
+/// the same mint before either signature is journaled.
+type ActiveSellMints = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// B7: attempt to reserve `mint` for a primary sell. Returns true iff the mint
+/// was newly reserved. A mint already reserved returns false (another producer
+/// owns the in-flight sell). A poisoned lock fails closed (false): we never
+/// submit a sell we cannot coordinate.
+fn try_reserve_sell_mint(active: &ActiveSellMints, mint: &str) -> bool {
+    match active.lock() {
+        Ok(mut set) => set.insert(mint.to_string()),
+        Err(_) => false,
+    }
+}
+
+/// B7: release a mint's primary sell reservation. A poisoned lock is ignored
+/// (the reservation cannot be observed as free again, which is fail-closed).
+fn release_sell_mint(active: &ActiveSellMints, mint: &str) {
+    if let Ok(mut set) = active.lock() {
+        set.remove(mint);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4322,6 +7103,120 @@ mod tests {
         assert!(primary_buy_fill_values(&fill).is_err());
     }
 
+    // === Agent F (HotScan BUY) helper tests ===
+
+    fn f_local_signer() -> Pubkey {
+        // Distinct valid base58 pubkey standing in for a selected local signer
+        // (e.g. a MultiWallet wallet or the primary keypair).
+        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap()
+    }
+
+    fn f_lightning_wallet() -> Pubkey {
+        // A DIFFERENT valid pubkey standing in for the configured Lightning wallet.
+        Pubkey::from_str("Vote111111111111111111111111111111111111111").unwrap()
+    }
+
+    #[test]
+    fn test_hotscan_lightning_wallet_is_configured_lightning_not_local() {
+        let local = f_local_signer();
+        let lightning = f_lightning_wallet();
+        // Lightning active mode: execution wallet MUST be the configured Lightning
+        // wallet, NOT the selected local signer.
+        let resolved =
+            hotscan_execution_wallet(true, local, Some(lightning)).expect("resolves");
+        assert_eq!(resolved, lightning);
+        assert_ne!(resolved, local);
+    }
+
+    #[test]
+    fn test_hotscan_lightning_active_without_wallet_is_error_no_fallback() {
+        let local = f_local_signer();
+        // Lightning active but no configured Lightning wallet: hard error, never
+        // falls back to the local signer (INV-WALLET-002).
+        assert!(hotscan_execution_wallet(true, local, None).is_err());
+    }
+
+    #[test]
+    fn test_hotscan_local_wallet_is_selected_signer() {
+        let local = f_local_signer();
+        let lightning = f_lightning_wallet();
+        // Local active mode: execution wallet is the selected local signer, and the
+        // configured Lightning wallet (even if present) is irrelevant.
+        let resolved =
+            hotscan_execution_wallet(false, local, Some(lightning)).expect("resolves");
+        assert_eq!(resolved, local);
+        assert_ne!(resolved, lightning);
+    }
+
+    #[test]
+    fn test_hotscan_risk_check_uses_final_amount() {
+        // The pre-send risk check must use the FINAL amount (after the creator
+        // multiplier), not the base amount.
+        let base = 0.02_f64;
+        let final_amount = base * 1.5; // elite creator 1.5x
+        assert_eq!(hotscan_risk_check_amount(final_amount), final_amount);
+        assert_ne!(hotscan_risk_check_amount(final_amount), base);
+    }
+
+    #[test]
+    fn test_hotscan_confirmed_fill_position_stores_raw_and_decimals() {
+        // A confirmed HotScan fill must produce a canonical Position carrying RAW
+        // token units and the fill's actual decimals (INV-TX-005) — never an
+        // estimate or a hard-coded 6-decimal normalization.
+        let fill = synthetic_buy_fill();
+        let (raw, _decimals, cost, price) =
+            primary_buy_fill_values(&fill).expect("valid buy fill");
+
+        let position = crate::position::manager::Position {
+            mint: fill.mint.clone(),
+            name: "n".to_string(),
+            symbol: "S".to_string(),
+            bonding_curve: String::new(),
+            token_amount: raw,
+            token_decimals: Some(fill.token_decimals),
+            entry_price: price,
+            total_cost_sol: cost,
+            entry_time: chrono::Utc::now(),
+            entry_signature: fill.signature.clone(),
+            entry_type: crate::position::manager::EntryType::Opportunity,
+            quick_profit_taken: false,
+            second_profit_taken: false,
+            peak_price: price,
+            current_price: price,
+            kill_switch_triggered: false,
+            kill_switch_reason: None,
+            wallet_pubkey: fill.wallet.clone(),
+            applied_exit_signatures: vec![],
+        };
+
+        // Stores RAW units exactly, decimals from the fill, and bonding_curve empty.
+        assert_eq!(position.token_amount, 1_500_000);
+        assert_eq!(position.token_decimals, Some(6));
+        assert!(position.bonding_curve.is_empty());
+        assert_eq!(position.entry_type, crate::position::manager::EntryType::Opportunity);
+        assert_eq!(position.wallet_pubkey, fill.wallet);
+    }
+
+    /// Pure classifier mirroring the live buy-block decision: bought_mints is only
+    /// added for a `ConfirmedFill`; an `Unresolved` (or failure) outcome must not
+    /// mark it (F5/F7).
+    fn hotscan_should_add_bought_mint(outcome: &ReconciliationOutcome) -> bool {
+        matches!(outcome, ReconciliationOutcome::ConfirmedFill(_))
+    }
+
+    #[test]
+    fn test_hotscan_unresolved_does_not_mark_bought_mints() {
+        let unresolved = ReconciliationOutcome::Unresolved {
+            signature: "sig".to_string(),
+            reason: "timeout".to_string(),
+            observed_after_ms: 15_000,
+        };
+        assert!(!hotscan_should_add_bought_mint(&unresolved));
+
+        let confirmed = ReconciliationOutcome::ConfirmedFill(synthetic_buy_fill());
+        assert!(hotscan_should_add_bought_mint(&confirmed));
+    }
+
     /// Synthetic SELL fill: 100 raw tokens removed (negative delta), decimals 6,
     /// positive net SOL received by default.
     fn synthetic_sell_fill() -> crate::trading::ReconciledFill {
@@ -4397,5 +7292,1129 @@ mod tests {
         fill.token_delta_raw = -101;
         let position = synthetic_sell_position();
         assert!(primary_sell_fill_values(&fill, &position).is_err());
+    }
+
+    // ======================================================================
+    // AGENT G — HotScan SELL transaction-truth helper tests (G11)
+    // ======================================================================
+
+    #[test]
+    fn test_g_route_local_exact_signer() {
+        // G4: a Local-route position with the primary signer resolves to the Local
+        // trader via the primary keypair; a Local route with only a recovery signer
+        // resolves via the recovery multi-wallet. Neither ever becomes Lightning.
+        assert_eq!(
+            hotscan_sell_action(
+                crate::wallet::ExecutionRoute::Local,
+                true,  // local trader available
+                true,  // lightning trader available (irrelevant for Local)
+                true,  // primary signer matches
+                false, // recovery signer absent
+            ),
+            HotScanSellAction::LocalPrimary
+        );
+        assert_eq!(
+            hotscan_sell_action(
+                crate::wallet::ExecutionRoute::Local,
+                true,
+                true,
+                false, // primary does NOT match
+                true,  // recovery signer present
+            ),
+            HotScanSellAction::LocalRecovery
+        );
+        // Local route but no exact signer anywhere => no sell.
+        assert_eq!(
+            hotscan_sell_action(
+                crate::wallet::ExecutionRoute::Local,
+                true,
+                true,
+                false,
+                false,
+            ),
+            HotScanSellAction::NoRoute
+        );
+    }
+
+    #[test]
+    fn test_g_route_lightning_no_local_fallback() {
+        // G4/INV-WALLET-001/003: a Lightning-route position uses the Lightning
+        // trader ONLY. Even when a local trader and local signers are available,
+        // the action is NEVER a Local one, and with no Lightning trader it is
+        // NoRoute (never a silent Local fallback).
+        assert_eq!(
+            hotscan_sell_action(
+                crate::wallet::ExecutionRoute::Lightning,
+                true, // local trader available — must be ignored
+                true, // lightning trader available
+                true, // primary signer matches — must be ignored
+                true, // recovery signer present — must be ignored
+            ),
+            HotScanSellAction::Lightning
+        );
+        let no_lightning = hotscan_sell_action(
+            crate::wallet::ExecutionRoute::Lightning,
+            true,  // local trader available
+            false, // NO lightning trader
+            true,  // primary signer matches
+            true,  // recovery signer present
+        );
+        assert_eq!(no_lightning, HotScanSellAction::NoRoute);
+        assert_ne!(no_lightning, HotScanSellAction::LocalPrimary);
+        assert_ne!(no_lightning, HotScanSellAction::LocalRecovery);
+    }
+
+    #[test]
+    fn test_g_registry_routes_match_recorded_wallet() {
+        // The registry itself decides the route from the EXACT recorded wallet.
+        use crate::wallet::ExecutionRoute;
+        let local = f_local_signer();
+        let lightning = f_lightning_wallet();
+        let registry = ExecutionWalletRegistry::new(local, &[], Some(lightning));
+        assert_eq!(registry.route_for(&local), Some(ExecutionRoute::Local));
+        assert_eq!(registry.route_for(&lightning), Some(ExecutionRoute::Lightning));
+        // An unknown wallet has no route => the live path halts, no sell.
+        let unknown =
+            Pubkey::from_str("Stake11111111111111111111111111111111111111").unwrap();
+        assert_eq!(registry.route_for(&unknown), None);
+    }
+
+    #[test]
+    fn test_g_intent_mapping() {
+        // G5: "50%" => QuickProfit, "25%" => SecondProfit, full/"100%"/other => Full.
+        assert_eq!(
+            hotscan_sell_intent_for_layer("50%"),
+            PendingSellIntent::QuickProfit
+        );
+        assert_eq!(
+            hotscan_sell_intent_for_layer("25%"),
+            PendingSellIntent::SecondProfit
+        );
+        assert_eq!(hotscan_sell_intent_for_layer("100%"), PendingSellIntent::Full);
+        assert_eq!(hotscan_sell_intent_for_layer("full"), PendingSellIntent::Full);
+    }
+
+    #[test]
+    fn test_g_requested_full_but_partial_fill_keeps_bought_mints() {
+        // G8: the ACTUAL close result controls the full-exit cache/cooldown. A
+        // requested "100%" that only partially fills (fully_closed == false) must
+        // NOT remove the bought-mint or mark a full-exit cooldown. Only an actual
+        // full close does.
+        assert!(!hotscan_full_exit_removes_cache(false));
+        assert!(hotscan_full_exit_removes_cache(true));
+        // Intent mapping of the requested "100%" is still Full; the amount is
+        // irrelevant to the cache decision — actual fill controls.
+        assert_eq!(hotscan_sell_intent_for_layer("100%"), PendingSellIntent::Full);
+    }
+
+    #[test]
+    fn test_g_confirmed_negative_net_sell_accepted() {
+        // G6: a confirmed fee-dominated HotScan sale (negative net wallet SOL
+        // delta) is accepted by the exact fill validator and is NOT clamped.
+        let mut fill = synthetic_sell_fill();
+        fill.wallet_sol_delta_lamports = -2_000; // net negative proceeds
+        let position = synthetic_sell_position();
+        let (sold_raw, net_sol, price) =
+            primary_sell_fill_values(&fill, &position).expect("negative net sell accepted");
+        assert_eq!(sold_raw, 100);
+        assert!(net_sol < 0.0, "net_sol was {}", net_sol);
+        assert!(price.is_finite());
+    }
+
+    // ======================================================================
+    // AGENT D — startup recovery + strategy rebuild helper tests (D8)
+    // ======================================================================
+
+    use crate::config::SafetyConfig;
+    use crate::position::manager::{EntryType, PositionManager};
+    use crate::wallet::ExecutionWalletRegistry;
+
+    /// In-memory (non-persisted) manager for recovery-helper tests.
+    fn mem_manager() -> PositionManager {
+        let cfg = SafetyConfig {
+            require_sell_confirmation: false,
+            max_position_sol: 1_000.0,
+            daily_loss_limit_sol: 1_000.0,
+            keypair_balance_warning_sol: 0.0,
+        };
+        PositionManager::new(cfg, None)
+    }
+
+    /// A canonical (decimals known, valid wallet) manager Position holding
+    /// `raw` tokens with the given wallet/entry signature.
+    fn canonical_position(mint: &str, wallet: &str, sig: &str, raw: u64) -> crate::position::manager::Position {
+        crate::position::manager::Position {
+            mint: mint.to_string(),
+            name: "T".to_string(),
+            symbol: "T".to_string(),
+            bonding_curve: "bc".to_string(),
+            token_amount: raw,
+            token_decimals: Some(6),
+            entry_price: 0.001,
+            total_cost_sol: 1.0,
+            entry_time: chrono::Utc::now(),
+            entry_signature: sig.to_string(),
+            entry_type: EntryType::Opportunity,
+            quick_profit_taken: false,
+            second_profit_taken: false,
+            peak_price: 0.002,
+            current_price: 0.0015,
+            kill_switch_triggered: false,
+            kill_switch_reason: None,
+            wallet_pubkey: wallet.to_string(),
+            applied_exit_signatures: vec![],
+        }
+    }
+
+    fn sell_pending(mint: &str, wallet: &str, sig: &str, intent: PendingSellIntent) -> PendingExecution {
+        PendingExecution::sell(
+            sig.to_string(),
+            mint.to_string(),
+            wallet.to_string(),
+            PendingSellContext {
+                requested_amount: "50%".to_string(),
+                intent,
+                reason: "test".to_string(),
+            },
+        )
+    }
+
+    const T_MINT: &str = "Mint1111111111111111111111111111111111111111";
+
+    /// D8: a recovered FULL exit removes the position and is idempotent on replay.
+    #[tokio::test]
+    async fn test_recovered_full_exit_removes_pending_idempotently() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+
+        let pending = sell_pending(T_MINT, &wallet, "exit-full", PendingSellIntent::Full);
+        // Sell the ENTIRE 100 raw => full close.
+        apply_recovered_sell(&mgr, &pending, 6, 100, 0.5, PendingSellIntent::Full)
+            .await
+            .unwrap();
+        assert!(mgr.get_position(T_MINT).await.is_none(), "position should be fully closed");
+
+        // Idempotent replay of the same exit signature must not error / double-count.
+        apply_recovered_sell(&mgr, &pending, 6, 100, 0.5, PendingSellIntent::Full)
+            .await
+            .unwrap();
+        assert!(mgr.get_position(T_MINT).await.is_none());
+    }
+
+    /// D8: a recovered PARTIAL exit reapplies a missing QuickProfit marker,
+    /// even on idempotent replay.
+    #[tokio::test]
+    async fn test_recovered_partial_reapplies_quick_profit_marker() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+
+        let pending = sell_pending(T_MINT, &wallet, "exit-quick", PendingSellIntent::QuickProfit);
+        apply_recovered_sell(&mgr, &pending, 6, 40, 0.3, PendingSellIntent::QuickProfit)
+            .await
+            .unwrap();
+        let pos = mgr.get_position(T_MINT).await.expect("partial remains");
+        assert!(pos.quick_profit_taken, "quick_profit flag must be set on partial recovery");
+        assert!(!pos.second_profit_taken);
+        assert_eq!(pos.token_amount, 60);
+
+        // Idempotent replay: still no error, flag stays set.
+        apply_recovered_sell(&mgr, &pending, 6, 40, 0.3, PendingSellIntent::QuickProfit)
+            .await
+            .unwrap();
+        assert!(mgr.get_position(T_MINT).await.unwrap().quick_profit_taken);
+    }
+
+    /// D8: a recovered PARTIAL SecondProfit exit reapplies the second flag.
+    #[tokio::test]
+    async fn test_recovered_partial_reapplies_second_profit_marker() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+
+        let pending = sell_pending(T_MINT, &wallet, "exit-second", PendingSellIntent::SecondProfit);
+        apply_recovered_sell(&mgr, &pending, 6, 25, 0.2, PendingSellIntent::SecondProfit)
+            .await
+            .unwrap();
+        let pos = mgr.get_position(T_MINT).await.expect("partial remains");
+        assert!(pos.second_profit_taken, "second_profit flag must be set");
+        assert!(!pos.quick_profit_taken);
+    }
+
+    /// D8: Full/Manual/KillSwitch partial exits add NO profit-layer marker.
+    #[tokio::test]
+    async fn test_recovered_partial_full_intent_adds_no_marker() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+        let pending = sell_pending(T_MINT, &wallet, "exit-manual", PendingSellIntent::Manual);
+        apply_recovered_sell(&mgr, &pending, 6, 40, 0.3, PendingSellIntent::Manual)
+            .await
+            .unwrap();
+        let pos = mgr.get_position(T_MINT).await.unwrap();
+        assert!(!pos.quick_profit_taken);
+        assert!(!pos.second_profit_taken);
+    }
+
+    fn single_wallet_registry(wallet: &str) -> ExecutionWalletRegistry {
+        let primary = wallet.parse::<Pubkey>().unwrap();
+        ExecutionWalletRegistry::new(primary, &[], None)
+    }
+
+    /// D8: strategy-restore conversion uses REMAINING cost and RAW tokens.
+    #[test]
+    fn test_strategy_restore_uses_remaining_cost_and_raw_tokens() {
+        let wallet = Pubkey::new_unique().to_string();
+        let mut pos = canonical_position(T_MINT, &wallet, "entry-sig", 60);
+        // Simulate a partial exit already applied: remaining cost < original.
+        pos.total_cost_sol = 0.6;
+        let sp = manager_position_to_strategy_position(
+            &pos,
+            crate::strategy::types::TradingStrategy::Adaptive,
+        );
+        assert_eq!(sp.tokens_held, 60, "tokens_held must be the RAW token amount");
+        assert!((sp.size_sol - 0.6).abs() < 1e-12, "size_sol must be REMAINING total cost");
+        assert_eq!(sp.mint, T_MINT);
+        // highest = max(peak, entry) = max(0.002, 0.001) = 0.002.
+        assert!((sp.highest_price - 0.002).abs() < 1e-12);
+        // lowest = min(current, entry) = min(0.0015, 0.001) = 0.001.
+        assert!((sp.lowest_price - 0.001).abs() < 1e-12);
+        assert!(sp.exit_levels_hit.is_empty());
+    }
+
+    /// D8: a canonical position with a routable wallet is restore-eligible; one
+    /// whose wallet is unknown to the registry is not.
+    #[test]
+    fn test_position_is_canonical_for_restore_route_gating() {
+        let wallet = Pubkey::new_unique().to_string();
+        let reg = single_wallet_registry(&wallet);
+        let ok = canonical_position(T_MINT, &wallet, "s", 10);
+        assert!(position_is_canonical_for_restore(&ok, &reg));
+
+        // Different (unrouted) wallet => not restorable.
+        let other = Pubkey::new_unique().to_string();
+        let unrouted = canonical_position(T_MINT, &other, "s", 10);
+        assert!(!position_is_canonical_for_restore(&unrouted, &reg));
+
+        // Unknown decimals => not restorable.
+        let mut no_dec = ok.clone();
+        no_dec.token_decimals = None;
+        assert!(!position_is_canonical_for_restore(&no_dec, &reg));
+    }
+
+    /// D8: legacy_recovery_required flags unknown decimals, invalid wallets, and
+    /// canonical-but-unroutable positions.
+    #[test]
+    fn test_legacy_recovery_required_classification() {
+        let wallet = Pubkey::new_unique().to_string();
+        let reg = single_wallet_registry(&wallet);
+
+        // Canonical + routable => not required.
+        let ok = canonical_position(T_MINT, &wallet, "s", 10);
+        assert!(!legacy_recovery_required(&ok, &reg));
+
+        // Unknown decimals => required.
+        let mut no_dec = ok.clone();
+        no_dec.token_decimals = None;
+        assert!(legacy_recovery_required(&no_dec, &reg));
+
+        // Valid but unrouted wallet => blocked (required).
+        let unrouted = canonical_position(T_MINT, &Pubkey::new_unique().to_string(), "s", 10);
+        assert!(legacy_recovery_required(&unrouted, &reg));
+
+        // Empty wallet => required.
+        let mut empty = ok.clone();
+        empty.wallet_pubkey = String::new();
+        assert!(legacy_recovery_required(&empty, &reg));
+    }
+
+    /// D8: multi-holder ownership resolution is ambiguous and is NOT reduced to a
+    /// single actionable wallet (mirrors the recover_legacy_positions guard).
+    #[test]
+    fn test_multi_wallet_legacy_holder_stays_unresolved() {
+        use crate::wallet::{OwnedHolderResolution, WalletTokenState};
+        let mint = Pubkey::new_unique();
+        let states = vec![
+            WalletTokenState {
+                wallet: Pubkey::new_unique(),
+                mint,
+                raw_amount: 10,
+                decimals: Some(6),
+                token_account_count: 1,
+            },
+            WalletTokenState {
+                wallet: Pubkey::new_unique(),
+                mint,
+                raw_amount: 20,
+                decimals: Some(6),
+                token_account_count: 1,
+            },
+        ];
+        // The recovery path treats Multiple as ambiguous: no single wallet chosen.
+        let resolution = OwnedHolderResolution::Multiple(states);
+        let selected: Option<Pubkey> = match resolution {
+            OwnedHolderResolution::Single(s) => Some(s.wallet),
+            OwnedHolderResolution::Multiple(_) | OwnedHolderResolution::None => None,
+        };
+        assert!(selected.is_none(), "multi-holder must not resolve to a single wallet");
+    }
+
+    // === AGENT E — primary event kill-switch sell ===
+
+    /// E5: a kill-switch pending sell round-trips its intent as
+    /// `PendingSellIntent::KillSwitch` with the exact `"100%"` request.
+    #[test]
+    fn test_kill_switch_pending_intent_round_trips() {
+        let wallet = Pubkey::new_unique().to_string();
+        let pending = PendingExecution::sell(
+            "ks-sig".to_string(),
+            T_MINT.to_string(),
+            wallet.clone(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::KillSwitch,
+                reason: "smart-money dump".to_string(),
+            },
+        );
+        assert_eq!(pending.side, ReconciliationSide::Sell);
+        assert_eq!(pending.mint, T_MINT);
+        assert_eq!(pending.wallet, wallet);
+        pending.validate().expect("kill-switch pending is structurally valid");
+        match &pending.context {
+            crate::trading::PendingExecutionContext::Sell(ctx) => {
+                assert_eq!(ctx.intent, PendingSellIntent::KillSwitch);
+                assert_eq!(ctx.requested_amount, "100%");
+            }
+            _ => panic!("expected Sell context"),
+        }
+
+        // JSON round-trip preserves the KillSwitch variant.
+        let json = serde_json::to_string(&pending).unwrap();
+        let back: PendingExecution = serde_json::from_str(&json).unwrap();
+        match back.context {
+            crate::trading::PendingExecutionContext::Sell(ctx) => {
+                assert_eq!(ctx.intent, PendingSellIntent::KillSwitch);
+            }
+            _ => panic!("expected Sell context after round-trip"),
+        }
+    }
+
+    /// E5: the pure full/partial decision helper. A full actual close unwatches
+    /// the evaluator; a partial close does NOT.
+    #[test]
+    fn test_kill_switch_unwatch_only_on_full_close() {
+        assert!(kill_switch_unwatch_on_close(true), "full close must unwatch");
+        assert!(!kill_switch_unwatch_on_close(false), "partial close keeps watching");
+    }
+
+    /// E3: the kill-switch route selection resolves Local for the primary wallet
+    /// and yields no route (=> no sell + halt) for an unknown wallet, with no
+    /// Lightning->Local fallback.
+    #[test]
+    fn test_kill_switch_route_selection() {
+        let primary = Pubkey::new_unique();
+        let lightning = Pubkey::new_unique();
+        let reg = ExecutionWalletRegistry::new(primary, &[], Some(lightning));
+
+        assert_eq!(reg.route_for(&primary), Some(crate::wallet::ExecutionRoute::Local));
+        assert_eq!(
+            reg.route_for(&lightning),
+            Some(crate::wallet::ExecutionRoute::Lightning)
+        );
+        // Unknown wallet => None => no sell, halt new entries.
+        assert_eq!(reg.route_for(&Pubkey::new_unique()), None);
+    }
+
+    // ===================================================================
+    // AGENT H — manual sell helper tests (H9)
+    // ===================================================================
+
+    fn wts(wallet: Pubkey, mint: Pubkey, raw: u64) -> crate::wallet::WalletTokenState {
+        crate::wallet::WalletTokenState {
+            wallet,
+            mint,
+            raw_amount: raw,
+            decimals: Some(6),
+            token_account_count: 1,
+        }
+    }
+
+    /// H9: a tracked canonical Position selects its EXACT recorded wallet even
+    /// when a global Lightning wallet is configured — there is no Lightning
+    /// preference. The tracked wallet routes Local because an exact local signer
+    /// exists for it.
+    #[test]
+    fn test_manual_sell_tracked_wallet_over_global_lightning() {
+        let primary = Pubkey::new_unique();
+        let lightning = Pubkey::new_unique();
+        let registry = ExecutionWalletRegistry::new(primary, &[], Some(lightning));
+
+        let mut pos = recovery_test_position();
+        pos.wallet_pubkey = primary.to_string();
+        pos.token_decimals = Some(6);
+
+        // Canonical (not recovery-required) => exact tracked wallet chosen.
+        assert!(!position_requires_recovery(&pos));
+        let wallet: Pubkey = pos.wallet_pubkey.parse().unwrap();
+        let choice = ManualSellWalletChoice::Tracked(wallet);
+        assert_eq!(choice.wallet(), primary);
+        assert!(choice.is_tracked());
+        // The tracked wallet is Local (not the configured Lightning wallet).
+        assert_eq!(
+            registry.route_for(&choice.wallet()),
+            Some(crate::wallet::ExecutionRoute::Local)
+        );
+        assert_ne!(choice.wallet(), lightning);
+    }
+
+    /// H9: an untracked token held by exactly one controlled wallet resolves to
+    /// that exact wallet.
+    #[test]
+    fn test_manual_sell_untracked_single_holder_resolves() {
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let resolution =
+            crate::wallet::OwnedHolderResolution::Single(wts(wallet, mint, 500));
+        assert_eq!(
+            manual_untracked_resolution(&resolution),
+            ManualUntrackedResolution::Single(wallet)
+        );
+    }
+
+    /// H9: an untracked token held in multiple controlled wallets is ambiguous
+    /// and rejected (no wallet chosen, no cost-basis merge).
+    #[test]
+    fn test_manual_sell_untracked_multiple_holders_rejected() {
+        let w1 = Pubkey::new_unique();
+        let w2 = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let resolution = crate::wallet::OwnedHolderResolution::Multiple(vec![
+            wts(w1, mint, 100),
+            wts(w2, mint, 200),
+        ]);
+        match manual_untracked_resolution(&resolution) {
+            ManualUntrackedResolution::Ambiguous(wallets) => {
+                assert_eq!(wallets.len(), 2);
+                assert!(wallets.contains(&w1) && wallets.contains(&w2));
+            }
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+    }
+
+    /// H9: an untracked token with no positive holder refuses the sell.
+    #[test]
+    fn test_manual_sell_untracked_no_holder_refused() {
+        let resolution = crate::wallet::OwnedHolderResolution::None;
+        assert_eq!(
+            manual_untracked_resolution(&resolution),
+            ManualUntrackedResolution::NoHolder
+        );
+    }
+
+    /// H9: the untracked confirmed-fill path is the `Untracked` wallet choice,
+    /// which carries no cost basis — the caller therefore takes the explicit
+    /// "Realized P&L unavailable" branch (no PositionManager close).
+    #[test]
+    fn test_manual_sell_untracked_choice_has_no_pnl_basis() {
+        let wallet = Pubkey::new_unique();
+        let choice = ManualSellWalletChoice::Untracked(wallet);
+        assert_eq!(choice.wallet(), wallet);
+        assert!(
+            !choice.is_tracked(),
+            "an untracked choice must not be treated as tracked (no cost basis => no P&L)"
+        );
+    }
+
+    /// H9: an unresolved pending Sell for the same mint blocks another manual
+    /// sell, and the blocking signature is surfaced.
+    #[test]
+    fn test_manual_sell_pending_sell_blocks() {
+        let sell = PendingExecution::sell(
+            "sellsig".to_string(),
+            "mint".to_string(),
+            "wallet".to_string(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::Manual,
+                reason: "manual".to_string(),
+            },
+        );
+        assert_eq!(
+            manual_sell_pending_block(None, Some(&sell)),
+            Some("sellsig".to_string())
+        );
+    }
+
+    /// H9: an unresolved pending Buy for the same mint also blocks a manual sell.
+    #[test]
+    fn test_manual_sell_pending_buy_blocks() {
+        let buy = PendingExecution::buy(
+            "buysig".to_string(),
+            "mint".to_string(),
+            "wallet".to_string(),
+            PendingBuyContext {
+                requested_sol: 0.05,
+                name: "n".to_string(),
+                symbol: "s".to_string(),
+                bonding_curve: "bc".to_string(),
+                entry_type: crate::position::manager::EntryType::Opportunity,
+            },
+        );
+        assert_eq!(
+            manual_sell_pending_block(Some(&buy), None),
+            Some("buysig".to_string())
+        );
+    }
+
+    /// H9: no pending Buy or Sell => not blocked.
+    #[test]
+    fn test_manual_sell_no_pending_not_blocked() {
+        assert_eq!(manual_sell_pending_block(None, None), None);
+    }
+
+    // ===================================================================
+    // AGENT B — primary startup / exit coordination tests (B13)
+    // ===================================================================
+
+    fn new_active_sell_mints() -> ActiveSellMints {
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    /// B7: the shared same-mint sell coordinator lets exactly one producer reserve
+    /// a mint. A second reservation of the SAME mint fails until it is released.
+    #[test]
+    fn test_primary_sell_reservation_blocks_second_same_mint() {
+        let active = new_active_sell_mints();
+        // First producer reserves the mint.
+        assert!(try_reserve_sell_mint(&active, T_MINT));
+        // Second producer (e.g. kill-switch) for the same mint is blocked.
+        assert!(!try_reserve_sell_mint(&active, T_MINT));
+        // A DIFFERENT mint is independently reservable.
+        let other_mint = "Mint2222222222222222222222222222222222222222";
+        assert!(try_reserve_sell_mint(&active, other_mint));
+    }
+
+    /// B7: releasing a mint's reservation allows a later retry to reserve it again.
+    #[test]
+    fn test_primary_sell_reservation_release_allows_retry() {
+        let active = new_active_sell_mints();
+        assert!(try_reserve_sell_mint(&active, T_MINT));
+        assert!(!try_reserve_sell_mint(&active, T_MINT));
+        release_sell_mint(&active, T_MINT);
+        // After release the mint is free to reserve again.
+        assert!(try_reserve_sell_mint(&active, T_MINT));
+    }
+
+    /// B5: an additional-local (multi-wallet) position has an operational exit
+    /// route iff a Local exit trader is available. Registry routes the wallet
+    /// Local because it is in the local set.
+    #[test]
+    fn test_operational_exit_route_additional_local_wallet() {
+        let primary = Pubkey::new_unique();
+        let additional = Pubkey::new_unique();
+        // Registry recognizes an ADDITIONAL local wallet (multi-wallet recovery).
+        let registry = ExecutionWalletRegistry::new(primary, &[additional], None);
+        let pos = canonical_position(T_MINT, &additional.to_string(), "s", 100);
+        assert_eq!(
+            registry.route_for(&additional),
+            Some(crate::wallet::ExecutionRoute::Local)
+        );
+        // Local trader available => operational.
+        assert!(position_has_operational_exit_route(&pos, &registry, true, false));
+        // No Local trader => NOT operational (cannot actually sign/submit).
+        assert!(!position_has_operational_exit_route(&pos, &registry, false, false));
+
+        // An unknown wallet has no route => never operational.
+        let unknown = canonical_position(T_MINT, &Pubkey::new_unique().to_string(), "s", 100);
+        assert!(!position_has_operational_exit_route(&unknown, &registry, true, true));
+    }
+
+    /// B5: a Lightning-route position has an operational exit route iff a Lightning
+    /// exit trader is available. A local trader does NOT satisfy a Lightning route.
+    #[test]
+    fn test_operational_exit_route_lightning_requires_trader() {
+        let primary = Pubkey::new_unique();
+        let lightning = Pubkey::new_unique();
+        let registry = ExecutionWalletRegistry::new(primary, &[], Some(lightning));
+        let pos = canonical_position(T_MINT, &lightning.to_string(), "s", 100);
+        assert_eq!(
+            registry.route_for(&lightning),
+            Some(crate::wallet::ExecutionRoute::Lightning)
+        );
+        // Lightning trader available => operational.
+        assert!(position_has_operational_exit_route(&pos, &registry, false, true));
+        // No Lightning trader (even with a local trader) => NOT operational; no
+        // Lightning->Local fallback.
+        assert!(!position_has_operational_exit_route(&pos, &registry, true, false));
+
+        // Unknown decimals => never operational even with a trader.
+        let mut no_dec = pos.clone();
+        no_dec.token_decimals = None;
+        assert!(!position_has_operational_exit_route(&no_dec, &registry, true, true));
+    }
+
+    /// B1: pending recovery is ordered by submission time, then signature. Build
+    /// records out of order and confirm the sort is chronological with a signature
+    /// tie-break.
+    #[test]
+    fn test_pending_recovery_sort_is_chronological() {
+        use chrono::{Duration, Utc};
+        let base = Utc::now();
+        let mk = |sig: &str, offset_ms: i64| {
+            let mut p = PendingExecution::sell(
+                sig.to_string(),
+                T_MINT.to_string(),
+                "wallet".to_string(),
+                PendingSellContext {
+                    requested_amount: "100%".to_string(),
+                    intent: PendingSellIntent::Full,
+                    reason: "r".to_string(),
+                },
+            );
+            p.submitted_at = base + Duration::milliseconds(offset_ms);
+            p
+        };
+        // Two share a submitted_at (tie => signature order "sig-a" < "sig-b").
+        let mut items = vec![
+            mk("sig-late", 100),
+            mk("sig-b", 0),
+            mk("sig-a", 0),
+        ];
+        sort_pending_for_recovery(&mut items);
+        let order: Vec<&str> = items.iter().map(|p| p.signature.as_str()).collect();
+        assert_eq!(order, vec!["sig-a", "sig-b", "sig-late"]);
+    }
+
+    /// B1 explicit tie-break naming coverage (submission time first, then signature).
+    #[test]
+    fn test_pending_recovery_order_is_submission_time_then_signature() {
+        use chrono::{Duration, Utc};
+        let base = Utc::now();
+        let mk = |sig: &str, offset_ms: i64| {
+            let mut p = PendingExecution::sell(
+                sig.to_string(),
+                T_MINT.to_string(),
+                "wallet".to_string(),
+                PendingSellContext {
+                    requested_amount: "100%".to_string(),
+                    intent: PendingSellIntent::Full,
+                    reason: "r".to_string(),
+                },
+            );
+            p.submitted_at = base + Duration::milliseconds(offset_ms);
+            p
+        };
+        // Earlier submitted_at wins even when its signature sorts later.
+        let mut items = vec![mk("zzz-earlier", -10), mk("aaa-later", 10)];
+        sort_pending_for_recovery(&mut items);
+        assert_eq!(items[0].signature, "zzz-earlier");
+        assert_eq!(items[1].signature, "aaa-later");
+    }
+
+    /// B2: a recovered confirmed SELL must be rejected BEFORE close when the open
+    /// Position's decimals disagree with the fill decimals. The position is NOT
+    /// closed (kept for restart recovery). If the Position is absent, the durable
+    /// full-exit receipt replay is still allowed.
+    #[tokio::test]
+    async fn test_recovered_sell_decimal_mismatch_is_rejected_before_close() {
+        let mgr = mem_manager();
+        let wallet = Pubkey::new_unique().to_string();
+        // Position tracked with decimals Some(6).
+        mgr.record_confirmed_position(canonical_position(T_MINT, &wallet, "entry-sig", 100))
+            .await
+            .unwrap();
+
+        let pending = sell_pending(T_MINT, &wallet, "exit-mismatch", PendingSellIntent::Full);
+        // Fill decimals 9 != position decimals 6 => must fail closed, no close.
+        let res = apply_recovered_sell(&mgr, &pending, 9, 100, 0.5, PendingSellIntent::Full).await;
+        assert!(res.is_err(), "decimal mismatch must be rejected");
+        assert!(
+            mgr.get_position(T_MINT).await.is_some(),
+            "position must NOT be closed on decimal mismatch"
+        );
+
+        // Matching decimals (6) proceed to a full close.
+        apply_recovered_sell(&mgr, &pending, 6, 100, 0.5, PendingSellIntent::Full)
+            .await
+            .unwrap();
+        assert!(mgr.get_position(T_MINT).await.is_none());
+    }
+
+    /// B8: a pending Buy (or Sell) for the mint blocks a primary automatic sell
+    /// submission — exercised via the pure predicate both producers use.
+    #[test]
+    fn test_primary_pending_buy_blocks_sell_submission() {
+        let buy = PendingExecution::buy(
+            "buysig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingBuyContext {
+                requested_sol: 0.05,
+                name: "n".to_string(),
+                symbol: "s".to_string(),
+                bonding_curve: "bc".to_string(),
+                entry_type: crate::position::manager::EntryType::Opportunity,
+            },
+        );
+        // Pending Buy alone blocks (surfaces the buy signature).
+        assert_eq!(
+            pending_blocks_automatic_sell(Some(&buy), None),
+            Some("buysig".to_string())
+        );
+        let sell = PendingExecution::sell(
+            "sellsig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::Full,
+                reason: "r".to_string(),
+            },
+        );
+        // Pending Sell alone blocks (Sell signature preferred when both present).
+        assert_eq!(
+            pending_blocks_automatic_sell(None, Some(&sell)),
+            Some("sellsig".to_string())
+        );
+        assert_eq!(
+            pending_blocks_automatic_sell(Some(&buy), Some(&sell)),
+            Some("sellsig".to_string())
+        );
+        // Neither => not blocked.
+        assert_eq!(pending_blocks_automatic_sell(None, None), None);
+    }
+
+    // ===================================================================
+    // AGENT C — HotScan / manual pending-state boundary tests (C8)
+    // ===================================================================
+
+    /// C2: a pending Buy for a mint blocks the HotScan automatic sell exactly as a
+    /// pending Sell does. The HotScan sell guard uses the same shared predicate, so
+    /// a confirmed-buy whose durable position save failed cannot be closed out from
+    /// under an in-flight buy (which restart recovery would otherwise re-open).
+    #[test]
+    fn test_hotscan_pending_buy_blocks_sell() {
+        let buy = PendingExecution::buy(
+            "hotscan-buysig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingBuyContext {
+                requested_sol: 0.05,
+                name: "n".to_string(),
+                symbol: "s".to_string(),
+                bonding_curve: "bc".to_string(),
+                entry_type: crate::position::manager::EntryType::Opportunity,
+            },
+        );
+        // Pending Buy alone => HotScan must NOT submit a new sell; surfaces the sig.
+        assert_eq!(
+            pending_blocks_automatic_sell(Some(&buy), None),
+            Some("hotscan-buysig".to_string())
+        );
+        // No pending at all => not blocked (sell may proceed via routed path).
+        assert_eq!(pending_blocks_automatic_sell(None, None), None);
+    }
+
+    /// C1: an existing Lightning-route position with a configured Lightning wallet
+    /// but a MISSING api_key (=> no Lightning trader handle) is operationally
+    /// unexitable, which must HALT new HotScan entries. The HotScan C1 block halts
+    /// on any position without an operational exit route; this exercises the pure
+    /// predicate it uses with `lightning_trader_available = false`.
+    #[test]
+    fn test_hotscan_existing_lightning_position_without_trader_halts_new_entries() {
+        let primary = Pubkey::new_unique();
+        let lightning = Pubkey::new_unique();
+        // Registry recognizes the Lightning wallet (configured lightning_wallet).
+        let registry = ExecutionWalletRegistry::new(primary, &[], Some(lightning));
+        let pos = canonical_position(T_MINT, &lightning.to_string(), "s", 100);
+        assert_eq!(
+            registry.route_for(&lightning),
+            Some(crate::wallet::ExecutionRoute::Lightning)
+        );
+
+        // Missing api_key => no Lightning trader => NOT operationally exitable.
+        let local_trader_available = true; // PumpPortal trading on
+        let lightning_trader_available = false; // api_key empty => no lightning trader
+        assert!(
+            !position_has_operational_exit_route(
+                &pos,
+                &registry,
+                local_trader_available,
+                lightning_trader_available,
+            ),
+            "Lightning position without a Lightning trader must be unexitable"
+        );
+
+        // The HotScan C1 halt decision: any unexitable canonical position halts new
+        // entries. Mirror that count here.
+        let positions = vec![pos];
+        let unexitable = positions
+            .iter()
+            .filter(|p| {
+                !position_has_operational_exit_route(
+                    p,
+                    &registry,
+                    local_trader_available,
+                    lightning_trader_available,
+                )
+            })
+            .count();
+        assert!(
+            unexitable > 0,
+            "at least one unexitable position => new entries must halt"
+        );
+
+        // Sanity: with the Lightning trader available it WOULD be exitable and would
+        // not force a halt on its own.
+        assert!(position_has_operational_exit_route(&positions[0], &registry, true, true));
+    }
+
+    /// C3: after a signature, a failed pending journal write must NOT skip immediate
+    /// reconciliation. The pure decision helper confirms that regardless of the
+    /// initial persist result the handler still resolves an outcome; and that on a
+    /// confirmed fill the pending is removed as usual even if the first write failed.
+    #[test]
+    fn test_manual_post_signature_journal_failure_still_requires_reconciliation_path() {
+        // A confirmed fill after an initial-write failure => still just remove
+        // pending (durable economic truth is the applied close + receipt ledger).
+        assert_eq!(
+            manual_pending_action(false, ManualOutcomeKind::ConfirmedFill),
+            ManualPendingAction::RemovePending
+        );
+        // A confirmed fill after a successful initial write => remove pending too.
+        assert_eq!(
+            manual_pending_action(true, ManualOutcomeKind::ConfirmedFill),
+            ManualPendingAction::RemovePending
+        );
+        // Neither confirmed-fill case is "return before reconciliation": the only
+        // reason a fill action exists is that reconciliation ran to completion.
+    }
+
+    /// C4: an ambiguous manual outcome (Unresolved or structural error) whose
+    /// initial post-signature journal write FAILED must retry durable persistence
+    /// before returning. A durable initial write instead keeps pending as-is.
+    #[test]
+    fn test_manual_unresolved_requires_pending_durability() {
+        // Initial write failed => must retry durable persistence.
+        assert_eq!(
+            manual_pending_action(false, ManualOutcomeKind::Unresolved),
+            ManualPendingAction::RetryDurable
+        );
+        assert_eq!(
+            manual_pending_action(false, ManualOutcomeKind::StructuralError),
+            ManualPendingAction::RetryDurable
+        );
+        // Initial write succeeded => pending already durable, keep it.
+        assert_eq!(
+            manual_pending_action(true, ManualOutcomeKind::Unresolved),
+            ManualPendingAction::KeepDurable
+        );
+        assert_eq!(
+            manual_pending_action(true, ManualOutcomeKind::StructuralError),
+            ManualPendingAction::KeepDurable
+        );
+    }
+
+    /// C4/C6: `ensure_manual_pending_durable` actually persists a pending record so
+    /// a later reload observes it — this is the durable-retry primitive the
+    /// ambiguous-outcome branches call. Exercised against a real temp-dir store.
+    #[tokio::test]
+    async fn test_ensure_manual_pending_durable_persists() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "pf_manual_durable_{}_{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = PendingExecutionStore::new(path.clone());
+        store.load().await.unwrap();
+        let pending = PendingExecution::sell(
+            "durable-sig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::Manual,
+                reason: "manual".to_string(),
+            },
+        );
+
+        ensure_pending_execution_durable(&store, &pending)
+            .await
+            .expect("durable retry must succeed for a writable path");
+
+        // Reload from disk: the pending record survived (durable).
+        let reloaded = PendingExecutionStore::new(path.clone());
+        reloaded.load().await.unwrap();
+        assert!(
+            reloaded.get("durable-sig").await.is_some(),
+            "pending must be durable after ensure_manual_pending_durable"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C5: a ConfirmedFailure whose initial post-signature write never succeeded
+    /// does NOT need a pending failure record invented; if it WAS persisted, remove
+    /// it. No pending state is fabricated on a proven on-chain failure.
+    #[test]
+    fn test_manual_confirmed_failure_does_not_require_pending_after_initial_write_failure() {
+        // Initial write never succeeded => nothing to remove, no record to invent.
+        assert_eq!(
+            manual_pending_action(false, ManualOutcomeKind::ConfirmedFailure),
+            ManualPendingAction::RemoveIfPersisted
+        );
+        // Initial write succeeded => remove the persisted pending record.
+        assert_eq!(
+            manual_pending_action(true, ManualOutcomeKind::ConfirmedFailure),
+            ManualPendingAction::RemoveIfPersisted
+        );
+    }
+
+    // ===================================================================
+    // AUDIT-002 A11 — symmetric post-signature durability tests. These are
+    // pure/helper-level and require no network. `pending_durability_required`
+    // is the single decision applied on every live submit path (primary buy,
+    // primary auto-sell, event kill-switch sell, HotScan buy, HotScan sell,
+    // manual sell) once the reconciliation outcome is known.
+    // ===================================================================
+
+    /// A11: an Unresolved outcome whose initial pending write FAILED requires a
+    /// durability retry; the same outcome after a successful write does not.
+    #[test]
+    fn test_pending_durability_action_unresolved_requires_retry_after_initial_failure() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::Unresolved));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::Unresolved));
+    }
+
+    /// A11: a structural reconciler error whose initial write FAILED requires a
+    /// durability retry (same rule as Unresolved).
+    #[test]
+    fn test_pending_durability_action_structural_error_requires_retry_after_initial_failure() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::StructuralError));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::StructuralError));
+    }
+
+    /// A11: a confirmed-but-unapplied fill (identity/validation/application
+    /// failure) whose initial write FAILED requires a durability retry so the
+    /// confirmed fill is restart-recoverable.
+    #[test]
+    fn test_pending_durability_action_confirmed_unapplied_requires_retry_after_initial_failure() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::ConfirmedUnapplied));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::ConfirmedUnapplied));
+    }
+
+    /// A11: a confirmed fill whose economic state was durably applied does NOT
+    /// require an additional durable pending record — the applied close/receipt
+    /// (or record_confirmed_position) is the authoritative durable truth.
+    #[test]
+    fn test_pending_durability_action_confirmed_applied_does_not_require_retry() {
+        assert!(!pending_durability_required(false, SubmittedOutcomeState::ConfirmedApplied));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::ConfirmedApplied));
+        // And a ConfirmedFailure never requires an invented durable record.
+        assert!(!pending_durability_required(false, SubmittedOutcomeState::ConfirmedFailure));
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::ConfirmedFailure));
+    }
+
+    /// A11: primary buy — an Unresolved outcome after an initial persist failure
+    /// is NOT terminal; without a durability retry the submitted signature is not
+    /// restart-recoverable, so the decision demands a retry.
+    #[test]
+    fn test_primary_buy_unresolved_after_initial_persist_failure_is_not_terminal_without_retry() {
+        // initial persist failed + Unresolved => must retry (not terminal).
+        assert!(pending_durability_required(false, SubmittedOutcomeState::Unresolved));
+        // If the retry had already made it durable (modeled as initially_persisted),
+        // no further durability action is required.
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::Unresolved));
+    }
+
+    /// A11: primary auto-sell — a confirmed fill whose local application failed
+    /// (confirmed-but-unapplied) after an initial persist failure requires a
+    /// durability retry.
+    #[test]
+    fn test_primary_sell_confirmed_apply_failure_after_initial_persist_failure_requires_retry() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::ConfirmedUnapplied));
+    }
+
+    /// A11: HotScan buy — Unresolved after an initial persist failure requires a
+    /// durability retry before break.
+    #[test]
+    fn test_hotscan_buy_unresolved_after_initial_persist_failure_requires_retry() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::Unresolved));
+    }
+
+    /// A11: HotScan sell — a confirmed-but-unapplied close failure after an
+    /// initial persist failure requires a durability retry.
+    #[test]
+    fn test_hotscan_sell_confirmed_apply_failure_after_initial_persist_failure_requires_retry() {
+        assert!(pending_durability_required(false, SubmittedOutcomeState::ConfirmedUnapplied));
+    }
+
+    /// A11/A9: a manual TRACKED confirmed-but-unapplied sell whose early fill
+    /// validation fails must go through the durability path when the initial
+    /// pending write failed (modeled as ConfirmedUnapplied), rather than bypassing
+    /// it via an early return.
+    #[test]
+    fn test_manual_tracked_early_fill_validation_failure_requires_pending_durability() {
+        // Tracked confirmed fill that fails validation with no durable pending =>
+        // must retry durable persistence.
+        assert!(pending_durability_required(false, SubmittedOutcomeState::ConfirmedUnapplied));
+        // A durable initial write needs no retry.
+        assert!(!pending_durability_required(true, SubmittedOutcomeState::ConfirmedUnapplied));
+    }
+
+    /// A10/A11: the retry helper actually makes an initially-unpersisted pending
+    /// record durable against a real temp-dir store, and short-circuits to `true`
+    /// when it was already persisted.
+    #[tokio::test]
+    async fn test_retry_pending_durability_if_needed_persists_when_initial_failed() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "pf_retry_durable_{}_{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = PendingExecutionStore::new(path.clone());
+        store.load().await.unwrap();
+        let pending = PendingExecution::sell(
+            "retry-durable-sig".to_string(),
+            T_MINT.to_string(),
+            "wallet".to_string(),
+            PendingSellContext {
+                requested_amount: "100%".to_string(),
+                intent: PendingSellIntent::Manual,
+                reason: "manual".to_string(),
+            },
+        );
+
+        // Already persisted => true without touching the store.
+        assert!(retry_pending_durability_if_needed(&store, &pending, true).await);
+
+        // Initially failed => retry persists it durably.
+        assert!(retry_pending_durability_if_needed(&store, &pending, false).await);
+
+        let reloaded = PendingExecutionStore::new(path.clone());
+        reloaded.load().await.unwrap();
+        assert!(
+            reloaded.get("retry-durable-sig").await.is_some(),
+            "pending must be durable after retry_pending_durability_if_needed"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

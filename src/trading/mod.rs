@@ -9,6 +9,7 @@ pub mod jito;
 pub mod pending;
 pub mod pumpportal_api;
 pub mod reconciliation;
+pub mod recovery;
 pub mod simulation;
 pub mod tips;
 pub mod transaction;
@@ -19,6 +20,9 @@ pub use pending::{
     PendingExecutionStore, PendingSellContext, PendingSellIntent,
 };
 pub use pumpportal_api::PumpPortalTrader;
+pub use recovery::{
+    plan_pending_outcome, reconcile_pending_execution, PendingRecoveryPlan,
+};
 pub use reconciliation::{
     ReconcileConfig, ReconciledFill, ReconciliationOutcome, ReconciliationSide, TradeReconciler,
 };

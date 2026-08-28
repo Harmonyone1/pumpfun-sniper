@@ -26,6 +26,7 @@
 
 pub mod advisor;
 pub mod credentials;
+pub mod execution;
 pub mod extractor;
 pub mod manager;
 pub mod multi_wallet;
@@ -34,6 +35,10 @@ pub mod transfer;
 pub mod types;
 
 pub use credentials::CredentialManager;
+pub use execution::{
+    ExecutionRoute, ExecutionWalletRegistry, OwnedHolderResolution, WalletOwnershipProbe,
+    WalletTokenState,
+};
 pub use manager::WalletManager;
 pub use multi_wallet::{MultiWalletManager, SelectionStrategy, TradingWallet};
 pub use safety::{SafetyEnforcer, SafetyViolation};
