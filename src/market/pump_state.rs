@@ -90,7 +90,9 @@ fn err(msg: impl Into<String>) -> Error {
 
 fn check_discriminator(data: &[u8], expected: &[u8; 8], what: &str) -> Result<()> {
     if data.len() < 8 {
-        return Err(err(format!("{what}: account data shorter than discriminator")));
+        return Err(err(format!(
+            "{what}: account data shorter than discriminator"
+        )));
     }
     if &data[..8] != expected {
         return Err(err(format!("{what}: wrong discriminator")));
@@ -554,9 +556,7 @@ fn read_fees(data: &[u8], off: usize, what: &str) -> Result<DecodedFees> {
         ("creator_fee_bps", creator_fee_bps),
     ] {
         if v > MAX_FEE_BPS {
-            return Err(err(format!(
-                "{what}: {name}={v} exceeds {MAX_FEE_BPS} bps"
-            )));
+            return Err(err(format!("{what}: {name}={v} exceeds {MAX_FEE_BPS} bps")));
         }
     }
     Ok(DecodedFees {
@@ -648,19 +648,13 @@ impl FeeConfigState {
 
 /// Bonding-curve PDA: seeds ["bonding-curve", base_mint] under the Pump program.
 pub fn bonding_curve_pda(base_mint: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[b"bonding-curve", base_mint.as_ref()],
-        &pump_program_id(),
-    )
+    Pubkey::find_program_address(&[b"bonding-curve", base_mint.as_ref()], &pump_program_id())
 }
 
 /// Pump canonical pool creator authority: seeds ["pool-authority", base_mint]
 /// under the Pump program.
 pub fn pump_pool_authority_pda(base_mint: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[b"pool-authority", base_mint.as_ref()],
-        &pump_program_id(),
-    )
+    Pubkey::find_program_address(&[b"pool-authority", base_mint.as_ref()], &pump_program_id())
 }
 
 /// Canonical PumpSwap pool PDA: seeds ["pool", 0u16 le, pump_pool_authority,
@@ -775,9 +769,7 @@ mod tests {
     fn test_decode_legacy_bonding_curve_defaults_appended_sol_fields() {
         // Legacy account truncated right after `complete` (len 49): no creator,
         // no appended tail. creator/quote_mint default; flags false.
-        let mut short = build_bonding_curve(
-            5, 6, 7, 8, 9, true, pk(3), true, true, pk(4),
-        );
+        let mut short = build_bonding_curve(5, 6, 7, 8, 9, true, pk(3), true, true, pk(4));
         short.truncate(49);
         let s = PumpBondingCurveState::decode(&short).unwrap();
         assert!(s.complete);
@@ -787,9 +779,7 @@ mod tests {
         assert_eq!(s.quote_mint, Pubkey::default());
 
         // Truncated at offset 81 (creator present, no appended flags/quote_mint).
-        let mut mid = build_bonding_curve(
-            5, 6, 7, 8, 9, false, pk(3), true, true, pk(4),
-        );
+        let mut mid = build_bonding_curve(5, 6, 7, 8, 9, false, pk(3), true, true, pk(4));
         mid.truncate(81);
         let s2 = PumpBondingCurveState::decode(&mid).unwrap();
         assert_eq!(s2.creator, pk(3));
@@ -800,27 +790,21 @@ mod tests {
 
     #[test]
     fn test_bonding_curve_wrong_discriminator_rejected() {
-        let mut data = build_bonding_curve(
-            1, 2, 3, 4, 5, false, pk(1), false, false, pk(2),
-        );
+        let mut data = build_bonding_curve(1, 2, 3, 4, 5, false, pk(1), false, false, pk(2));
         data[0] ^= 0xFF;
         assert!(PumpBondingCurveState::decode(&data).is_err());
     }
 
     #[test]
     fn test_bonding_curve_invalid_bool_rejected() {
-        let mut data = build_bonding_curve(
-            1, 2, 3, 4, 5, false, pk(1), false, false, pk(2),
-        );
+        let mut data = build_bonding_curve(1, 2, 3, 4, 5, false, pk(1), false, false, pk(2));
         data[48] = 2; // complete byte invalid
         assert!(PumpBondingCurveState::decode(&data).is_err());
     }
 
     #[test]
     fn test_bonding_curve_trailing_padding_allowed() {
-        let mut data = build_bonding_curve(
-            1, 2, 3, 4, 5, false, pk(1), false, false, pk(2),
-        );
+        let mut data = build_bonding_curve(1, 2, 3, 4, 5, false, pk(1), false, false, pk(2));
         data.extend_from_slice(&[0u8; 16]);
         assert!(PumpBondingCurveState::decode(&data).is_ok());
     }
@@ -901,7 +885,19 @@ mod tests {
     #[test]
     fn test_decode_legacy_pool_defaults_virtual_quote_zero() {
         let data = build_pool(
-            1, 0, pk(1), pk(2), pk(3), pk(4), pk(5), pk(6), 1, pk(7), false, false, None,
+            1,
+            0,
+            pk(1),
+            pk(2),
+            pk(3),
+            pk(4),
+            pk(5),
+            pk(6),
+            1,
+            pk(7),
+            false,
+            false,
+            None,
         );
         assert_eq!(data.len(), 245);
         let p = PumpSwapPoolState::decode(&data).unwrap();
@@ -911,7 +907,19 @@ mod tests {
     #[test]
     fn test_partial_virtual_quote_field_rejected() {
         let mut data = build_pool(
-            1, 0, pk(1), pk(2), pk(3), pk(4), pk(5), pk(6), 1, pk(7), false, false, None,
+            1,
+            0,
+            pk(1),
+            pk(2),
+            pk(3),
+            pk(4),
+            pk(5),
+            pk(6),
+            1,
+            pk(7),
+            false,
+            false,
+            None,
         );
         // Append only 8 of the 16 i128 bytes => partial field must be rejected.
         data.extend_from_slice(&[0u8; 8]);
@@ -923,7 +931,19 @@ mod tests {
     fn test_pool_full_i128_after_padding_note() {
         // A field fully present plus extra trailing padding is fine (>=16 remain).
         let mut data = build_pool(
-            1, 0, pk(1), pk(2), pk(3), pk(4), pk(5), pk(6), 1, pk(7), false, false, Some(42),
+            1,
+            0,
+            pk(1),
+            pk(2),
+            pk(3),
+            pk(4),
+            pk(5),
+            pk(6),
+            1,
+            pk(7),
+            false,
+            false,
+            Some(42),
         );
         data.extend_from_slice(&[0u8; 8]); // trailing padding after full i128
         let p = PumpSwapPoolState::decode(&data).unwrap();
@@ -1100,13 +1120,7 @@ mod tests {
 
     #[test]
     fn test_fee_config_component_over_10000_rejected() {
-        let data = build_fee_config(
-            1,
-            pk(1),
-            (10_001, 10, 10),
-            &[(0u128, (1, 1, 1))],
-            None,
-        );
+        let data = build_fee_config(1, pk(1), (10_001, 10, 10), &[(0u128, (1, 1, 1))], None);
         assert!(FeeConfigState::decode(&data).is_err());
     }
 
@@ -1130,10 +1144,8 @@ mod tests {
         let base = pk(42);
         let (pda, bump) = bonding_curve_pda(&base);
         // Determinism + independent recomputation with explicit program id.
-        let (expected, ebump) = Pubkey::find_program_address(
-            &[b"bonding-curve", base.as_ref()],
-            &pump_program_id(),
-        );
+        let (expected, ebump) =
+            Pubkey::find_program_address(&[b"bonding-curve", base.as_ref()], &pump_program_id());
         assert_eq!(pda, expected);
         assert_eq!(bump, ebump);
         assert_ne!(pda, Pubkey::default());
