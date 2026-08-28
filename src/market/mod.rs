@@ -5,5 +5,11 @@
 //! the on-chain oracle module and curated re-exports.
 
 pub mod math;
+pub mod oracle;
 pub mod pump_state;
 pub mod types;
+
+// Curated re-exports (packet D9). The oracle is the canonical live-money entry
+// point; the domain types travel with every snapshot/quote it returns.
+pub use oracle::PumpMarketOracle;
+pub use types::{ExecutableQuote, MarketSide, MarketSnapshot, MarketVenue, QuoteAsset};

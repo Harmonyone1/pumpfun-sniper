@@ -364,7 +364,10 @@ mod tests {
         assert_eq!(calculate_fee_tier(&tiers, 999).unwrap().threshold, 0);
         assert_eq!(calculate_fee_tier(&tiers, 1_000).unwrap().threshold, 1_000);
         assert_eq!(calculate_fee_tier(&tiers, 5_000).unwrap().threshold, 1_000);
-        assert_eq!(calculate_fee_tier(&tiers, 10_000).unwrap().threshold, 10_000);
+        assert_eq!(
+            calculate_fee_tier(&tiers, 10_000).unwrap().threshold,
+            10_000
+        );
         assert_eq!(
             calculate_fee_tier(&tiers, u128::MAX).unwrap().threshold,
             10_000
@@ -447,15 +450,21 @@ mod tests {
         // Fail-closed inputs.
         assert_eq!(pump_buy_base_out(0, PUMP_VT, PUMP_VQ, PUMP_RTR, 150), None);
         assert_eq!(pump_buy_base_out(1, PUMP_VT, PUMP_VQ, PUMP_RTR, 150), None);
-        assert_eq!(pump_buy_base_out(1_000_000_000, 0, PUMP_VQ, PUMP_RTR, 150), None);
-        assert_eq!(pump_buy_base_out(1_000_000_000, PUMP_VT, PUMP_VQ, 0, 150), None);
+        assert_eq!(
+            pump_buy_base_out(1_000_000_000, 0, PUMP_VQ, PUMP_RTR, 150),
+            None
+        );
+        assert_eq!(
+            pump_buy_base_out(1_000_000_000, PUMP_VT, PUMP_VQ, 0, 150),
+            None
+        );
     }
 
     #[test]
     fn test_pumpswap_sell_uses_effective_quote_reserve() {
         // net (lp+protocol+creator) = 1_243_093.
-        let net = pumpswap_sell_net_quote_out(5_000_000, PS_BASE_RES, PS_EFF_QUOTE, 20, 30, 5)
-            .unwrap();
+        let net =
+            pumpswap_sell_net_quote_out(5_000_000, PS_BASE_RES, PS_EFF_QUOTE, 20, 30, 5).unwrap();
         assert_eq!(net, 1_243_093);
         // A different effective quote reserve must change the raw output — proves
         // effective (not raw vault) reserve is what drives the quote.
@@ -469,8 +478,8 @@ mod tests {
     fn test_pumpswap_sell_creator_default_omits_creator_fee() {
         // With creator_bps = 0 (default creator) the creator fee is omitted:
         // net = raw - lp - protocol = 1_243_718.
-        let net = pumpswap_sell_net_quote_out(5_000_000, PS_BASE_RES, PS_EFF_QUOTE, 20, 30, 0)
-            .unwrap();
+        let net =
+            pumpswap_sell_net_quote_out(5_000_000, PS_BASE_RES, PS_EFF_QUOTE, 20, 30, 0).unwrap();
         assert_eq!(net, 1_243_718);
         // And it is exactly the creator fee (625) larger than the with-creator case.
         let with_creator =
@@ -480,16 +489,21 @@ mod tests {
 
     #[test]
     fn test_pumpswap_buy_quote_uses_total_fee_bps() {
-        let base_out =
-            pumpswap_buy_base_out(1_000_000_000, PS_BASE_RES, PS_EFF_QUOTE, 55).unwrap();
+        let base_out = pumpswap_buy_base_out(1_000_000_000, PS_BASE_RES, PS_EFF_QUOTE, 55).unwrap();
         assert_eq!(base_out, 3_900_536_321);
         // Higher total fee bps -> less base out.
         let base_out_more =
             pumpswap_buy_base_out(1_000_000_000, PS_BASE_RES, PS_EFF_QUOTE, 500).unwrap();
         assert!(base_out_more < base_out);
         // Fail-closed inputs.
-        assert_eq!(pumpswap_buy_base_out(0, PS_BASE_RES, PS_EFF_QUOTE, 55), None);
-        assert_eq!(pumpswap_buy_base_out(1_000_000_000, 0, PS_EFF_QUOTE, 55), None);
+        assert_eq!(
+            pumpswap_buy_base_out(0, PS_BASE_RES, PS_EFF_QUOTE, 55),
+            None
+        );
+        assert_eq!(
+            pumpswap_buy_base_out(1_000_000_000, 0, PS_EFF_QUOTE, 55),
+            None
+        );
     }
 
     #[test]
@@ -512,8 +526,7 @@ mod tests {
     fn test_raw_ratio_is_not_normalized_price() {
         // Raw reserve ratio (lamports per raw base unit).
         let raw_ratio = PS_EFF_QUOTE as f64 / PS_BASE_RES as f64; // 0.25
-        let normalized =
-            normalized_mark_sol_per_token(PS_BASE_RES, 6, PS_EFF_QUOTE).unwrap(); // 0.00025
+        let normalized = normalized_mark_sol_per_token(PS_BASE_RES, 6, PS_EFF_QUOTE).unwrap(); // 0.00025
         assert!((raw_ratio - 0.25).abs() < 1e-12);
         // They differ by exactly 10^base_decimals / 1e9 lamport factor.
         // raw_ratio / normalized = 1e9 / 10^6 = 1000.
