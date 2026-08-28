@@ -133,6 +133,182 @@ fn layer_raw_amount(total_raw: u64, sell_pct: &str) -> Option<u64> {
     }
 }
 
+/// Convert a decimal UI token amount string to an exact raw `u64` using the
+/// token's decimals (MPT-001 Agent I1). This is the inverse of
+/// `raw_token_amount_to_decimal_string` for a normal manual numeric sell amount.
+///
+/// Pure string/integer math — NO f64, so no precision loss. Rejects:
+/// - scientific notation (`e`/`E`);
+/// - a leading sign (negative or explicit `+`);
+/// - empty input, a bare `.`, or multiple `.`;
+/// - non-digit characters;
+/// - more fractional digits than `decimals` UNLESS every excess digit is `0`;
+/// - integer/multiply/add overflow of `u64`.
+///
+/// Examples (decimals = 6): `"1.234567" => 1_234_567`, `"0.5" => 500_000`,
+/// `"2" => 2_000_000`, `"1.2300" => 1_230_000` (trailing zeros ok),
+/// `"1.2345678"` rejected (nonzero 7th/8th fractional digit).
+fn decimal_token_amount_to_raw(input: &str, decimals: u8) -> crate::error::Result<u64> {
+    use crate::error::Error;
+    let s = input.trim();
+    if s.is_empty() {
+        return Err(Error::MarketData(
+            "empty token amount is not a valid decimal".to_string(),
+        ));
+    }
+    // Reject scientific notation and any sign; only [0-9] and a single '.' allowed.
+    if s.contains('e') || s.contains('E') {
+        return Err(Error::MarketData(format!(
+            "scientific notation is not accepted for a token amount: '{}'",
+            input
+        )));
+    }
+    if s.starts_with('-') || s.starts_with('+') {
+        return Err(Error::MarketData(format!(
+            "signed token amount is not accepted: '{}'",
+            input
+        )));
+    }
+
+    let (int_str, frac_str) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    // A bare "." or a value with more than one "." (split_once leaves a '.' in frac).
+    if frac_str.contains('.') {
+        return Err(Error::MarketData(format!(
+            "malformed token amount (multiple decimal points): '{}'",
+            input
+        )));
+    }
+    if int_str.is_empty() && frac_str.is_empty() {
+        return Err(Error::MarketData(format!(
+            "malformed token amount: '{}'",
+            input
+        )));
+    }
+    // Treat an empty integer part (".5") as "0".
+    let int_str = if int_str.is_empty() { "0" } else { int_str };
+    if !int_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::MarketData(format!(
+            "non-digit in integer part of token amount: '{}'",
+            input
+        )));
+    }
+    if !frac_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::MarketData(format!(
+            "non-digit in fractional part of token amount: '{}'",
+            input
+        )));
+    }
+
+    let decimals = decimals as usize;
+    // Split the fractional digits into the part that scales into raw units and any
+    // excess beyond the token's precision. Excess is only allowed if all zeros.
+    let (frac_used, frac_excess) = if frac_str.len() > decimals {
+        frac_str.split_at(decimals)
+    } else {
+        (frac_str, "")
+    };
+    if frac_excess.bytes().any(|b| b != b'0') {
+        return Err(Error::MarketData(format!(
+            "token amount '{}' has more than {} fractional decimals",
+            input, decimals
+        )));
+    }
+    // Right-pad the used fractional digits to exactly `decimals` so it lines up with
+    // 10^decimals scaling.
+    let mut frac_scaled = frac_used.to_string();
+    while frac_scaled.len() < decimals {
+        frac_scaled.push('0');
+    }
+
+    let int_val: u64 = int_str
+        .parse()
+        .map_err(|_| Error::MarketData(format!("integer part overflows u64: '{}'", input)))?;
+    let scale = 10u64
+        .checked_pow(decimals as u32)
+        .ok_or_else(|| Error::MarketData(format!("decimals {} overflow scale", decimals)))?;
+    let frac_val: u64 = if frac_scaled.is_empty() {
+        0
+    } else {
+        frac_scaled
+            .parse()
+            .map_err(|_| Error::MarketData(format!("fractional part overflows u64: '{}'", input)))?
+    };
+    int_val
+        .checked_mul(scale)
+        .and_then(|hi| hi.checked_add(frac_val))
+        .ok_or_else(|| Error::MarketData(format!("token amount overflows u64: '{}'", input)))
+}
+
+/// Resolve an arbitrary manual sell percentage to an EXACT raw proportion of a
+/// position's raw balance (MPT-001 Agent I1). Integer math only (u128): the
+/// percentage string is parsed to a fixed-point value scaled by `10^6` percent-
+/// decimals, then `total_raw * pct_scaled / (100 * 10^6)` with flooring. Rejects a
+/// zero result (nothing to sell). The percentage validity range is enforced by the
+/// caller; this only needs a well-formed non-negative decimal string.
+fn percent_of_raw(total_raw: u64, pct_str: &str) -> crate::error::Result<u64> {
+    use crate::error::Error;
+    const PCT_DECIMALS: u8 = 6;
+    // Reuse the exact decimal->raw parser to get pct scaled by 10^6, rejecting
+    // scientific notation / signs / excess precision consistently.
+    let pct_scaled = decimal_token_amount_to_raw(pct_str, PCT_DECIMALS)?;
+    let denom: u128 = 100u128 * 10u128.pow(PCT_DECIMALS as u32);
+    let raw = (total_raw as u128)
+        .checked_mul(pct_scaled as u128)
+        .map(|hi| hi / denom)
+        .ok_or_else(|| Error::MarketData("percentage proportion overflow".to_string()))?;
+    if raw == 0 {
+        return Err(Error::MarketData(format!(
+            "percentage {}% of {} raw resolves to zero tokens",
+            pct_str, total_raw
+        )));
+    }
+    if raw > u64::MAX as u128 {
+        return Err(Error::MarketData(
+            "percentage proportion exceeds u64".to_string(),
+        ));
+    }
+    Ok(raw as u64)
+}
+
+/// The exact raw amount + venue-pinned pool a manual sell will submit, decided
+/// AFTER a fresh executable quote is obtained (MPT-001 Agent I3/I5). A normal
+/// manual sell may only submit when a same-venue SOL quote exists; otherwise it
+/// must refuse (no Auto, no oracle bypass — `--force` only skips the human
+/// prompt). This pure decision function makes that requirement testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualSellDecision {
+    /// A fresh executable quote confirmed the venue; submit this pinned pool.
+    Submit { pool: PoolType },
+    /// No usable same-venue SOL quote; refuse the normal manual sell.
+    Refuse,
+}
+
+/// I5(5)/(6)/(7): decide whether a manual sell may submit, given the fresh quote.
+/// Requires `Some(quote)` that is a SOL pair; pins the pool to the quoted venue.
+fn manual_sell_decision(quote: Option<&crate::market::ExecutableQuote>) -> ManualSellDecision {
+    match quote {
+        Some(q) if q.is_sol_pair() => ManualSellDecision::Submit {
+            pool: pumpportal_pool_for_venue(q.venue),
+        },
+        _ => ManualSellDecision::Refuse,
+    }
+}
+
+/// Quote-to-fill execution drift for a SELL, as a percentage (MPT-001 Agent I4).
+/// Positive means the fill was WORSE than the quote: `(expected - actual)/expected
+/// * 100`. Returns `None` when `expected` is not finite/positive (never fabricated)
+/// or `actual` is not finite. This mirrors the strategy-side sell drift definition;
+/// the manual path only DISPLAYS it (no StrategyEngine present).
+fn manual_sell_drift_pct(expected: f64, actual: f64) -> Option<f64> {
+    if !expected.is_finite() || expected <= 0.0 || !actual.is_finite() {
+        return None;
+    }
+    Some((expected - actual) / expected * 100.0)
+}
+
 /// Which fresh-MARK rule produced a price-exit candidate (MPT-001 Agent F2). The
 /// candidate is identified from the fresh on-chain mark, but a price-based sell is
 /// only submitted after the SAME condition is re-confirmed against the exact-size
@@ -3003,8 +3179,10 @@ fn manual_sell_pending_block(
 /// The outcome of resolving an untracked token's controlled-wallet ownership (H2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManualUntrackedResolution {
-    /// Exactly one controlled wallet holds a positive balance.
-    Single(Pubkey),
+    /// Exactly one controlled wallet holds a positive balance. Carries the proven
+    /// raw balance + decimals so a manual percentage/numeric amount resolves to an
+    /// exact raw size from proven on-chain ownership (MPT-001 Agent I1).
+    Single(crate::wallet::WalletTokenState),
     /// Held in multiple controlled wallets => ambiguous, refuse.
     Ambiguous(Vec<Pubkey>),
     /// No controlled wallet holds a positive balance => refuse.
@@ -3022,7 +3200,9 @@ fn manual_untracked_resolution(
     use crate::wallet::OwnedHolderResolution;
     match resolution {
         OwnedHolderResolution::None => ManualUntrackedResolution::NoHolder,
-        OwnedHolderResolution::Single(state) => ManualUntrackedResolution::Single(state.wallet),
+        OwnedHolderResolution::Single(state) => {
+            ManualUntrackedResolution::Single(state.clone())
+        }
         OwnedHolderResolution::Multiple(states) => {
             ManualUntrackedResolution::Ambiguous(states.iter().map(|s| s.wallet).collect())
         }
@@ -3179,21 +3359,20 @@ pub async fn sell(
     let token_pubkey = solana_sdk::pubkey::Pubkey::try_from(token)
         .map_err(|e| anyhow::anyhow!("Invalid token address: {}", e))?;
 
-    // Parse amount (percentage like "50%" or absolute token units). The exact
-    // user input string is preserved verbatim for the pending sell context (H5).
+    // Parse the amount shape. A percentage ("50%") is resolved to an EXACT raw
+    // proportion of the position later, once decimals/balance are known (I1). A
+    // numeric UI amount is NOT parsed through f64 here — it is converted to raw
+    // exactly via `decimal_token_amount_to_raw` after decimals are resolved (I1).
+    // The percentage magnitude is parsed only to validate/derive the proportion.
     let is_percentage = amount.ends_with('%');
-    let amount_value: f64 = if is_percentage {
-        amount
+    if is_percentage {
+        let v: f64 = amount
             .trim_end_matches('%')
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid amount: {}", e))?
-    } else {
-        amount
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid amount: {}", e))?
-    };
-    if is_percentage && (amount_value <= 0.0 || amount_value > 100.0) {
-        anyhow::bail!("Percentage must be between 0 and 100");
+            .map_err(|e| anyhow::anyhow!("Invalid percentage amount: {}", e))?;
+        if v <= 0.0 || v > 100.0 {
+            anyhow::bail!("Percentage must be between 0 and 100");
+        }
     }
 
     if !config.pumpportal.use_for_trading {
@@ -3326,6 +3505,10 @@ pub async fn sell(
     let bought_mints_path = Arc::new(bought_mints_path);
 
     // === H2: resolve the EXACT execution wallet ===
+    // I1: for an UNTRACKED sell there is no canonical Position, so the exact raw
+    // balance + decimals come from the ownership probe. Captured here so a manual
+    // percentage/numeric amount resolves to an exact raw size (never through f64).
+    let mut untracked_balance: Option<crate::wallet::WalletTokenState> = None;
     let mut tracked_position = position_manager.get_position(token).await;
     let wallet_choice: ManualSellWalletChoice = match tracked_position.clone() {
         Some(pos) if !position_requires_recovery(&pos) => {
@@ -3386,7 +3569,11 @@ pub async fn sell(
                 .await
                 .map_err(|e| anyhow::anyhow!("Ownership probe failed: {}", e))?;
             match manual_untracked_resolution(&resolution) {
-                ManualUntrackedResolution::Single(w) => ManualSellWalletChoice::Untracked(w),
+                ManualUntrackedResolution::Single(state) => {
+                    let wallet = state.wallet;
+                    untracked_balance = Some(state);
+                    ManualSellWalletChoice::Untracked(wallet)
+                }
                 ManualUntrackedResolution::Ambiguous(wallets) => {
                     for w in &wallets {
                         println!("  controlled wallet holding {}: {}", token, w);
@@ -3426,6 +3613,125 @@ pub async fn sell(
     }
     println!("  Execution wallet: {} ({:?})", execution_wallet, route);
 
+    // === I1: resolve the EXACT raw amount + token decimals BEFORE quoting/prompt ===
+    // Tracked: proportion (percentage) or exact numeric conversion uses the tracked
+    // raw token_amount and the position's confirmed decimals. Untracked: the proven
+    // wallet raw balance + decimals from the ownership probe. No f64 for absolute
+    // token amounts (I1); percentages resolve to an exact raw proportion.
+    let (base_total_raw, token_decimals): (u64, u8) = match &tracked_position {
+        Some(pos) => {
+            let decimals = pos.token_decimals.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Tracked position for {} has no canonical decimals; refusing manual sell.",
+                    token
+                )
+            })?;
+            (pos.token_amount, decimals)
+        }
+        None => {
+            let state = untracked_balance.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Untracked sell for {} has no proven wallet balance; refusing manual sell.",
+                    token
+                )
+            })?;
+            let decimals = state.decimals.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Untracked wallet balance for {} has no decimals; refusing manual sell.",
+                    token
+                )
+            })?;
+            (state.raw_amount, decimals)
+        }
+    };
+
+    let resolved_raw: u64 = if is_percentage {
+        percent_of_raw(base_total_raw, amount.trim_end_matches('%'))
+            .map_err(|e| anyhow::anyhow!("Failed to resolve percentage sell amount: {}", e))?
+    } else {
+        let raw = decimal_token_amount_to_raw(amount, token_decimals)
+            .map_err(|e| anyhow::anyhow!("Failed to convert token amount to raw: {}", e))?;
+        if raw == 0 {
+            anyhow::bail!("Resolved token amount is zero; nothing to sell.");
+        }
+        if raw > base_total_raw {
+            anyhow::bail!(
+                "Requested {} tokens exceeds available balance ({} raw); refusing manual sell.",
+                amount,
+                base_total_raw
+            );
+        }
+        raw
+    };
+
+    // Exact decimal amount string derived from the resolved raw size — this is the
+    // SAME size that is quoted, route-pinned and submitted (I2/I3).
+    let submit_amount = raw_token_amount_to_decimal_string(resolved_raw, token_decimals);
+
+    // === I2: fetch a fresh, exact-size executable sell quote BEFORE the prompt ===
+    // Build a PumpMarketOracle inline from the manual RPC client (Agent G pattern).
+    // No DexScreener. A normal manual sell requires a successful same-venue SOL
+    // quote; --force never bypasses this (it only skips the human prompt in H4).
+    let market_oracle = Arc::new(PumpMarketOracle::new(rpc_client.clone()));
+    let sell_quote = match market_oracle
+        .quote_sell_raw(&token_pubkey, resolved_raw)
+        .await
+    {
+        Ok(q) => q,
+        Err(e) => {
+            // I3: quote unavailable => refuse the normal manual sell (no submit).
+            anyhow::bail!(
+                "No executable market quote for {} at exact size {} raw ({}): refusing manual sell. \
+                 This is a market-admission failure, not a submission. {}",
+                token,
+                resolved_raw,
+                submit_amount,
+                e
+            );
+        }
+    };
+
+    // I3: a normal manual sell only proceeds on a same-venue SOL quote; the pinned
+    // pool is decided purely from the quote venue (never Auto).
+    let manual_decision = manual_sell_decision(Some(&sell_quote));
+    let sell_pool = match manual_decision {
+        ManualSellDecision::Submit { pool } => pool,
+        ManualSellDecision::Refuse => {
+            anyhow::bail!(
+                "Market quote for {} is not a supported SOL pair (venue {:?}); refusing manual sell \
+                 (unsupported quote mint). Kill-switch/emergency is a separate path.",
+                token,
+                sell_quote.venue
+            );
+        }
+    };
+
+    // I2 display: venue, exact raw + UI amount, fresh mark, expected net SOL out,
+    // expected executable price, and the quote slot. Then the existing prompt.
+    let fresh_mark = match market_oracle.snapshot(&token_pubkey).await {
+        Ok(snap) => snap.mark_price_sol_per_token,
+        Err(_) => None,
+    };
+    println!("\n=== EXECUTABLE SELL QUOTE ===");
+    println!("  Venue: {:?} (pool {:?})", sell_quote.venue, sell_pool);
+    println!("  Exact raw amount: {}", resolved_raw);
+    println!("  Exact UI amount: {}", submit_amount);
+    match fresh_mark {
+        Some(m) => println!("  Fresh mark: {:.12} SOL/token", m),
+        None => println!("  Fresh mark: unavailable"),
+    }
+    match sell_quote.expected_sol() {
+        Some(sol) => println!("  Expected protocol net SOL out: {:.9} SOL", sol),
+        None => println!("  Expected protocol net SOL out: unavailable"),
+    }
+    match sell_quote.expected_price_sol_per_token {
+        Some(p) => println!("  Expected executable price: {:.12} SOL/token", p),
+        None => println!("  Expected executable price: unavailable"),
+    }
+    println!("  Quote slot: {}", sell_quote.slot);
+    // Expected quote price retained for the post-fill drift report (I4).
+    let expected_quote_price = sell_quote.expected_price_sol_per_token;
+
     // === H4: preserve the manual confirmation prompt + dry-run no-send ===
     if config.safety.require_sell_confirmation && !force {
         let confirmed = Confirm::new()
@@ -3442,11 +3748,17 @@ pub async fn sell(
     }
 
     if dry_run {
-        info!("DRY-RUN: Would sell {} of {} from {}", amount, token, execution_wallet);
+        info!(
+            "DRY-RUN: Would sell {} (raw {}) of {} from {} via pool {:?}",
+            submit_amount, resolved_raw, token, execution_wallet, sell_pool
+        );
         return Ok(());
     }
 
-    // === H3: exact route submission ===
+    // === H3/I3: exact route submission, venue-pinned to the quoted venue ===
+    // Submit the EXACT decimal amount derived from the resolved raw size (I3), and
+    // pin the pool to the quoted venue (never Auto for a normal manual sell). Quote
+    // input, route and submitted amount are therefore the same intended size.
     let slippage_pct = config.trading.slippage_bps / 100;
     let priority_fee = config.trading.priority_fee_lamports as f64 / 1_000_000_000.0;
 
@@ -3455,15 +3767,19 @@ pub async fn sell(
             // Resolve the EXACT local signer for this wallet: primary keypair or a
             // recovery MultiWallet signer. No fallback (INV-WALLET-003).
             if execution_wallet == keypair.pubkey() {
-                info!("Manual sell: local submission via primary keypair");
+                info!(
+                    "Manual sell: local submission via primary keypair (pool {:?})",
+                    sell_pool
+                );
                 pumpportal_local_trader()
-                    .sell_local(
+                    .sell_local_with_pool(
                         token,
-                        amount,
+                        &submit_amount,
                         slippage_pct,
                         priority_fee,
                         &keypair,
                         &rpc_client,
+                        sell_pool,
                     )
                     .await
             } else {
@@ -3473,17 +3789,18 @@ pub async fn sell(
                 {
                     Some(tw) => {
                         info!(
-                            "Manual sell: local submission via recovery wallet {}",
-                            execution_wallet
+                            "Manual sell: local submission via recovery wallet {} (pool {:?})",
+                            execution_wallet, sell_pool
                         );
                         pumpportal_local_trader()
-                            .sell_local(
+                            .sell_local_with_pool(
                                 token,
-                                amount,
+                                &submit_amount,
                                 slippage_pct,
                                 priority_fee,
                                 &tw.keypair,
                                 &rpc_client,
+                                sell_pool,
                             )
                             .await
                     }
@@ -3502,9 +3819,12 @@ pub async fn sell(
             if config.pumpportal.api_key.is_empty() {
                 anyhow::bail!("PumpPortal API key required for a Lightning manual sell.");
             }
-            info!("Manual sell: Lightning submission (wallet {})", execution_wallet);
+            info!(
+                "Manual sell: Lightning submission (wallet {}, pool {:?})",
+                execution_wallet, sell_pool
+            );
             PumpPortalTrader::lightning(config.pumpportal.api_key.clone())
-                .sell(token, amount, slippage_pct, priority_fee)
+                .sell_with_pool(token, &submit_amount, slippage_pct, priority_fee, sell_pool)
                 .await
         }
     };
@@ -3531,7 +3851,7 @@ pub async fn sell(
         token.to_string(),
         execution_wallet.to_string(),
         PendingSellContext {
-            requested_amount: amount.to_string(), // exact user input preserved (H5)
+            requested_amount: submit_amount.clone(), // exact submitted decimal amount (I3)
             intent: PendingSellIntent::Manual,
             reason: "manual".to_string(),
         },
@@ -3795,6 +4115,16 @@ pub async fn sell(
                 println!("  UI sold: {:.6}", ui_sold);
                 println!("  Net SOL (wallet delta): {:+.6} SOL", validated_net_sol);
                 println!("  Effective price: {:.10} SOL/token", validated_price);
+                // I4: expected quote price, actual fill price, quote-to-fill drift.
+                match expected_quote_price {
+                    Some(p) => println!("  Expected quote price: {:.10} SOL/token", p),
+                    None => println!("  Expected quote price: unavailable"),
+                }
+                println!("  Actual fill price: {:.10} SOL/token", validated_price);
+                match expected_quote_price.and_then(|p| manual_sell_drift_pct(p, validated_price)) {
+                    Some(d) => println!("  Quote-to-fill drift: {:+.4}% (positive = worse)", d),
+                    None => println!("  Quote-to-fill drift: unavailable"),
+                }
                 println!("  Realized P&L: {:+.6} SOL", close_result.pnl_sol);
                 if close_result.fully_closed {
                     println!("  Position fully closed.");
@@ -3831,6 +4161,16 @@ pub async fn sell(
                 println!("  UI sold: {:.6}", ui_sold);
                 println!("  Net SOL (wallet delta): {:+.6} SOL", net_sol);
                 println!("  Effective price: {:.10} SOL/token", effective_price);
+                // I4: expected quote price, actual fill price, quote-to-fill drift.
+                match expected_quote_price {
+                    Some(p) => println!("  Expected quote price: {:.10} SOL/token", p),
+                    None => println!("  Expected quote price: unavailable"),
+                }
+                println!("  Actual fill price: {:.10} SOL/token", effective_price);
+                match expected_quote_price.and_then(|p| manual_sell_drift_pct(p, effective_price)) {
+                    Some(d) => println!("  Quote-to-fill drift: {:+.4}% (positive = worse)", d),
+                    None => println!("  Quote-to-fill drift: unavailable"),
+                }
                 println!(
                     "Realized P&L unavailable: token was not tracked with a canonical cost basis."
                 );
@@ -9127,10 +9467,14 @@ mod tests {
         let mint = Pubkey::new_unique();
         let resolution =
             crate::wallet::OwnedHolderResolution::Single(wts(wallet, mint, 500));
-        assert_eq!(
-            manual_untracked_resolution(&resolution),
-            ManualUntrackedResolution::Single(wallet)
-        );
+        match manual_untracked_resolution(&resolution) {
+            ManualUntrackedResolution::Single(state) => {
+                assert_eq!(state.wallet, wallet);
+                assert_eq!(state.raw_amount, 500);
+                assert_eq!(state.decimals, Some(6));
+            }
+            other => panic!("expected Single, got {:?}", other),
+        }
     }
 
     /// H9: an untracked token held in multiple controlled wallets is ambiguous
@@ -9759,5 +10103,137 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- MPT-001 Agent I5: manual-sell quote/route-truth pure tests -----------
+
+    fn manual_test_sell_quote(venue: MarketVenue) -> crate::market::ExecutableQuote {
+        crate::market::ExecutableQuote {
+            mint: Pubkey::new_unique(),
+            side: crate::market::MarketSide::Sell,
+            venue,
+            quote_asset: crate::market::QuoteAsset::Sol,
+            base_decimals: 6,
+            quote_decimals: 9,
+            base_amount_raw: 1_234_567,
+            quote_amount_raw: 40_000_000,
+            expected_price_sol_per_token: Some(0.000_032),
+            protocol_fee_bps: 100,
+            creator_fee_bps: 0,
+            lp_fee_bps: 0,
+            slot: 77,
+            quoted_at: chrono::Utc::now(),
+        }
+    }
+
+    fn manual_unsupported_sell_quote() -> crate::market::ExecutableQuote {
+        crate::market::ExecutableQuote {
+            quote_asset: crate::market::QuoteAsset::Unsupported(Pubkey::new_unique()),
+            expected_price_sol_per_token: None,
+            ..manual_test_sell_quote(MarketVenue::PumpSwapCanonical)
+        }
+    }
+
+    #[test]
+    fn test_manual_decimal_ui_amount_exact_conversion() {
+        // I5(1): a numeric UI amount converts to raw EXACTLY via token decimals.
+        assert_eq!(decimal_token_amount_to_raw("1.234567", 6).unwrap(), 1_234_567);
+        assert_eq!(decimal_token_amount_to_raw("0.5", 6).unwrap(), 500_000);
+        assert_eq!(decimal_token_amount_to_raw("2", 6).unwrap(), 2_000_000);
+        assert_eq!(decimal_token_amount_to_raw(".5", 6).unwrap(), 500_000);
+        // Trailing-zero excess beyond decimals is accepted (all-zero excess).
+        assert_eq!(decimal_token_amount_to_raw("1.2300", 6).unwrap(), 1_230_000);
+    }
+
+    #[test]
+    fn test_manual_rejects_precision_beyond_decimals() {
+        // I5(2): more fractional digits than decimals with a NONZERO excess digit
+        // is rejected (would silently truncate real precision).
+        assert!(decimal_token_amount_to_raw("1.2345678", 6).is_err());
+        assert!(decimal_token_amount_to_raw("0.0000001", 6).is_err());
+    }
+
+    #[test]
+    fn test_manual_rejects_scientific_notation() {
+        // I5(3): scientific notation is never accepted for a token amount.
+        assert!(decimal_token_amount_to_raw("1e6", 6).is_err());
+        assert!(decimal_token_amount_to_raw("1E6", 6).is_err());
+        assert!(decimal_token_amount_to_raw("1.5e3", 6).is_err());
+        // Signed / malformed inputs also reject.
+        assert!(decimal_token_amount_to_raw("-1.0", 6).is_err());
+        assert!(decimal_token_amount_to_raw("", 6).is_err());
+        assert!(decimal_token_amount_to_raw("1.2.3", 6).is_err());
+    }
+
+    #[test]
+    fn test_manual_percentage_raw_derivation() {
+        // I5(4): a percentage resolves to an EXACT raw proportion of the position.
+        assert_eq!(percent_of_raw(1_000_000, "100").unwrap(), 1_000_000);
+        assert_eq!(percent_of_raw(1_000_000, "50").unwrap(), 500_000);
+        assert_eq!(percent_of_raw(1_000_000, "25").unwrap(), 250_000);
+        assert_eq!(percent_of_raw(1_234_567, "10").unwrap(), 123_456); // floored
+        // Zero-resulting proportion refuses (nothing to sell).
+        assert!(percent_of_raw(1, "1").is_err());
+    }
+
+    #[test]
+    fn test_manual_quote_precedes_submit_decision() {
+        // I5(5): the submit decision REQUIRES Some(quote); absence => Refuse. This
+        // encodes that a fresh quote must be obtained before any submit choice.
+        assert_eq!(manual_sell_decision(None), ManualSellDecision::Refuse);
+        let q = manual_test_sell_quote(MarketVenue::PumpBondingCurve);
+        assert!(matches!(
+            manual_sell_decision(Some(&q)),
+            ManualSellDecision::Submit { .. }
+        ));
+    }
+
+    #[test]
+    fn test_manual_venue_pin() {
+        // I5(6): the submitted pool is pinned to the quoted venue (never Auto).
+        let pump = manual_test_sell_quote(MarketVenue::PumpBondingCurve);
+        assert_eq!(
+            manual_sell_decision(Some(&pump)),
+            ManualSellDecision::Submit {
+                pool: PoolType::Pump
+            }
+        );
+        let amm = manual_test_sell_quote(MarketVenue::PumpSwapCanonical);
+        assert_eq!(
+            manual_sell_decision(Some(&amm)),
+            ManualSellDecision::Submit {
+                pool: PoolType::PumpAmm
+            }
+        );
+        for v in [MarketVenue::PumpBondingCurve, MarketVenue::PumpSwapCanonical] {
+            let q = manual_test_sell_quote(v);
+            assert_ne!(
+                manual_sell_decision(Some(&q)),
+                ManualSellDecision::Submit {
+                    pool: PoolType::Auto
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_manual_unsupported_quote_mint_refuses() {
+        // I5(7): a non-SOL (unsupported) quote mint refuses the normal manual sell.
+        let q = manual_unsupported_sell_quote();
+        assert_eq!(manual_sell_decision(Some(&q)), ManualSellDecision::Refuse);
+    }
+
+    #[test]
+    fn test_manual_sell_drift_guards_expected() {
+        // I4: drift only computed for finite positive expected; never fabricated.
+        assert_eq!(manual_sell_drift_pct(0.0, 1.0), None);
+        assert_eq!(manual_sell_drift_pct(f64::NAN, 1.0), None);
+        assert_eq!(manual_sell_drift_pct(1.0, f64::NAN), None);
+        // Sell: fill worse than quote => positive drift.
+        let d = manual_sell_drift_pct(100.0, 97.0).unwrap();
+        assert!((d - 3.0).abs() < 1e-9);
+        // Price improvement => negative drift.
+        let d2 = manual_sell_drift_pct(100.0, 101.0).unwrap();
+        assert!((d2 + 1.0).abs() < 1e-9);
     }
 }
