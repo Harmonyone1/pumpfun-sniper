@@ -4715,13 +4715,25 @@ pub async fn health(config: &Config) -> Result<()> {
     }
 
     // Check PumpPortal API (if using for trading)
+    //
+    // BLOCKER B: report the Data-API capability and the trade-EXECUTION route
+    // SEPARATELY, mirroring start()'s real routing
+    // (`use_local_api = api_key.is_empty() || force_local_api`). API-key presence
+    // authenticates the Data API but does NOT by itself imply Lightning execution:
+    // a configured key with `force_local_api=true` still executes LOCAL. This block
+    // is report-only and does not affect start()'s actual route/wallet selection.
     if config.pumpportal.use_for_trading {
+        let api_key_present = !config.pumpportal.api_key.trim().is_empty();
+        let force_local_api = config.pumpportal.force_local_api;
+        let mode = health_execution_mode(api_key_present, force_local_api);
+
         print!("PumpPortal Trading API... ");
-        if config.pumpportal.api_key.is_empty() {
-            println!("LOCAL MODE (no API key)");
-        } else {
-            println!("LIGHTNING MODE (API key configured)");
-        }
+        println!("{}", health_execution_line(mode, force_local_api));
+        // Separate Data-capability line: independent of the execution route.
+        println!(
+            "PumpPortal Data API... {}",
+            health_data_capability_line(api_key_present)
+        );
     }
 
     // Check keypair
@@ -4849,6 +4861,74 @@ fn health_lock_policy<T, E>(inspect_result: &std::result::Result<Option<T>, E>) 
         Ok(None) => HealthLockPolicy::AllowSocket,
         Ok(Some(_)) => HealthLockPolicy::SkipActive,
         Err(_) => HealthLockPolicy::SkipUnhealthy,
+    }
+}
+
+/// BLOCKER B: the trade-EXECUTION route reported by `health()`.
+///
+/// This is a REPORT-ONLY mirror of the route `start()` actually selects. It must
+/// never influence `start()`'s real routing/wallet selection — it only exists so
+/// the health report tells the operator the truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthExecutionMode {
+    /// LOCAL transaction API + local signing wallet (0.5% provider fee).
+    Local,
+    /// PumpPortal Lightning transaction API (1% provider fee).
+    Lightning,
+}
+
+/// BLOCKER B pure helper: compute the trade-execution route EXACTLY as `start()`
+/// does. `start()` uses:
+///
+/// ```text
+/// let use_local_api = api_key.is_empty() || force_local_api;
+/// ```
+///
+/// so the execution mode is the boolean COMPLEMENT of `use_local_api`:
+///   - api_key absent                        => use_local_api=true  => Local
+///   - api_key present && force_local_api     => use_local_api=true  => Local
+///   - api_key present && !force_local_api    => use_local_api=false => Lightning
+///
+/// Crucially, api-key PRESENCE alone never implies Lightning: after RET-001 the
+/// key authenticates the Data API independently of the trade route, so a key with
+/// `force_local_api=true` still executes LOCAL. This is a pure function of two
+/// booleans and never touches or derives the secret value.
+fn health_execution_mode(api_key_present: bool, force_local_api: bool) -> HealthExecutionMode {
+    // Mirror of start()'s `use_local_api = api_key.is_empty() || force_local_api`.
+    let use_local_api = !api_key_present || force_local_api;
+    if use_local_api {
+        HealthExecutionMode::Local
+    } else {
+        HealthExecutionMode::Lightning
+    }
+}
+
+/// BLOCKER B pure formatter for the health trade-EXECUTION line. Driven only by
+/// the computed `HealthExecutionMode` (never the secret). The `force_local_api`
+/// flag is surfaced only to explain why a configured key is still routing Local.
+fn health_execution_line(mode: HealthExecutionMode, force_local_api: bool) -> &'static str {
+    match mode {
+        HealthExecutionMode::Local => {
+            if force_local_api {
+                "Execution: LOCAL MODE (force_local_api; Data API credential configured, Local Transaction API 0.5%)"
+            } else {
+                "Execution: LOCAL MODE (no API key; Local Transaction API 0.5%)"
+            }
+        }
+        HealthExecutionMode::Lightning => {
+            "Execution: LIGHTNING MODE (Lightning Transaction API 1%)"
+        }
+    }
+}
+
+/// BLOCKER B pure formatter for the SEPARATE Data-capability line reported by
+/// `health()`. Independent of the execution route: it reflects only whether an
+/// api-key is configured to authenticate the Data API. Never contains the secret.
+fn health_data_capability_line(api_key_present: bool) -> &'static str {
+    if api_key_present {
+        "Data: authenticated/metered token+account trade streams available"
+    } else {
+        "Data: new-token/migration only; trade subscriptions unavailable"
     }
 }
 
@@ -11503,6 +11583,97 @@ mod tests {
             absent,
             "new-token/migration only; trade subscriptions unavailable"
         );
+    }
+
+    // === BLOCKER B — health execution-route vs Data-capability truth ==========
+
+    // (B1) No api-key => LOCAL execution (start(): use_local_api = api_key.is_empty()).
+    #[test]
+    fn test_health_execution_mode_no_key_is_local() {
+        assert_eq!(
+            health_execution_mode(false, false),
+            HealthExecutionMode::Local
+        );
+        // force_local_api is irrelevant when there is no key.
+        assert_eq!(
+            health_execution_mode(false, true),
+            HealthExecutionMode::Local
+        );
+    }
+
+    // (B2) api-key present + force_local_api=true => LOCAL execution. This is the
+    //      exact bug BLOCKER B fixes: a key used only for the Data API while the
+    //      trade route is pinned Local.
+    #[test]
+    fn test_health_execution_mode_key_plus_force_local_is_local() {
+        assert_eq!(
+            health_execution_mode(true, true),
+            HealthExecutionMode::Local
+        );
+    }
+
+    // (B3) api-key present + force_local_api=false => LIGHTNING execution.
+    #[test]
+    fn test_health_execution_mode_key_without_force_is_lightning() {
+        assert_eq!(
+            health_execution_mode(true, false),
+            HealthExecutionMode::Lightning
+        );
+    }
+
+    // (B4) a configured key with force_local_api=true yields LOCAL execution AND a
+    //      Data-available capability line: the Data credential is independent of the
+    //      execution route, and key presence never by itself implies Lightning.
+    #[test]
+    fn test_data_capability_key_does_not_imply_lightning_execution() {
+        let api_key_present = true;
+        let force_local_api = true;
+
+        // Execution route is LOCAL despite the key being present.
+        assert_eq!(
+            health_execution_mode(api_key_present, force_local_api),
+            HealthExecutionMode::Local
+        );
+
+        // Data capability is AVAILABLE because the key authenticates the Data API,
+        // independent of the (Local) execution route.
+        let data_line = health_data_capability_line(api_key_present);
+        assert_eq!(
+            data_line,
+            "Data: authenticated/metered token+account trade streams available"
+        );
+
+        // Sanity: the Local execution line must NOT claim Lightning.
+        let exec_line = health_execution_line(
+            health_execution_mode(api_key_present, force_local_api),
+            force_local_api,
+        );
+        assert!(exec_line.contains("LOCAL MODE"));
+        assert!(!exec_line.contains("LIGHTNING"));
+    }
+
+    // (B5) the formatted health lines never contain the api-key. Formatting is a
+    //      pure function of booleans + the computed mode, so a sample secret can
+    //      never leak into either the execution or the Data line.
+    #[test]
+    fn test_health_execution_mode_text_contains_no_api_key() {
+        let sample_key = "super-secret-sample-api-key-XYZ-9876543210";
+        let api_key_present = true; // a key IS set in this scenario
+
+        for force_local_api in [true, false] {
+            let mode = health_execution_mode(api_key_present, force_local_api);
+            let exec_line = health_execution_line(mode, force_local_api);
+            let data_line = health_data_capability_line(api_key_present);
+
+            assert!(
+                !exec_line.contains(sample_key),
+                "execution line leaked the api-key"
+            );
+            assert!(
+                !data_line.contains(sample_key),
+                "data line leaked the api-key"
+            );
+        }
     }
 
     // (6b) masked config display (Agent B hardened) exposes neither the
