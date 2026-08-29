@@ -670,9 +670,9 @@ mod tests {
             "https://example.com/meta.json".to_string(),
             "Creator123".to_string(),
             "BondingCurve123".to_string(),
-            1000,
-            1_000_000_000,
-            100_000_000,
+            1000.0,
+            1_000_000_000.0,
+            100_000_000.0,
             1.0,
         );
 
@@ -697,9 +697,9 @@ mod tests {
             "https://example.com/meta.json".to_string(),
             "Creator123".to_string(),
             "BondingCurve123".to_string(),
-            1000,
-            1_000_000_000,
-            100_000_000,
+            1000.0,
+            1_000_000_000.0,
+            100_000_000.0,
             1.0,
         );
 
@@ -721,9 +721,9 @@ mod tests {
             "uri".to_string(),
             "creator".to_string(),
             "curve".to_string(),
-            0,
-            0,
-            0,
+            0.0,
+            0.0,
+            0.0,
             0.0,
         );
 

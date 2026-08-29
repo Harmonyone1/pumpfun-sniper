@@ -295,9 +295,9 @@ mod tests {
             "https://example.com".to_string(),
             creator.to_string(),
             "BondingCurve".to_string(),
-            1000,
-            1_000_000_000,
-            100_000_000,
+            1000.0,
+            1_000_000_000.0,
+            100_000_000.0,
             1.0,
         )
     }
