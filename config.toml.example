@@ -28,22 +28,35 @@ reconnect_delay_ms = 1000
 max_reconnect_attempts = 10
 
 [pumpportal]
-# PumpPortal WebSocket for token detection (alternative to ShredStream)
+# PumpPortal WebSocket for token detection (alternative to ShredStream).
+# Provider contract:
+#   - new token + migration streams: FREE (no key required)
+#   - token/account trade streams:  AUTHENTICATED + metered (key required)
 enabled = true
+# BASE URL only. NEVER put the api-key in this URL — the key is appended
+# internally from api_key below and is never logged. A ws_url containing an
+# api-key/credential query is rejected at config validation.
 ws_url = "wss://pumpportal.fun/api/data"
 reconnect_delay_ms = 1000
 max_reconnect_attempts = 10
 ping_interval_secs = 30
-# API key for Lightning Trading API (get from https://pumpportal.fun)
+# API key (get from https://pumpportal.fun).
 # SECRET — set locally in config.toml or via SNIPER__PUMPPORTAL__API_KEY.
-# Leave empty to use Local API when configuration selects it.
+# The SAME key authenticates the Data API even when trading uses the Local API.
+# Token/account trade data REQUIRES this key; new-token/migration data does not.
+# NOTE: force_local_api below only affects TRADING execution — it does NOT let
+# the Data stream omit this key. Without a key, live trade subscriptions
+# (kill-switch / account tracking) are unavailable and new entries are halted.
+# Leave BLANK here; never commit a real key.
 api_key = ""
 # Public wallet associated with the Lightning credential, when Lightning is used.
 lightning_wallet = ""
 # Use PumpPortal for trading (true) or Jito bundles (false)
 use_for_trading = true
 # CRITICAL: Force Local API even with API key set (0.5% fee vs 1% Lightning)
-# This saves 0.5% per trade = 1% round-trip savings
+# This saves 0.5% per trade = 1% round-trip savings.
+# This affects TRADING execution ONLY. It does NOT let the Data stream omit the
+# api_key: token/account trade subscriptions still require the key above.
 force_local_api = true
 
 [backpressure]
