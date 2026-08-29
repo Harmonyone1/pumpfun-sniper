@@ -297,6 +297,65 @@ fn manual_sell_decision(quote: Option<&crate::market::ExecutableQuote>) -> Manua
     }
 }
 
+/// BLOCKER B — validate the FINAL exact-size manual-sell quote fetched
+/// immediately before live submission (the second of the two-quote semantics).
+///
+/// The PREVIEW quote shown to the human is display-only and may be arbitrarily
+/// stale by the time confirmation returns. This pure helper validates the FRESH
+/// final quote against the exact intended sale and derives the pinned pool from
+/// the FINAL quote venue (never the preview, never `Auto`).
+///
+/// Checks (all must hold, else `Err(Error::MarketData(..))` => refuse the sell):
+/// - `quote.mint == expected_mint`
+/// - `quote.side == MarketSide::Sell`
+/// - `quote.base_amount_raw == expected_raw` (exact size)
+/// - `quote.is_sol_pair()` (supported SOL quote asset)
+/// - `expected_price_sol_per_token` is `Some(finite > 0)`
+///
+/// On success returns the pool pinned to the FINAL venue: a token that graduated
+/// during the human delay (preview Pump -> final PumpSwap) yields
+/// `PoolType::PumpAmm` here, without a second confirmation.
+fn validate_final_manual_sell_quote(
+    expected_mint: &Pubkey,
+    expected_raw: u64,
+    quote: &crate::market::ExecutableQuote,
+) -> crate::error::Result<PoolType> {
+    if quote.mint != *expected_mint {
+        return Err(crate::error::Error::MarketData(format!(
+            "final manual-sell quote mint {} does not match intended mint {}; refusing sell",
+            quote.mint, expected_mint
+        )));
+    }
+    if quote.side != crate::market::MarketSide::Sell {
+        return Err(crate::error::Error::MarketData(format!(
+            "final manual-sell quote side is {:?}, expected Sell; refusing sell",
+            quote.side
+        )));
+    }
+    if quote.base_amount_raw != expected_raw {
+        return Err(crate::error::Error::MarketData(format!(
+            "final manual-sell quote base size {} raw does not match intended size {} raw; refusing sell",
+            quote.base_amount_raw, expected_raw
+        )));
+    }
+    if !quote.is_sol_pair() {
+        return Err(crate::error::Error::MarketData(format!(
+            "final manual-sell quote for {} is not a supported SOL pair (venue {:?}); refusing sell",
+            expected_mint, quote.venue
+        )));
+    }
+    match quote.expected_price_sol_per_token {
+        Some(p) if p.is_finite() && p > 0.0 => {}
+        other => {
+            return Err(crate::error::Error::MarketData(format!(
+                "final manual-sell quote has no finite positive expected price ({:?}); refusing sell",
+                other
+            )));
+        }
+    }
+    Ok(pumpportal_pool_for_venue(quote.venue))
+}
+
 /// Quote-to-fill execution drift for a SELL, as a percentage (MPT-001 Agent I4).
 /// Positive means the fill was WORSE than the quote: `(expected - actual)/expected
 /// * 100`. Returns `None` when `expected` is not finite/positive (never fabricated)
@@ -3668,12 +3727,16 @@ pub async fn sell(
     // SAME size that is quoted, route-pinned and submitted (I2/I3).
     let submit_amount = raw_token_amount_to_decimal_string(resolved_raw, token_decimals);
 
-    // === I2: fetch a fresh, exact-size executable sell quote BEFORE the prompt ===
+    // === I2 / BLOCKER B(2): fetch a PREVIEW exact-size sell quote for DISPLAY ONLY ===
     // Build a PumpMarketOracle inline from the manual RPC client (Agent G pattern).
-    // No DexScreener. A normal manual sell requires a successful same-venue SOL
-    // quote; --force never bypasses this (it only skips the human prompt in H4).
+    // No DexScreener. This first quote is a PREVIEW shown to the human; it is NOT
+    // used to pin the venue or submit. By the time the human confirms it may be
+    // arbitrarily stale, so a second FINAL quote is fetched below immediately
+    // before live submit (two-quote semantics). A normal manual sell still
+    // requires a successful same-venue SOL quote to even display; --force never
+    // bypasses either quote (it only skips the human prompt in H4).
     let market_oracle = Arc::new(PumpMarketOracle::new(rpc_client.clone()));
-    let sell_quote = match market_oracle
+    let preview_quote = match market_oracle
         .quote_sell_raw(&token_pubkey, resolved_raw)
         .await
     {
@@ -3691,17 +3754,18 @@ pub async fn sell(
         }
     };
 
-    // I3: a normal manual sell only proceeds on a same-venue SOL quote; the pinned
-    // pool is decided purely from the quote venue (never Auto).
-    let manual_decision = manual_sell_decision(Some(&sell_quote));
-    let sell_pool = match manual_decision {
+    // I3: the PREVIEW must itself be a same-venue SOL quote for the sell to be
+    // admissible at all; the pool shown here is preview-only and is re-derived
+    // from the FINAL quote before submission (never Auto, never the preview).
+    let preview_decision = manual_sell_decision(Some(&preview_quote));
+    let preview_pool = match preview_decision {
         ManualSellDecision::Submit { pool } => pool,
         ManualSellDecision::Refuse => {
             anyhow::bail!(
                 "Market quote for {} is not a supported SOL pair (venue {:?}); refusing manual sell \
                  (unsupported quote mint). Kill-switch/emergency is a separate path.",
                 token,
-                sell_quote.venue
+                preview_quote.venue
             );
         }
     };
@@ -3712,25 +3776,24 @@ pub async fn sell(
         Ok(snap) => snap.mark_price_sol_per_token,
         Err(_) => None,
     };
-    println!("\n=== EXECUTABLE SELL QUOTE ===");
-    println!("  Venue: {:?} (pool {:?})", sell_quote.venue, sell_pool);
+    println!("\n=== EXECUTABLE SELL QUOTE (PREVIEW) ===");
+    println!("  Venue: {:?} (pool {:?})", preview_quote.venue, preview_pool);
     println!("  Exact raw amount: {}", resolved_raw);
     println!("  Exact UI amount: {}", submit_amount);
     match fresh_mark {
         Some(m) => println!("  Fresh mark: {:.12} SOL/token", m),
         None => println!("  Fresh mark: unavailable"),
     }
-    match sell_quote.expected_sol() {
+    match preview_quote.expected_sol() {
         Some(sol) => println!("  Expected protocol net SOL out: {:.9} SOL", sol),
         None => println!("  Expected protocol net SOL out: unavailable"),
     }
-    match sell_quote.expected_price_sol_per_token {
+    match preview_quote.expected_price_sol_per_token {
         Some(p) => println!("  Expected executable price: {:.12} SOL/token", p),
         None => println!("  Expected executable price: unavailable"),
     }
-    println!("  Quote slot: {}", sell_quote.slot);
-    // Expected quote price retained for the post-fill drift report (I4).
-    let expected_quote_price = sell_quote.expected_price_sol_per_token;
+    println!("  Quote slot: {}", preview_quote.slot);
+    println!("  (preview only — a fresh quote is taken immediately before submit)");
 
     // === H4: preserve the manual confirmation prompt + dry-run no-send ===
     if config.safety.require_sell_confirmation && !force {
@@ -3748,14 +3811,75 @@ pub async fn sell(
     }
 
     if dry_run {
+        // BLOCKER B(5): DRY-RUN returns HERE, after confirmation and before any
+        // FINAL quote. No second quote is fetched and nothing is submitted. The
+        // pool reported is the PREVIEW pool (display only) — a dry-run never pins
+        // a live venue.
         info!(
-            "DRY-RUN: Would sell {} (raw {}) of {} from {} via pool {:?}",
-            submit_amount, resolved_raw, token, execution_wallet, sell_pool
+            "DRY-RUN: Would sell {} (raw {}) of {} from {} via preview pool {:?} \
+             (a fresh FINAL quote would be taken before a LIVE submit)",
+            submit_amount, resolved_raw, token, execution_wallet, preview_pool
         );
         return Ok(());
     }
 
-    // === H3/I3: exact route submission, venue-pinned to the quoted venue ===
+    // === BLOCKER B(6)/(8)/(9): LIVE ONLY — FINAL exact-size quote immediately before submit ===
+    // The human has confirmed and this is a LIVE sell. Re-quote the EXACT same raw
+    // size RIGHT NOW so the venue/price used for submission is fresh, not the
+    // possibly-stale preview. --force never skips this. There is NO sleep,
+    // DexScreener, extra snapshot, or unrelated network call between this final
+    // quote and the submit below.
+    let final_quote = match market_oracle
+        .quote_sell_raw(&token_pubkey, resolved_raw)
+        .await
+    {
+        Ok(q) => q,
+        Err(e) => {
+            // Final quote unavailable => refuse the sell (no submit). Nothing was
+            // reserved or submitted; the tracked position is untouched.
+            anyhow::bail!(
+                "No FINAL executable market quote for {} at exact size {} raw ({}) immediately before \
+                 submit: refusing manual sell (fail closed). {}",
+                token,
+                resolved_raw,
+                submit_amount,
+                e
+            );
+        }
+    };
+
+    // BLOCKER B(8): validate the FINAL quote (mint/side/exact raw/SOL pair/finite
+    // positive price) and derive the pinned pool from the FINAL venue. On any
+    // failure we refuse (no submit); no reservation was taken so none is released.
+    let sell_pool = match validate_final_manual_sell_quote(&token_pubkey, resolved_raw, &final_quote)
+    {
+        Ok(pool) => pool,
+        Err(e) => {
+            anyhow::bail!(
+                "FINAL manual-sell quote validation failed for {}: {}; refusing manual sell (no submit).",
+                token,
+                e
+            );
+        }
+    };
+
+    // BLOCKER B: if the token graduated during the human delay the FINAL venue may
+    // differ from the preview (e.g. Pump -> PumpSwap => PoolType::PumpAmm). We use
+    // the FINAL venue and LOG the change; we do NOT re-prompt (a second prompt
+    // would let this fresh quote go stale again).
+    if final_quote.venue != preview_quote.venue {
+        info!(
+            "Manual sell: venue changed between preview and final quote for {} \
+             (preview {:?}/{:?} -> final {:?}/{:?}); submitting on FINAL venue without re-confirmation",
+            token, preview_quote.venue, preview_pool, final_quote.venue, sell_pool
+        );
+    }
+
+    // BLOCKER B(11): quote-to-fill drift references the FINAL quote's expected
+    // price, never the preview's.
+    let expected_quote_price = final_quote.expected_price_sol_per_token;
+
+    // === H3/I3: exact route submission, venue-pinned to the FINAL quoted venue ===
     // Submit the EXACT decimal amount derived from the resolved raw size (I3), and
     // pin the pool to the quoted venue (never Auto for a normal manual sell). Quote
     // input, route and submitted amount are therefore the same intended size.
@@ -10235,5 +10359,244 @@ mod tests {
         // Price improvement => negative drift.
         let d2 = manual_sell_drift_pct(100.0, 101.0).unwrap();
         assert!((d2 + 1.0).abs() < 1e-9);
+    }
+
+    // --- BLOCKER B: FINAL manual-sell quote validation (two-quote semantics) ---
+
+    /// Fully-specified FINAL-quote fixture (struct literal) so each test can pin
+    /// mint / raw size / side / venue / expected price exactly.
+    fn final_sell_quote(
+        mint: Pubkey,
+        base_amount_raw: u64,
+        side: crate::market::MarketSide,
+        venue: MarketVenue,
+        quote_asset: crate::market::QuoteAsset,
+        expected_price_sol_per_token: Option<f64>,
+    ) -> crate::market::ExecutableQuote {
+        crate::market::ExecutableQuote {
+            mint,
+            side,
+            venue,
+            quote_asset,
+            base_decimals: 6,
+            quote_decimals: 9,
+            base_amount_raw,
+            quote_amount_raw: 40_000_000,
+            expected_price_sol_per_token,
+            protocol_fee_bps: 100,
+            creator_fee_bps: 0,
+            lp_fee_bps: 0,
+            slot: 12_345,
+            quoted_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_final_quote_requires_sell_side() {
+        // B(8): a Buy-side final quote is rejected (must be Sell).
+        let mint = Pubkey::new_unique();
+        let q = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Buy,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(0.001),
+        );
+        assert!(validate_final_manual_sell_quote(&mint, 1_000, &q).is_err());
+    }
+
+    #[test]
+    fn test_final_quote_requires_exact_mint() {
+        // B(8): a final quote for a DIFFERENT mint is rejected.
+        let intended = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let q = final_sell_quote(
+            other,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(0.001),
+        );
+        assert!(validate_final_manual_sell_quote(&intended, 1_000, &q).is_err());
+        // Same mint (control) passes.
+        let ok = final_sell_quote(
+            intended,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(0.001),
+        );
+        assert!(validate_final_manual_sell_quote(&intended, 1_000, &ok).is_ok());
+    }
+
+    #[test]
+    fn test_final_quote_requires_exact_raw_amount() {
+        // B(8): a final quote sized differently than the resolved raw is rejected.
+        let mint = Pubkey::new_unique();
+        let q = final_sell_quote(
+            mint,
+            999,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(0.001),
+        );
+        assert!(validate_final_manual_sell_quote(&mint, 1_000, &q).is_err());
+    }
+
+    #[test]
+    fn test_final_quote_requires_sol_pair() {
+        // B(8): a non-SOL (unsupported) quote asset is rejected.
+        let mint = Pubkey::new_unique();
+        let q = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpSwapCanonical,
+            crate::market::QuoteAsset::Unsupported(Pubkey::new_unique()),
+            Some(0.001),
+        );
+        assert!(validate_final_manual_sell_quote(&mint, 1_000, &q).is_err());
+    }
+
+    #[test]
+    fn test_final_quote_requires_finite_positive_price() {
+        // B(8): expected price must be Some(finite > 0). None / 0 / NaN / Inf all reject.
+        let mint = Pubkey::new_unique();
+        for price in [None, Some(0.0), Some(-1.0), Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY)] {
+            let q = final_sell_quote(
+                mint,
+                1_000,
+                crate::market::MarketSide::Sell,
+                MarketVenue::PumpBondingCurve,
+                crate::market::QuoteAsset::Sol,
+                price,
+            );
+            assert!(
+                validate_final_manual_sell_quote(&mint, 1_000, &q).is_err(),
+                "price {:?} must be rejected",
+                price
+            );
+        }
+        // A finite positive price passes.
+        let ok = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(0.000_001),
+        );
+        assert!(validate_final_manual_sell_quote(&mint, 1_000, &ok).is_ok());
+    }
+
+    #[test]
+    fn test_final_quote_pump_venue_pins_pump_pool() {
+        // B(9): a valid Pump final quote pins PoolType::Pump (never Auto).
+        let mint = Pubkey::new_unique();
+        let q = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(0.001),
+        );
+        let pool = validate_final_manual_sell_quote(&mint, 1_000, &q).unwrap();
+        assert_eq!(pool, PoolType::Pump);
+        assert_ne!(pool, PoolType::Auto);
+    }
+
+    #[test]
+    fn test_final_quote_pumpswap_venue_pins_pumpamm_pool() {
+        // B(9): a valid PumpSwap final quote pins PoolType::PumpAmm (never Auto).
+        let mint = Pubkey::new_unique();
+        let q = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpSwapCanonical,
+            crate::market::QuoteAsset::Sol,
+            Some(0.001),
+        );
+        let pool = validate_final_manual_sell_quote(&mint, 1_000, &q).unwrap();
+        assert_eq!(pool, PoolType::PumpAmm);
+        assert_ne!(pool, PoolType::Auto);
+    }
+
+    #[test]
+    fn test_preview_pump_final_pumpswap_submits_pumpamm() {
+        // B: token graduated during the human delay. Preview was Pump but the
+        // FINAL quote is PumpSwap; the derived pool MUST come from the FINAL quote
+        // (=> PumpAmm), regardless of the preview venue, with no re-confirmation.
+        let mint = Pubkey::new_unique();
+        // Preview venue is Pump (display-only) — asserted here for intent clarity.
+        let preview = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(0.001),
+        );
+        assert_eq!(pumpportal_pool_for_venue(preview.venue), PoolType::Pump);
+        // FINAL quote is PumpSwap; the pool derived from the FINAL quote is PumpAmm.
+        let final_q = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpSwapCanonical,
+            crate::market::QuoteAsset::Sol,
+            Some(0.002),
+        );
+        let pool = validate_final_manual_sell_quote(&mint, 1_000, &final_q).unwrap();
+        assert_eq!(pool, PoolType::PumpAmm);
+        // The derived pool ignores the preview venue entirely.
+        assert_ne!(pool, pumpportal_pool_for_venue(preview.venue));
+    }
+
+    #[test]
+    fn test_drift_reference_uses_final_not_preview_quote() {
+        // B(11): the quote-to-fill drift reference is the FINAL quote's expected
+        // price, never the preview's. Given preview.expected != final.expected, the
+        // drift is computed from final.expected.
+        let mint = Pubkey::new_unique();
+        let preview = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(200.0), // preview price (stale)
+        );
+        let final_q = final_sell_quote(
+            mint,
+            1_000,
+            crate::market::MarketSide::Sell,
+            MarketVenue::PumpBondingCurve,
+            crate::market::QuoteAsset::Sol,
+            Some(100.0), // fresh final price actually used for drift
+        );
+        // Mirror the handler: expected_quote_price is taken from the FINAL quote.
+        let expected_quote_price = final_q.expected_price_sol_per_token;
+        assert_ne!(
+            expected_quote_price,
+            preview.expected_price_sol_per_token
+        );
+        let actual_fill_price = 97.0;
+        let drift = expected_quote_price
+            .and_then(|p| manual_sell_drift_pct(p, actual_fill_price))
+            .unwrap();
+        // From FINAL (100 -> 97) drift is +3%. From the preview (200) it would be
+        // +51.5%; assert we got the FINAL-derived value.
+        assert!((drift - 3.0).abs() < 1e-9);
+        let preview_drift = preview
+            .expected_price_sol_per_token
+            .and_then(|p| manual_sell_drift_pct(p, actual_fill_price))
+            .unwrap();
+        assert!((drift - preview_drift).abs() > 1.0);
     }
 }

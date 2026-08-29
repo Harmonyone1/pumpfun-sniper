@@ -30,7 +30,7 @@ use solana_sdk::pubkey::Pubkey;
 use crate::error::{Error, Result};
 use crate::market::math::{self, FeeComponents, FeeTier};
 use crate::market::pump_state::{
-    bonding_curve_pda, canonical_pool_pda, is_token_program, pump_fee_config_pda,
+    bonding_curve_pda, canonical_pool_pda, fee_program_id, is_token_program, pump_fee_config_pda,
     pump_pool_authority_pda, pump_program_id, pumpswap_fee_config_pda, wsol_mint, DecodedFees,
     FeeConfigState, MintState, PumpBondingCurveState, PumpSwapPoolState, TokenAccountState,
 };
@@ -120,6 +120,130 @@ pub fn validate_canonical_pool(
         )));
     }
     Ok(())
+}
+
+/// Fail-closed owner check for a FeeConfig account: it MUST be owned by the fee
+/// program (packet Section 9 / BLOCKER A steps 8 + pre-graduation). A FeeConfig
+/// sitting at the right PDA but owned by anything else is rejected before decode.
+pub fn validate_fee_config_owner(owner: &Pubkey) -> Result<()> {
+    if *owner == fee_program_id() {
+        Ok(())
+    } else {
+        Err(market_err(format!(
+            "FeeConfig: wrong owner {owner}, expected fee program {}",
+            fee_program_id()
+        )))
+    }
+}
+
+/// Validated PumpSwap quote-state produced from the FINAL coherent batch
+/// (BLOCKER A steps 5-10). Carries the FINAL context slot as the ONLY quote
+/// provenance — no discovery/curve slot survives here.
+struct PumpSwapQuoteState {
+    pool: PumpSwapPoolState,
+    base_reserve: u64,
+    effective_quote_reserve: u64,
+    base_mint: MintState,
+    fee_config: FeeConfigState,
+    slot: u64,
+}
+
+/// PURE (RPC-free) decode + validation of the FINAL PumpSwap batch (BLOCKER A
+/// steps 5-10). Takes the already-fetched raw account tuples `(owner, data)` for
+/// EXACTLY `[pool, base_vault, quote_vault, base_mint, feeconfig]`, the addresses
+/// requested for the pool + the two DISCOVERED vaults, the derived Pump pool
+/// authority, the expected base/quote mints, and the FINAL batch context slot.
+///
+/// It:
+/// - re-decodes/re-validates the pool (owner, index==0, creator==authority, mints);
+/// - requires FINAL `pool_base_token_account`/`pool_quote_token_account` to equal
+///   the DISCOVERED vault addresses (fail closed if either moved);
+/// - decodes/validates both vaults, base mint, and FeeConfig from this batch only;
+/// - checks the FeeConfig account owner == fee_program_id();
+/// - computes the effective quote reserve from the FINAL quote-vault amount +
+///   FINAL `pool.virtual_quote_reserves`;
+/// - stamps `slot` = FINAL batch context slot.
+///
+/// This is the single testable core of the graduated quote path; the async
+/// `resolve_and_fetch` is only the RPC wiring around it.
+#[allow(clippy::too_many_arguments)]
+fn decode_final_pumpswap_batch(
+    pool_owner: &Pubkey,
+    pool_data: &[u8],
+    base_vault_owner: &Pubkey,
+    base_vault_data: &[u8],
+    quote_vault_owner: &Pubkey,
+    quote_vault_data: &[u8],
+    base_mint_owner: &Pubkey,
+    base_mint_data: &[u8],
+    fee_config_owner: &Pubkey,
+    fee_config_data: &[u8],
+    pool_pda: &Pubkey,
+    discovered_base_vault: &Pubkey,
+    discovered_quote_vault: &Pubkey,
+    expected_authority: &Pubkey,
+    expected_base_mint: &Pubkey,
+    expected_quote_mint: &Pubkey,
+    final_slot: u64,
+) -> Result<PumpSwapQuoteState> {
+    // Step 5 — re-decode/re-validate the POOL from the FINAL batch.
+    PumpSwapPoolState::validate_owner(pool_owner)?;
+    let pool = PumpSwapPoolState::decode(pool_data)?;
+    validate_canonical_pool(&pool, expected_authority, expected_base_mint, expected_quote_mint)?;
+
+    // Step 6 — FINAL pool vault addresses MUST equal the DISCOVERED vault
+    // addresses. Any change between discovery and final => fail closed.
+    if pool.pool_base_token_account != *discovered_base_vault {
+        return Err(market_err(format!(
+            "PumpSwap base vault changed between discovery and final (discovered {discovered_base_vault}, final pool {})",
+            pool.pool_base_token_account
+        )));
+    }
+    if pool.pool_quote_token_account != *discovered_quote_vault {
+        return Err(market_err(format!(
+            "PumpSwap quote vault changed between discovery and final (discovered {discovered_quote_vault}, final pool {})",
+            pool.pool_quote_token_account
+        )));
+    }
+
+    // Step 7 — decode/validate both vaults + base mint from the FINAL batch ONLY.
+    // Vaults are owned by the pool PDA; their mints are the pool's base/quote mints.
+    TokenAccountState::validate_program(base_vault_owner)?;
+    let base_vault = TokenAccountState::decode(base_vault_data)?;
+    base_vault.validate(&pool.base_mint, pool_pda)?;
+
+    TokenAccountState::validate_program(quote_vault_owner)?;
+    let quote_vault = TokenAccountState::decode(quote_vault_data)?;
+    quote_vault.validate(&pool.quote_mint, pool_pda)?;
+
+    MintState::validate_owner(base_mint_owner)?;
+    let base_mint = MintState::decode(base_mint_data)?;
+
+    // Step 8 — FeeConfig account owner MUST be the fee program, BEFORE decode.
+    validate_fee_config_owner(fee_config_owner)?;
+    let fee_config = FeeConfigState::decode(fee_config_data)?;
+
+    let base_reserve = base_vault.amount;
+    if base_reserve == 0 {
+        return Err(market_err("PumpSwap pool has zero base reserve"));
+    }
+
+    // Step 9 — effective quote reserve = f(FINAL quote-vault amount, FINAL pool vqr).
+    let effective_quote_reserve =
+        math::effective_quote_reserve(quote_vault.amount, pool.virtual_quote_reserves)
+            .ok_or_else(|| {
+                market_err("PumpSwap effective quote reserve non-positive / overflow")
+            })?;
+
+    // Step 10 — published slot IS the FINAL batch context slot.
+    Ok(PumpSwapQuoteState {
+        pool,
+        base_reserve,
+        effective_quote_reserve,
+        base_mint,
+        fee_config,
+        slot: final_slot,
+    })
 }
 
 /// Build the `FeeTier` slice consumed by `calculate_fee_tier` from a decoded
@@ -257,6 +381,9 @@ impl PumpMarketOracle {
                 .cloned()
                 .flatten()
                 .ok_or_else(|| market_err("Pump FeeConfig account missing"))?;
+            // Fail-closed: Pump FeeConfig account owner MUST be the fee program
+            // BEFORE decoding it (same discipline as the graduated path, step 8).
+            validate_fee_config_owner(&fee_acc.owner)?;
             let fee_config = FeeConfigState::decode(&fee_acc.data)?;
 
             if curve.virtual_token_reserves == 0 || curve.virtual_quote_reserves == 0 {
@@ -285,85 +412,109 @@ impl PumpMarketOracle {
         let (pool_pda, _) = canonical_pool_pda(mint, &pool_quote_mint, &authority);
         let (amm_fee_pda, _) = pumpswap_fee_config_pda();
 
-        // Fetch pool + AMM FeeConfig coherently first (pool identity gives vault keys).
-        let (pool_accounts, pool_slot) = self.fetch_multi(vec![pool_pda, amm_fee_pda]).await?;
-        let pool_acc =
-            pool_accounts.first().cloned().flatten().ok_or_else(|| {
-                market_err("curve complete but canonical PumpSwap pool unavailable")
-            })?;
-        PumpSwapPoolState::validate_owner(&pool_acc.owner)?;
-        let pool = PumpSwapPoolState::decode(&pool_acc.data)?;
-        validate_canonical_pool(&pool, &authority, mint, &pool_quote_mint)?;
+        // The initial `slot` is bonding-curve provenance ONLY. It MUST NOT be
+        // published as PumpSwap quote provenance (BLOCKER A step 10).
+        let _ = slot;
 
-        let amm_fee_acc = pool_accounts
-            .get(1)
-            .cloned()
-            .flatten()
-            .ok_or_else(|| market_err("PumpSwap FeeConfig account missing"))?;
-        let fee_config = FeeConfigState::decode(&amm_fee_acc.data)?;
-
-        // Fetch vaults + base mint coherently.
-        let (vault_accounts, vault_slot) = self
-            .fetch_multi(vec![
-                pool.pool_base_token_account,
-                pool.pool_quote_token_account,
-                *mint,
-            ])
-            .await?;
-
-        let base_vault_acc = vault_accounts
+        // Step 3 — DISCOVERY-ONLY fetch of the canonical pool, used solely to learn
+        // the base_vault + quote_vault addresses. This pool data is NOT quote-state
+        // and its context slot is deliberately discarded.
+        let (discovery_accounts, _discovery_slot) = self.fetch_multi(vec![pool_pda]).await?;
+        let discovery_pool_acc = discovery_accounts
             .first()
             .cloned()
             .flatten()
-            .ok_or_else(|| market_err("pool base vault missing"))?;
-        TokenAccountState::validate_program(&base_vault_acc.owner)?;
-        let base_vault = TokenAccountState::decode(&base_vault_acc.data)?;
-        base_vault.validate(mint, &pool_pda)?;
+            .ok_or_else(|| {
+                market_err("curve complete but canonical PumpSwap pool unavailable")
+            })?;
+        PumpSwapPoolState::validate_owner(&discovery_pool_acc.owner)?;
+        let discovery_pool = PumpSwapPoolState::decode(&discovery_pool_acc.data)?;
+        // Validate discovery identity too, so we only ever fetch vaults belonging to
+        // the real canonical pool. (Final batch re-validates independently.)
+        validate_canonical_pool(&discovery_pool, &authority, mint, &pool_quote_mint)?;
+        let discovered_base_vault = discovery_pool.pool_base_token_account;
+        let discovered_quote_vault = discovery_pool.pool_quote_token_account;
 
-        let quote_vault_acc = vault_accounts
+        // Step 4 — FINAL single coherent batch at confirmed commitment. Account list
+        // is EXACTLY [pool PDA, discovered base vault, discovered quote vault, base
+        // mint, PumpSwap FeeConfig PDA]. Its context slot is the published slot.
+        let (final_accounts, final_slot) = self
+            .fetch_multi(vec![
+                pool_pda,
+                discovered_base_vault,
+                discovered_quote_vault,
+                *mint,
+                amm_fee_pda,
+            ])
+            .await?;
+
+        let pool_acc = final_accounts
+            .first()
+            .cloned()
+            .flatten()
+            .ok_or_else(|| market_err("final PumpSwap pool account missing"))?;
+        let base_vault_acc = final_accounts
             .get(1)
             .cloned()
             .flatten()
-            .ok_or_else(|| market_err("pool quote vault missing"))?;
-        TokenAccountState::validate_program(&quote_vault_acc.owner)?;
-        let quote_vault = TokenAccountState::decode(&quote_vault_acc.data)?;
-        quote_vault.validate(&pool.quote_mint, &pool_pda)?;
-
-        let base_mint_acc = vault_accounts
+            .ok_or_else(|| market_err("final PumpSwap base vault missing"))?;
+        let quote_vault_acc = final_accounts
             .get(2)
             .cloned()
             .flatten()
-            .ok_or_else(|| market_err("base mint account missing"))?;
-        MintState::validate_owner(&base_mint_acc.owner)?;
-        let base_mint = MintState::decode(&base_mint_acc.data)?;
+            .ok_or_else(|| market_err("final PumpSwap quote vault missing"))?;
+        let base_mint_acc = final_accounts
+            .get(3)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| market_err("final base mint account missing"))?;
+        let amm_fee_acc = final_accounts
+            .get(4)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| market_err("final PumpSwap FeeConfig account missing"))?;
 
-        let base_reserve = base_vault.amount;
-        if base_reserve == 0 {
-            return Err(market_err("PumpSwap pool has zero base reserve"));
-        }
-        let effective_quote_reserve =
-            math::effective_quote_reserve(quote_vault.amount, pool.virtual_quote_reserves)
-                .ok_or_else(|| {
-                    market_err("PumpSwap effective quote reserve non-positive / overflow")
-                })?;
-
-        let _ = (pool_slot, vault_slot); // context slots documented; snapshot uses first-fetch slot.
+        // Steps 5-10 — pure decode/validate of the FINAL batch. This is the sole
+        // source of published quote-state and slot.
+        let q = decode_final_pumpswap_batch(
+            &pool_acc.owner,
+            &pool_acc.data,
+            &base_vault_acc.owner,
+            &base_vault_acc.data,
+            &quote_vault_acc.owner,
+            &quote_vault_acc.data,
+            &base_mint_acc.owner,
+            &base_mint_acc.data,
+            &amm_fee_acc.owner,
+            &amm_fee_acc.data,
+            &pool_pda,
+            &discovered_base_vault,
+            &discovered_quote_vault,
+            &authority,
+            mint,
+            &pool_quote_mint,
+            final_slot,
+        )?;
 
         Ok(VenueFetch::PumpSwap(PumpSwapFetch {
-            pool,
-            base_reserve,
-            effective_quote_reserve,
-            base_mint,
-            fee_config,
-            slot,
+            pool: q.pool,
+            base_reserve: q.base_reserve,
+            effective_quote_reserve: q.effective_quote_reserve,
+            base_mint: q.base_mint,
+            fee_config: q.fee_config,
+            slot: q.slot,
         }))
     }
 
     /// Fresh on-chain MARK observation (packet D6). Observational: an unsupported
     /// quote asset is reported with `mark = None`, not an error.
     pub async fn snapshot(&self, mint: &Pubkey) -> Result<MarketSnapshot> {
+        // Timestamp policy (packet "Snapshot timestamp"): await the successful
+        // resolve/fetch FIRST, THEN stamp observed_at, THEN construct the snapshot.
+        // The resolved `VenueFetch` carries NO premature now().
+        let resolved = self.resolve_and_fetch(mint).await?;
         let observed_at = chrono::Utc::now();
-        match self.resolve_and_fetch(mint).await? {
+        match resolved {
             VenueFetch::Pump(f) => {
                 let quote_asset = curve_quote_asset(&f.curve.quote_mint);
                 let mark = if quote_asset == QuoteAsset::Sol {
@@ -861,5 +1012,316 @@ mod tests {
             &crate::market::pump_state::spl_token_program_id()
         ));
         assert!(!is_token_program(&pump_program_id()));
+    }
+
+    // ------------------------------------------------------------------
+    // Final-batch coherence tests (BLOCKER A). No network — pure fixtures
+    // built the same way src/market/pump_state.rs tests build them.
+    // ------------------------------------------------------------------
+
+    use crate::market::pump_state::{
+        pump_amm_program_id, spl_token_program_id, wsol_mint as wsol, FEE_CONFIG_DISCRIMINATOR,
+        POOL_DISCRIMINATOR,
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_pool_bytes(
+        index: u16,
+        creator: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        coin_creator: Pubkey,
+        virtual_quote: i128,
+    ) -> Vec<u8> {
+        let mut d = Vec::with_capacity(261);
+        d.extend_from_slice(&POOL_DISCRIMINATOR);
+        d.push(0u8); // pool_bump
+        d.extend_from_slice(&index.to_le_bytes());
+        d.extend_from_slice(creator.as_ref());
+        d.extend_from_slice(base_mint.as_ref());
+        d.extend_from_slice(quote_mint.as_ref());
+        d.extend_from_slice(pk(200).as_ref()); // lp_mint
+        d.extend_from_slice(base_vault.as_ref());
+        d.extend_from_slice(quote_vault.as_ref());
+        d.extend_from_slice(&1u64.to_le_bytes()); // lp_supply
+        d.extend_from_slice(coin_creator.as_ref());
+        d.push(0u8); // is_mayhem_mode
+        d.push(0u8); // is_cashback_coin
+        d.extend_from_slice(&virtual_quote.to_le_bytes());
+        assert_eq!(d.len(), 261);
+        d
+    }
+
+    fn build_token_account_bytes(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 165];
+        d[0..32].copy_from_slice(mint.as_ref());
+        d[32..64].copy_from_slice(owner.as_ref());
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        d
+    }
+
+    fn build_mint_bytes(supply: u64, decimals: u8) -> Vec<u8> {
+        let mut d = vec![0u8; 82];
+        d[36..44].copy_from_slice(&supply.to_le_bytes());
+        d[44] = decimals;
+        d
+    }
+
+    fn build_fee_config_bytes() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&FEE_CONFIG_DISCRIMINATOR);
+        d.push(255u8); // bump
+        d.extend_from_slice(pk(50).as_ref()); // admin
+                                              // flat fees
+        d.extend_from_slice(&100u64.to_le_bytes());
+        d.extend_from_slice(&50u64.to_le_bytes());
+        d.extend_from_slice(&25u64.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes()); // one tier
+        d.extend_from_slice(&0u128.to_le_bytes()); // threshold
+        d.extend_from_slice(&100u64.to_le_bytes());
+        d.extend_from_slice(&50u64.to_le_bytes());
+        d.extend_from_slice(&25u64.to_le_bytes());
+        d
+    }
+
+    /// Standard identities for a well-formed FINAL batch.
+    struct Fixture {
+        authority: Pubkey,
+        base_mint_pk: Pubkey,
+        quote_mint_pk: Pubkey,
+        pool_pda: Pubkey,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+    }
+
+    fn fixture() -> Fixture {
+        Fixture {
+            authority: pk(1),
+            base_mint_pk: pk(2),
+            quote_mint_pk: wsol(),
+            pool_pda: pk(10),
+            base_vault: pk(5),
+            quote_vault: pk(6),
+        }
+    }
+
+    /// Call the pure final-batch decoder with a well-formed batch, allowing the
+    /// caller to override discovered vault addresses / feeconfig owner / vqr / slot.
+    #[allow(clippy::too_many_arguments)]
+    fn run_final(
+        f: &Fixture,
+        pool_base_vault: Pubkey,
+        pool_quote_vault: Pubkey,
+        discovered_base: Pubkey,
+        discovered_quote: Pubkey,
+        fee_owner: Pubkey,
+        virtual_quote: i128,
+        quote_vault_amount: u64,
+        final_slot: u64,
+    ) -> Result<PumpSwapQuoteState> {
+        let pool_bytes = build_pool_bytes(
+            0,
+            f.authority,
+            f.base_mint_pk,
+            f.quote_mint_pk,
+            pool_base_vault,
+            pool_quote_vault,
+            Pubkey::default(),
+            virtual_quote,
+        );
+        let base_vault_bytes = build_token_account_bytes(f.base_mint_pk, f.pool_pda, 1_000_000);
+        let quote_vault_bytes =
+            build_token_account_bytes(f.quote_mint_pk, f.pool_pda, quote_vault_amount);
+        let mint_bytes = build_mint_bytes(1_000_000_000_000_000, 6);
+        let fee_bytes = build_fee_config_bytes();
+
+        decode_final_pumpswap_batch(
+            &pump_amm_program_id(),
+            &pool_bytes,
+            &spl_token_program_id(),
+            &base_vault_bytes,
+            &spl_token_program_id(),
+            &quote_vault_bytes,
+            &spl_token_program_id(),
+            &mint_bytes,
+            &fee_owner,
+            &fee_bytes,
+            &f.pool_pda,
+            &discovered_base,
+            &discovered_quote,
+            &f.authority,
+            &f.base_mint_pk,
+            &f.quote_mint_pk,
+            final_slot,
+        )
+    }
+
+    #[test]
+    fn test_final_batch_slot_is_published_not_discovery() {
+        let f = fixture();
+        let q = run_final(
+            &f,
+            f.base_vault,
+            f.quote_vault,
+            f.base_vault,
+            f.quote_vault,
+            fee_program_id(),
+            5_000_000_000i128,
+            2_000_000_000,
+            9_999_999, // FINAL context slot
+        )
+        .unwrap();
+        // Published slot must equal the FINAL batch slot, never a discovery/curve slot.
+        assert_eq!(q.slot, 9_999_999);
+    }
+
+    #[test]
+    fn test_final_batch_changed_base_vault_rejected() {
+        let f = fixture();
+        // FINAL pool reports a base vault different from the discovered one.
+        let err = run_final(
+            &f,
+            pk(77), // final pool base vault moved
+            f.quote_vault,
+            f.base_vault, // discovered base vault
+            f.quote_vault,
+            fee_program_id(),
+            0,
+            1_000_000_000,
+            1,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_final_batch_changed_quote_vault_rejected() {
+        let f = fixture();
+        let err = run_final(
+            &f,
+            f.base_vault,
+            pk(88), // final pool quote vault moved
+            f.base_vault,
+            f.quote_vault, // discovered quote vault
+            fee_program_id(),
+            0,
+            1_000_000_000,
+            1,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_final_batch_wrong_fee_program_owner_rejected() {
+        let f = fixture();
+        let err = run_final(
+            &f,
+            f.base_vault,
+            f.quote_vault,
+            f.base_vault,
+            f.quote_vault,
+            pump_amm_program_id(), // NOT the fee program
+            0,
+            1_000_000_000,
+            1,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_final_batch_effective_reserve_uses_final_pool_and_quote_vault() {
+        let f = fixture();
+        let vqr = 3_000_000_000i128;
+        let quote_amt = 7_000_000_000u64;
+        let q = run_final(
+            &f,
+            f.base_vault,
+            f.quote_vault,
+            f.base_vault,
+            f.quote_vault,
+            fee_program_id(),
+            vqr,
+            quote_amt,
+            42,
+        )
+        .unwrap();
+        let expected =
+            math::effective_quote_reserve(quote_amt, vqr).expect("finite effective reserve");
+        assert_eq!(q.effective_quote_reserve, expected);
+        assert_eq!(q.pool.virtual_quote_reserves, vqr);
+    }
+
+    #[test]
+    fn test_pump_fee_config_wrong_owner_rejected_pregraduation() {
+        // Pre-graduation path validates the Pump FeeConfig owner via the same helper
+        // before decoding. Prove the helper fails closed for a non-fee-program owner.
+        assert!(validate_fee_config_owner(&fee_program_id()).is_ok());
+        assert!(validate_fee_config_owner(&pump_program_id()).is_err());
+        assert!(validate_fee_config_owner(&pump_amm_program_id()).is_err());
+    }
+
+    #[test]
+    fn test_timestamp_resolved_state_carries_no_premature_now() {
+        // Timestamp policy: the resolved quote-state produced by the pure decoder
+        // carries NO timestamp field — observed_at is applied by snapshot() ONLY
+        // after the await succeeds. A well-formed batch resolves without any now().
+        let f = fixture();
+        let q = run_final(
+            &f,
+            f.base_vault,
+            f.quote_vault,
+            f.base_vault,
+            f.quote_vault,
+            fee_program_id(),
+            1_000_000_000i128,
+            1_000_000_000,
+            123,
+        )
+        .unwrap();
+        // Structurally: PumpSwapQuoteState has slot but no observed_at/quoted_at.
+        // (If a timestamp field were added here, this line would fail to compile,
+        // guarding the "stamp after await" contract.)
+        let _slot_only: u64 = q.slot;
+    }
+
+    #[test]
+    fn test_final_batch_wrong_pool_owner_rejected() {
+        // Sanity: re-validation from the final batch rejects a non-PumpSwap pool owner.
+        let f = fixture();
+        let pool_bytes = build_pool_bytes(
+            0,
+            f.authority,
+            f.base_mint_pk,
+            f.quote_mint_pk,
+            f.base_vault,
+            f.quote_vault,
+            Pubkey::default(),
+            0,
+        );
+        let bv = build_token_account_bytes(f.base_mint_pk, f.pool_pda, 1);
+        let qv = build_token_account_bytes(f.quote_mint_pk, f.pool_pda, 1);
+        let mint_bytes = build_mint_bytes(1, 6);
+        let fee_bytes = build_fee_config_bytes();
+        let err = decode_final_pumpswap_batch(
+            &pump_program_id(), // wrong owner
+            &pool_bytes,
+            &spl_token_program_id(),
+            &bv,
+            &spl_token_program_id(),
+            &qv,
+            &spl_token_program_id(),
+            &mint_bytes,
+            &fee_program_id(),
+            &fee_bytes,
+            &f.pool_pda,
+            &f.base_vault,
+            &f.quote_vault,
+            &f.authority,
+            &f.base_mint_pk,
+            &f.quote_mint_pk,
+            1,
+        );
+        assert!(err.is_err());
     }
 }

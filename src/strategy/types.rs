@@ -570,9 +570,13 @@ impl ExecutionRecord {
     /// - Buy:  `(actual - expected) / expected * 100`
     /// - Sell: `(expected - actual) / expected * 100`
     ///
-    /// Returns None when `expected` is non-finite or <= 0.
+    /// Returns None when `expected` is non-finite or <= 0, or when `actual`
+    /// is non-finite (NaN or +/- Infinity).
     pub fn quote_to_fill_drift_pct(side: Side, expected: f64, actual: f64) -> Option<f64> {
         if !expected.is_finite() || expected <= 0.0 {
+            return None;
+        }
+        if !actual.is_finite() {
             return None;
         }
         let drift = match side {
@@ -799,6 +803,46 @@ mod tests {
             ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, f64::NAN, 1.0),
             None
         );
+    }
+
+    #[test]
+    fn test_drift_none_on_non_finite_actual() {
+        // NaN actual on both sides => None (guard before any division).
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, f64::NAN),
+            None
+        );
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, f64::NAN),
+            None
+        );
+        // +Infinity actual on both sides => None.
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, f64::INFINITY),
+            None
+        );
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, f64::INFINITY),
+            None
+        );
+        // -Infinity actual on both sides => None.
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, f64::NEG_INFINITY),
+            None
+        );
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, f64::NEG_INFINITY),
+            None
+        );
+    }
+
+    #[test]
+    fn test_drift_finite_actual_unchanged() {
+        // A finite actual with valid expected still yields the expected drift.
+        let buy = ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, 103.0).unwrap();
+        assert!((buy - 3.0).abs() < 1e-9);
+        let sell = ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, 97.0).unwrap();
+        assert!((sell - 3.0).abs() < 1e-9);
     }
 
     #[test]
