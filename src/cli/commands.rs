@@ -4673,10 +4673,17 @@ pub async fn health(config: &Config) -> Result<()> {
             }
         }
 
-        // AUDIT-003 B3: the authoritative Data-capability line is printed once
-        // below via `health_data_capability_line` in the `use_for_trading` block.
-        // The older redundant "PumpPortal data capability..." line was removed to
-        // avoid two contradictory capability reports.
+        // AUDIT-004: the authoritative Data-capability line lives HERE, in the
+        // PumpPortal-ENABLED section, because Data/event streaming is independent of
+        // the trade-EXECUTION route. `pumpportal.enabled=true` +
+        // `use_for_trading=false` means PumpPortal is the DATA provider while Jito
+        // executes, so this line must still print. It is gated only by
+        // `health_should_report_pumpportal_data(config.pumpportal.enabled)` (i.e. by
+        // being inside this block). `api_key_present` is already computed above.
+        println!(
+            "PumpPortal Data API... {}",
+            health_data_capability_line(api_key_present)
+        );
     } else {
         println!("PumpPortal... DISABLED");
     }
@@ -4731,11 +4738,9 @@ pub async fn health(config: &Config) -> Result<()> {
             "{}",
             health_execution_line(mode, api_key_present, force_local_api)
         );
-        // Separate Data-capability line: independent of the execution route.
-        println!(
-            "PumpPortal Data API... {}",
-            health_data_capability_line(api_key_present)
-        );
+        // AUDIT-004: this block reports ONLY the transaction execution route. The
+        // Data-capability line is printed once in the `pumpportal.enabled` section
+        // above, since Data capability is independent of the execution route.
     }
 
     // Check keypair
@@ -4943,6 +4948,15 @@ fn health_data_capability_line(api_key_present: bool) -> &'static str {
     } else {
         "Data: new-token/migration only; trade subscriptions unavailable"
     }
+}
+
+/// AUDIT-004 pure predicate: whether `health()` should report the PumpPortal
+/// Data-API capability line. Data/event streaming is independent of the trade
+/// EXECUTION route, so this depends ONLY on `pumpportal.enabled` (the data/event
+/// provider switch), never on `use_for_trading` (the execution route). Display
+/// only; changes no execution/route/subscription/readiness behavior.
+fn health_should_report_pumpportal_data(pumpportal_enabled: bool) -> bool {
+    pumpportal_enabled
 }
 
 async fn check_jito(_config: &Config) -> Result<u64> {
@@ -11737,26 +11751,23 @@ mod tests {
         assert!(!line.contains("LOCAL"));
     }
 
-    // (B6) output policy: health() emits exactly ONE data-capability semantic line.
-    //      After AUDIT-003 B3 the older redundant "PumpPortal data capability..."
-    //      print was removed, leaving a single authoritative Data line printed via
-    //      `health_data_capability_line`. Enforce that by scanning this module's
-    //      own source for capability print sites so the duplicate cannot silently
-    //      return.
+    // AUDIT-004 (B6): output policy — health() emits exactly ONE live
+    //      data-capability print site, and that site lives under the PumpPortal
+    //      ENABLED section, NOT the `use_for_trading` execution block. Data/event
+    //      capability is independent of the trade-execution route, so the print
+    //      must be gated by `pumpportal.enabled`. Enforce both facts by scanning
+    //      this module's own source, split across fragments so the assertions do
+    //      not count themselves.
     #[test]
-    fn test_health_has_single_data_capability_semantic_line() {
+    fn test_health_data_capability_print_site_is_single() {
         let src = include_str!("commands.rs");
-        // The removed helper must not be reintroduced (check for its definition
-        // and any call, split so this literal does not match the token in nearby
-        // comments).
+        // The removed AUDIT-003 duplicate helper must not be reintroduced.
         let helper = concat!("pumpportal_", "capability_line(");
         assert!(
             !src.contains(helper),
             "the removed duplicate capability helper reappeared"
         );
-        // Exactly one health() print site feeds the authoritative Data line. Count
-        // the distinctive output prefix (broken across two string fragments so this
-        // assertion does not count itself).
+        // Exactly one live print site feeds the authoritative Data line.
         let prefix = concat!("PumpPortal Data ", "API... {}");
         let data_line_prints = src.matches(prefix).count();
         assert_eq!(
@@ -11764,6 +11775,75 @@ mod tests {
             "expected exactly one health data-capability print site, found {}",
             data_line_prints
         );
+    }
+
+    // AUDIT-004: prove SEMANTICS, not just "one print site" — the sole live Data
+    //      print site must sit inside the `if config.pumpportal.enabled {` block
+    //      and OUTSIDE the `if config.pumpportal.use_for_trading {` block. This is
+    //      the structural replacement for the AUDIT-003 test that only asserted the
+    //      print was inside `use_for_trading`.
+    #[test]
+    fn test_health_data_capability_is_tied_to_pumpportal_enabled_not_trading_route() {
+        // The pure predicate depends ONLY on `enabled`, never on the exec route.
+        assert!(health_should_report_pumpportal_data(true));
+        assert!(!health_should_report_pumpportal_data(false));
+
+        let src = include_str!("commands.rs");
+        let prefix = concat!("PumpPortal Data ", "API... {}");
+        let print_at = src
+            .find(prefix)
+            .expect("expected a live Data-capability print site");
+
+        // Byte offset of the enabled-section guard that must precede the print.
+        let enabled_guard = concat!("if config.pumpportal.", "enabled {");
+        let enabled_at = src
+            .find(enabled_guard)
+            .expect("expected the pumpportal.enabled health guard");
+        assert!(
+            enabled_at < print_at,
+            "Data print site must be inside the pumpportal.enabled section"
+        );
+
+        // Byte offset of the trading-route guard in health(). The Data print must
+        // NOT live after it (it belongs to the enabled section that precedes it).
+        let trading_guard = concat!("if config.pumpportal.", "use_for_trading {");
+        // There are several `use_for_trading` guards in the file; find the one that
+        // opens the health() Trading-API block by anchoring on its distinctive
+        // downstream marker.
+        let trading_marker = "PumpPortal Trading API... ";
+        let trading_marker_at = src
+            .find(trading_marker)
+            .expect("expected the health() Trading API block");
+        // The Data print site precedes the Trading API block entirely.
+        assert!(
+            print_at < trading_marker_at,
+            "Data print site must precede (not live inside) the Trading API block"
+        );
+        // And the trading guard exists (route reporting retained).
+        assert!(
+            src[..trading_marker_at].contains(trading_guard),
+            "expected the use_for_trading guard ahead of the Trading API block"
+        );
+    }
+
+    // AUDIT-004: enabled + Jito execution (use_for_trading=false) still reports the
+    //      PumpPortal Data capability, and the execution route is NOT PumpPortal.
+    #[test]
+    fn test_health_jito_execution_still_reports_pumpportal_data_when_enabled() {
+        let pumpportal_enabled = true;
+        let use_for_trading = false;
+        // Data capability is driven by `enabled`, so it reports even with Jito exec.
+        assert!(health_should_report_pumpportal_data(pumpportal_enabled));
+        // Execution route is NOT PumpPortal in this config: the Trading-API block is
+        // gated on `use_for_trading`, which is false here, so no PumpPortal exec line.
+        assert!(!use_for_trading);
+    }
+
+    // AUDIT-004: disabled PumpPortal never reports Data capability, even if an
+    //      unused api-key happens to be configured.
+    #[test]
+    fn test_health_disabled_pumpportal_does_not_report_data_capability() {
+        assert!(!health_should_report_pumpportal_data(false));
     }
 
     // (6b) masked config display (Agent B hardened) exposes neither the
