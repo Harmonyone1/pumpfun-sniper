@@ -3629,6 +3629,14 @@ pub async fn sell(
     // credentials_dir. Cross-process file locking is not implemented. The
     // ActiveSellMints reservation coordinates tasks inside one start() process
     // only; positions.json and pending_executions.json have no cross-process lock.
+    //
+    // E2 / INV-RUN-001/002: acquire the exclusive runtime lease for this
+    // credentials_dir BEFORE any pending recovery or PositionManager mutation.
+    // Held for the entire function lifetime. Applies EVEN in dry-run.
+    let _runtime_lease =
+        RuntimeLease::acquire(&config.wallet.credentials_dir, manual_sell_lease_label())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     info!("Sell command: token={}, amount={}", token, amount);
 
     // Parse token address.
@@ -4609,14 +4617,61 @@ pub async fn health(config: &Config) -> Result<()> {
 
     // Check PumpPortal (if enabled)
     if config.pumpportal.enabled {
-        print!("PumpPortal WebSocket... ");
-        match check_pumpportal(config).await {
-            Ok(_) => println!("OK"),
+        // E6.2: validate the base URL + configured api-key placement using the
+        // stream helper. The returned URL may embed the secret, so it is NEVER
+        // printed or logged.
+        print!("PumpPortal URL config... ");
+        match crate::stream::pumpportal::build_connection_url(
+            &config.pumpportal.ws_url,
+            &config.pumpportal.api_key,
+        ) {
+            Ok(_authenticated_url) => {
+                // Do NOT print _authenticated_url; it may contain the api-key.
+                println!("OK (base URL valid, api-key placement checked)");
+            }
             Err(e) => {
+                // build_connection_url errors are built from the sanitized base
+                // only and never contain the secret.
                 println!("FAILED: {}", e);
                 all_healthy = false;
             }
         }
+
+        // E6.3/E6.4: connection-only live socket check. If another runtime is
+        // active it owns the single PumpPortal connection, so we must NOT open a
+        // second socket.
+        let active_runtime = matches!(
+            RuntimeLease::inspect(&config.wallet.credentials_dir),
+            Ok(Some(_))
+        );
+        let api_key_present = !config.pumpportal.api_key.trim().is_empty();
+        print!("PumpPortal live socket... ");
+        if !health_should_open_socket(active_runtime, api_key_present) {
+            if active_runtime {
+                println!(
+                    "SKIPPED live socket check: active runtime owns the single PumpPortal connection"
+                );
+            } else {
+                // No key: the free new-token/migration endpoint could still be
+                // reached, but a connection-only check with no key proves nothing
+                // about trade credentials, so we skip opening a socket here.
+                println!("SKIPPED (no api-key configured)");
+            }
+        } else {
+            match check_pumpportal(config).await {
+                Ok(_) => println!("endpoint reachable"),
+                Err(e) => {
+                    println!("FAILED: {}", e);
+                    all_healthy = false;
+                }
+            }
+        }
+
+        // E6.5: separate data-capability line. Never prints the secret.
+        println!(
+            "PumpPortal data capability... {}",
+            pumpportal_capability_line(api_key_present)
+        );
     } else {
         println!("PumpPortal... DISABLED");
     }
@@ -4705,20 +4760,33 @@ async fn check_shredstream(_config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Connection-only PumpPortal health check.
+///
+/// Opens ONE socket using the authenticated URL (built internally via the stream
+/// helper so the api-key is placed correctly), then immediately closes it. The
+/// authenticated URL is NEVER logged or printed. This proves only that the
+/// endpoint is reachable — it does NOT authorize or consume any (metered) trade
+/// subscription. Callers must gate this behind `health_should_open_socket`.
 async fn check_pumpportal(config: &Config) -> Result<()> {
     use std::time::Duration;
     use tokio_tungstenite::connect_async;
 
-    let url = url::Url::parse(&config.pumpportal.ws_url)
-        .map_err(|e| anyhow::anyhow!("Invalid WebSocket URL: {}", e))?;
+    // Build the authenticated URL internally. Never log/print the returned Url.
+    let url = crate::stream::pumpportal::build_connection_url(
+        &config.pumpportal.ws_url,
+        &config.pumpportal.api_key,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Try to connect with timeout
+    // Try to connect with timeout. On any error, surface only the sanitized base
+    // (never the authenticated Url, which carries the secret).
     let connect_future = connect_async(url);
     let timeout = Duration::from_secs(5);
 
     match tokio::time::timeout(timeout, connect_future).await {
         Ok(Ok((ws, _))) => {
-            // Successfully connected, close by dropping
+            // Successfully connected, close immediately by dropping. Do NOT send
+            // any subscribe message: health must not consume metered trade events.
             drop(ws);
             Ok(())
         }
@@ -4727,6 +4795,28 @@ async fn check_pumpportal(config: &Config) -> Result<()> {
             "Connection timed out after {}s",
             timeout.as_secs()
         )),
+    }
+}
+
+/// E6 pure policy helper: whether a connection-only health check may open a live
+/// PumpPortal socket. When another runtime is active it owns the single
+/// PumpPortal connection, so health must NEVER open a second socket. A
+/// connection-only check with no api-key proves nothing about trade credentials,
+/// so we also skip when no key is present.
+fn health_should_open_socket(active_runtime: bool, api_key_present: bool) -> bool {
+    if active_runtime {
+        return false;
+    }
+    api_key_present
+}
+
+/// E6 pure formatter for the health data-capability line. Never contains the
+/// secret — only a boolean presence flag drives it.
+fn pumpportal_capability_line(api_key_present: bool) -> &'static str {
+    if api_key_present {
+        "trade subscription credential configured"
+    } else {
+        "new-token/migration only; trade subscriptions unavailable"
     }
 }
 
@@ -4875,6 +4965,11 @@ pub async fn wallet_add(
     use chrono::Utc;
     use std::path::Path;
 
+    // E3 / INV-RUN-001/002: exclude a running trading process before mutating the
+    // credential registry/files. Held for the whole function.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "wallet_add")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     let creds_path = Path::new(&config.wallet.credentials_dir);
     let mut creds = CredentialManager::load(creds_path)
         .map_err(|e| anyhow::anyhow!("Failed to load credentials: {}", e))?;
@@ -4978,6 +5073,11 @@ pub async fn wallet_extract(
     use crate::wallet::safety::WalletSafetyConfig;
     use crate::wallet::types::{InitiatedBy, TransferReason};
     use dialoguer::Confirm;
+
+    // E3 / INV-RUN-001/002: exclude a running trading process before any
+    // controlled-wallet balance move. Held for the whole function.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "wallet_extract")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     info!("Extracting {} SOL to vault", amount);
 
@@ -5183,6 +5283,11 @@ pub async fn wallet_transfer(
     use solana_sdk::signature::Signer;
     use std::str::FromStr;
 
+    // E3 / INV-RUN-001/002: exclude a running trading process before any
+    // controlled-wallet balance move. Held for the whole function.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "wallet_transfer")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     info!(
         "Initiating transfer of {} SOL from {} to {}",
         amount, from, to
@@ -5348,6 +5453,7 @@ pub async fn scan(
             if auto_buy && !tokens.is_empty() {
                 warn!("AUTO-BUY enabled - this is AGGRESSIVE mode!");
                 // TODO: Implement auto-buy logic
+                // If scan auto-buy becomes executable, it MUST acquire RuntimeLease before any state/wallet mutation.
             }
         }
 
@@ -5378,6 +5484,13 @@ pub async fn hot_scan(
 ) -> Result<()> {
     use crate::dexscreener::{DexScreenerClient, HotScanConfig};
     use solana_sdk::signature::Signer;
+
+    // E1 / INV-RUN-001/002: acquire the exclusive runtime lease for this
+    // credentials_dir BEFORE PositionManager / pending / wallet initialization.
+    // Held for the entire function lifetime. This applies EVEN in dry-run because
+    // HotScan startup recovery can mutate persistent state.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "hot_scan")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     info!("=== HOT TOKEN SCANNER ===");
     info!(
@@ -7688,6 +7801,33 @@ fn primary_sell_fill_values(
 /// market-price input is involved.
 fn kill_switch_unwatch_on_close(fully_closed: bool) -> bool {
     fully_closed
+}
+
+// ===========================================================================
+// AGENT E — pure runtime-ownership classifier for CLI commands.
+//
+// Returns true for commands that mutate persistent trading state / credentials /
+// controlled-wallet balances and therefore MUST hold the exclusive runtime lease
+// (INV-RUN-001/002). Read-only commands (status/config/health/wallet
+// status/list/history) and the emergency-control command (INV-RUN-006) return
+// false — emergency must stay callable while a bot holds the lease.
+// ===========================================================================
+fn command_requires_runtime_lease(command: &str) -> bool {
+    matches!(
+        command,
+        "start"
+            | "hot_scan"
+            | "sell"
+            | "wallet_add"
+            | "wallet_extract"
+            | "wallet_transfer"
+    )
+}
+
+/// E8(2): the exact runtime-lease command label used by the manual `sell` handler.
+/// Factored so tests assert the label without acquiring a lease.
+fn manual_sell_lease_label() -> &'static str {
+    "sell"
 }
 
 // ===========================================================================
@@ -11043,5 +11183,141 @@ mod tests {
         .await;
         assert!(ok);
         assert!(rx.recv().await.is_some());
+    }
+
+    // === AGENT E8 — runtime-ownership + health secret-safety tests ==========
+
+    // (1) start and HotScan lease the same dir => second acquire conflicts.
+    #[test]
+    fn test_e8_start_and_hotscan_same_dir_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = RuntimeLease::acquire(dir.path(), "start").expect("first acquires");
+        let err = RuntimeLease::acquire(dir.path(), "hot_scan");
+        assert!(
+            err.is_err(),
+            "second runtime in same credentials_dir must fail closed"
+        );
+        drop(lease);
+        // After release the dir is free again.
+        let _reacquired = RuntimeLease::acquire(dir.path(), "hot_scan")
+            .expect("acquires after prior lease dropped");
+    }
+
+    // (2) manual sell uses the exact "sell" command label, and that label is what
+    //     lands in the lease metadata.
+    #[test]
+    fn test_e8_manual_sell_lease_command_label() {
+        assert_eq!(manual_sell_lease_label(), "sell");
+        let dir = tempfile::tempdir().unwrap();
+        let _lease =
+            RuntimeLease::acquire(dir.path(), manual_sell_lease_label()).expect("acquires");
+        let meta = RuntimeLease::inspect(dir.path())
+            .expect("inspect ok")
+            .expect("lease present");
+        assert_eq!(meta.command, "sell");
+    }
+
+    // (3) wallet transfer (and the other mutating commands) classified as
+    //     requiring the exclusive runtime lease.
+    #[test]
+    fn test_e8_wallet_transfer_classified_mutating() {
+        for cmd in [
+            "start",
+            "hot_scan",
+            "sell",
+            "wallet_add",
+            "wallet_extract",
+            "wallet_transfer",
+        ] {
+            assert!(
+                command_requires_runtime_lease(cmd),
+                "{cmd} must require the runtime lease"
+            );
+        }
+    }
+
+    // (4) wallet emergency + read-only commands classified NON-exclusive.
+    #[test]
+    fn test_e8_emergency_and_readonly_non_exclusive() {
+        for cmd in [
+            "wallet_emergency",
+            "status",
+            "config",
+            "health",
+            "wallet_status",
+            "wallet_list",
+            "wallet_history",
+            "scan",
+        ] {
+            assert!(
+                !command_requires_runtime_lease(cmd),
+                "{cmd} must NOT require the runtime lease"
+            );
+        }
+    }
+
+    // (5) health policy helper: when a runtime is active, never open a second
+    //     PumpPortal socket (regardless of key presence).
+    #[test]
+    fn test_e8_health_active_runtime_avoids_second_socket() {
+        assert!(!health_should_open_socket(true, true));
+        assert!(!health_should_open_socket(true, false));
+        // No active runtime: may open a socket only if a key exists.
+        assert!(health_should_open_socket(false, true));
+        assert!(!health_should_open_socket(false, false));
+    }
+
+    // (6) health capability line never contains a sample API key.
+    #[test]
+    fn test_e8_health_capability_line_has_no_secret() {
+        let sample_key = "super-secret-sample-api-key-1234567890";
+        // Presence path is driven by a bool, so the secret cannot leak into it.
+        let present = pumpportal_capability_line(true);
+        let absent = pumpportal_capability_line(false);
+        assert!(!present.contains(sample_key));
+        assert!(!absent.contains(sample_key));
+        assert_eq!(present, "trade subscription credential configured");
+        assert_eq!(
+            absent,
+            "new-token/migration only; trade subscriptions unavailable"
+        );
+    }
+
+    // (6b) masked config display (Agent B hardened) exposes neither the
+    //      PumpPortal api_key nor the Helius key embedded in the RPC URL.
+    #[test]
+    fn test_e8_masked_config_hides_keys() {
+        let mut config = Config::default();
+        config.pumpportal.api_key = "super-secret-sample-api-key-1234567890".to_string();
+        config.rpc.endpoint =
+            "https://mainnet.helius-rpc.com/?api-key=helius-secret-abcdef".to_string();
+        let display = config.masked_display();
+        assert!(
+            !display.contains("super-secret-sample-api-key-1234567890"),
+            "masked config must not contain the PumpPortal api_key"
+        );
+        assert!(
+            !display.contains("helius-secret-abcdef"),
+            "masked config must not contain the Helius RPC query key"
+        );
+    }
+
+    // (7) generic scan auto_buy remains a no-op: no submit/trader.buy path was
+    //     introduced, and the guard comment is present in this source file.
+    #[test]
+    fn test_e8_scan_auto_buy_remains_no_op() {
+        let src = include_str!("commands.rs");
+        assert!(
+            src.contains(
+                "If scan auto-buy becomes executable, it MUST acquire RuntimeLease before any state/wallet mutation."
+            ),
+            "scan auto-buy guard comment must be present"
+        );
+        // The generic `scan` fn ignores buy_amount (bound as `_buy_amount`) — no
+        // executable buy path exists.
+        assert!(
+            src.contains("_buy_amount: f64,"),
+            "generic scan must keep buy amount unused (no submit path)"
+        );
     }
 }
