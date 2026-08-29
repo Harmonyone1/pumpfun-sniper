@@ -666,10 +666,29 @@ impl CommandSender {
         }
 
         // 9. signal the worker to resync the active socket to desired.
-        self.notify_tx
-            .send(())
-            .await
-            .map_err(|_| Error::Internal("PumpPortal notify channel closed".to_string()))
+        //
+        // BLOCKER A: the wake carries NO authoritative state — desired is already
+        // mutated above and is the single source of truth; one pending wake is
+        // enough for the worker to diff active vs desired. Awaiting bounded notify
+        // capacity here would reintroduce a circular wait (event channel full ->
+        // worker awaits Connected permit capacity -> notify queue full -> this
+        // caller blocks awaiting notify capacity -> worker can't drain notify until
+        // event capacity frees -> caller can't return to free event capacity).
+        //
+        // INVARIANT: this path NEVER awaits notification-channel capacity. Use a
+        // nonblocking coalescing try_send:
+        //   Ok    => wake enqueued.
+        //   Full  => a wake is already queued; desired is authoritative and current,
+        //            so a coalesced wake is sufficient => success.
+        //   Closed => the worker's receiver is gone; report Err. Desired may already
+        //            be mutated (A3) — that is acceptable, no truth is rolled back.
+        match self.notify_tx.try_send(()) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(Error::Internal(
+                "PumpPortal notify channel closed".to_string(),
+            )),
+        }
     }
 }
 
@@ -1550,8 +1569,22 @@ mod tests {
         Arc<Mutex<SubscriptionRegistry>>,
         mpsc::Receiver<()>,
     ) {
+        make_sender_with_capacity(api_key_present, seed, 16)
+    }
+
+    /// Same as `make_sender` but with a caller-chosen notify-channel capacity so
+    /// tests can construct a small/full notify queue and observe coalescing.
+    fn make_sender_with_capacity(
+        api_key_present: bool,
+        seed: SubscriptionRegistry,
+        notify_capacity: usize,
+    ) -> (
+        CommandSender,
+        Arc<Mutex<SubscriptionRegistry>>,
+        mpsc::Receiver<()>,
+    ) {
         let desired = Arc::new(Mutex::new(seed));
-        let (notify_tx, notify_rx) = mpsc::channel::<()>(16);
+        let (notify_tx, notify_rx) = mpsc::channel::<()>(notify_capacity);
         let sender = CommandSender {
             desired: desired.clone(),
             notify_tx,
@@ -1979,5 +2012,96 @@ mod tests {
         // Sanitized: base only, no secret.
         assert!(format!("{err}").contains("pumpportal.fun"));
         assert!(!format!("{err}").contains(SAMPLE_KEY));
+    }
+
+    // === AGENT A — BLOCKER A wake nonblocking/coalescing tests ================
+
+    /// A4.1 — A FULL notify queue must NOT block `send()`. The wake is coalesced
+    /// (`Full => Ok`) because desired is already authoritative and current. The
+    /// command's desired mutation must still be visible despite the dropped wake.
+    #[tokio::test]
+    async fn test_notify_full_is_coalesced_success() {
+        // Capacity-1 notify channel, no consumer. Prefill it so the next wake
+        // would see `Full`.
+        let (sender, desired, _notify_rx) =
+            make_sender_with_capacity(true, SubscriptionRegistry::default(), 1);
+        // Fill the single notify slot directly (no receiver drains it).
+        sender
+            .notify_tx
+            .try_send(())
+            .expect("prefill the one notify slot");
+        assert!(
+            sender.notify_tx.try_send(()).is_err(),
+            "notify queue must be full before the command"
+        );
+
+        // A command that genuinely changes desired. With the notify queue full,
+        // send() must return promptly with Ok (coalesced wake) AND the desired
+        // registry must reflect the command.
+        let res = sender
+            .send(SubscriptionCommand::SubscribeTokenTrades(vec![
+                VALID_PK_1.to_string(),
+            ]))
+            .await;
+        assert!(res.is_ok(), "Full notify must coalesce to success");
+        assert!(
+            desired.lock().await.token_trades.contains(VALID_PK_1),
+            "desired must reflect the command even when the wake was coalesced"
+        );
+    }
+
+    /// A4.2 — If the notify RECEIVER is dropped (channel closed) while the worker
+    /// flags still look live, a desired-changing command's wake must return Err
+    /// (`Closed`) and must not hang. Desired may already be mutated — acceptable.
+    #[tokio::test]
+    async fn test_notify_closed_returns_error() {
+        let (sender, desired, notify_rx) =
+            make_sender_with_capacity(true, SubscriptionRegistry::default(), 4);
+        // worker_alive still reads true (pre-check passes), but the receiver is
+        // gone, so the channel is Closed for the wake.
+        drop(notify_rx);
+        assert!(
+            sender.worker_alive.load(Ordering::SeqCst),
+            "worker flag must still look live for this race"
+        );
+
+        let res = sender
+            .send(SubscriptionCommand::SubscribeTokenTrades(vec![
+                VALID_PK_1.to_string(),
+            ]))
+            .await;
+        // Closed wake => Err(Error::Internal notify closed), no hang.
+        match res {
+            Err(Error::Internal(msg)) => assert!(msg.contains("notify channel closed")),
+            other => panic!("expected Internal notify-closed error, got {other:?}"),
+        }
+        // A3: desired may already be mutated; we do NOT reverse it.
+        assert!(desired.lock().await.token_trades.contains(VALID_PK_1));
+    }
+
+    /// A4.3 — `send()` must never wait for notify capacity. With a small/full
+    /// notify channel and NO receiver draining it, send() must still complete
+    /// (bounded by a short timeout guard proving it did not block on capacity).
+    #[tokio::test]
+    async fn test_command_sender_never_waits_for_notify_capacity() {
+        let (sender, _desired, _notify_rx) =
+            make_sender_with_capacity(true, SubscriptionRegistry::default(), 1);
+        // Fill the only slot; nothing will ever drain it.
+        sender
+            .notify_tx
+            .try_send(())
+            .expect("prefill the one notify slot");
+
+        // If send() awaited notify capacity it would hang forever here. The
+        // timeout guard proves completion without a draining receiver.
+        let out = tokio::time::timeout(
+            Duration::from_secs(2),
+            sender.send(SubscriptionCommand::SubscribeTokenTrades(vec![
+                VALID_PK_2.to_string(),
+            ])),
+        )
+        .await;
+        let inner = out.expect("send() must not block on notify capacity");
+        assert!(inner.is_ok(), "coalesced wake on a full queue is success");
     }
 }
