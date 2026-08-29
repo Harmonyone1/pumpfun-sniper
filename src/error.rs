@@ -67,6 +67,12 @@ pub enum Error {
     #[error("Transaction reconciliation failed: {0}")]
     TransactionReconciliation(String),
 
+    #[error("Market data error: {0}")]
+    MarketData(String),
+
+    #[error("Unsupported quote mint: {0}")]
+    UnsupportedQuoteMint(String),
+
     #[error("Slippage exceeded: expected {expected}, got {actual}")]
     SlippageExceeded { expected: u64, actual: u64 },
 

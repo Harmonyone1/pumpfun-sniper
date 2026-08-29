@@ -1,4 +1,16 @@
-//! Price calculation utilities for pump.fun bonding curves
+//! LEGACY / NON-CANONICAL PRICE HELPERS.
+//! Do not use for live money authorization.
+//! Canonical live pricing is crate::market::PumpMarketOracle.
+//!
+//! Price calculation utilities for pump.fun bonding curves.
+//!
+//! WARNING (raw-unit legacy): `calculate_price` / `BondingCurve::get_price()`
+//! return a RAW reserve ratio (lamports per raw base unit), NOT a normalized
+//! SOL-per-whole-token price, and the token-decimal handling here assumes a
+//! hardcoded default (see `DEFAULT_TOKEN_DECIMALS`). This math is dimensionally
+//! wrong for live price/exit authorization (INV-MKT-003) and must not be relied
+//! on by canonical commands. Use crate::market::PumpMarketOracle for any live
+//! mark or executable quote.
 
 use super::accounts::BondingCurve;
 use crate::error::Result;

@@ -1,7 +1,14 @@
+//! LEGACY / NON-CANONICAL PRICE HELPERS.
+//! Do not use for live money authorization.
+//! Canonical live pricing is crate::market::PumpMarketOracle.
+//!
 //! Price feed for position monitoring
 //!
 //! Polls bonding curve accounts to get current token prices.
-//! Falls back to DexScreener API for graduated tokens.
+//! A DexScreener source transition is permitted ONLY when the bonding curve
+//! account is explicitly decoded with `complete == true`. An RPC or decode
+//! failure is NOT graduation and stays an error (INV-MKT-001); it must never
+//! switch the source to DexScreener or authorize a live exit.
 //! This is used for auto-sell (take-profit / stop-loss) triggers.
 //!
 //! WARNING: TP/SL is best-effort, not guaranteed. At 1-second polling,
@@ -132,14 +139,11 @@ impl PriceFeed {
                                             }
                                         }
                                         Err(e) => {
-                                            // Bonding curve failed, try DexScreener
-                                            debug!("Bonding curve fetch failed for {}: {}, trying DexScreener", token.mint, e);
-                                            let mut guard = monitored.write().await;
-                                            if let Some(t) = guard.get_mut(&token.mint) {
-                                                t.source = PriceSource::DexScreener;
-                                            }
-                                            drop(guard);
-                                            Self::fetch_dexscreener_price(&dexscreener, &token.mint).await
+                                            // INV-MKT-001: an RPC/decode failure is NOT graduation.
+                                            // Do NOT switch the source to DexScreener and do NOT
+                                            // fabricate a price. The error stays an error so that
+                                            // no live exit can be authorized on a failed observation.
+                                            Err(e)
                                         }
                                     }
                                 }
@@ -285,9 +289,11 @@ impl PriceFeed {
     pub async fn check_if_graduated(&self, bonding_curve: &Pubkey) -> Result<bool> {
         match Self::fetch_bonding_curve_price(&self.rpc_client, bonding_curve).await {
             Ok((_, graduated)) => Ok(graduated),
-            Err(_) => {
-                // If we can't fetch the bonding curve, assume it's graduated
-                Ok(true)
+            Err(e) => {
+                // INV-MKT-001: an RPC/decode failure is NOT graduation. Propagate
+                // the error instead of assuming graduation. Only an explicitly
+                // decoded `complete == true` may be treated as graduated.
+                Err(e)
             }
         }
     }

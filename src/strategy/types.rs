@@ -525,6 +525,67 @@ impl ExecutionRecord {
         }
     }
 
+    /// Create a successful execution record from an on-chain RECONCILED fill
+    /// that also had a real same-venue pre-send executable QUOTE.
+    ///
+    /// Unlike `success_reconciled_unquoted`, this DOES record a drift sample: the
+    /// stored `slippage_pct` is the quote-to-fill execution DRIFT (see spec
+    /// Section 26.4) — positive means the fill was worse than the quote on both
+    /// buy and sell sides. It is not pure AMM slippage.
+    ///
+    /// The caller must guarantee `expected_price` is finite and > 0. Drift is only
+    /// computed when the expected price is valid; if not, `slippage_pct` is None
+    /// so a missing reference is never faked as 0% drift.
+    pub fn success_reconciled_quoted(
+        mint: String,
+        side: Side,
+        requested_size_sol: f64,
+        filled_size_sol: f64,
+        expected_price: f64,
+        actual_price: f64,
+        latency_ms: u64,
+        tx_signature: String,
+    ) -> Self {
+        let drift = Self::quote_to_fill_drift_pct(side, expected_price, actual_price);
+
+        Self {
+            timestamp: chrono::Utc::now(),
+            mint,
+            side,
+            requested_size_sol,
+            filled_size_sol,
+            expected_price: Some(expected_price),
+            actual_price: Some(actual_price),
+            slippage_pct: drift,
+            latency_ms,
+            success: true,
+            failure_reason: None,
+            tx_signature: Some(tx_signature),
+        }
+    }
+
+    /// Compute quote-to-fill execution drift as a percentage.
+    ///
+    /// Positive = worse than the executable quote on BOTH sides (do not use abs):
+    /// - Buy:  `(actual - expected) / expected * 100`
+    /// - Sell: `(expected - actual) / expected * 100`
+    ///
+    /// Returns None when `expected` is non-finite or <= 0, or when `actual`
+    /// is non-finite (NaN or +/- Infinity).
+    pub fn quote_to_fill_drift_pct(side: Side, expected: f64, actual: f64) -> Option<f64> {
+        if !expected.is_finite() || expected <= 0.0 {
+            return None;
+        }
+        if !actual.is_finite() {
+            return None;
+        }
+        let drift = match side {
+            Side::Buy => (actual - expected) / expected * 100.0,
+            Side::Sell => (expected - actual) / expected * 100.0,
+        };
+        Some(drift)
+    }
+
     /// Create a failed execution record. A failure is NOT a zero-slippage fill:
     /// price/slippage are all None.
     pub fn failure(
@@ -694,6 +755,130 @@ mod tests {
         assert_eq!(Trend::from_slope(0.0, 0.1), Trend::Stable);
         assert_eq!(Trend::from_slope(-0.15, 0.1), Trend::Deteriorating);
         assert_eq!(Trend::from_slope(-0.5, 0.1), Trend::StronglyDeteriorating);
+    }
+
+    #[test]
+    fn test_buy_bad_drift_positive() {
+        // Buy: actual worse (higher) than quote => positive drift.
+        let d = ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, 103.0).unwrap();
+        assert!((d - 3.0).abs() < 1e-9, "got {}", d);
+        assert!(d > 0.0);
+    }
+
+    #[test]
+    fn test_buy_price_improvement_negative() {
+        // Buy: actual better (lower) than quote => negative drift.
+        let d = ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, 99.0).unwrap();
+        assert!((d - (-1.0)).abs() < 1e-9, "got {}", d);
+        assert!(d < 0.0);
+    }
+
+    #[test]
+    fn test_sell_bad_drift_positive() {
+        // Sell: actual worse (lower) than quote => positive drift.
+        let d = ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, 97.0).unwrap();
+        assert!((d - 3.0).abs() < 1e-9, "got {}", d);
+        assert!(d > 0.0);
+    }
+
+    #[test]
+    fn test_sell_price_improvement_negative() {
+        // Sell: actual better (higher) than quote => negative drift.
+        let d = ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, 101.0).unwrap();
+        assert!((d - (-1.0)).abs() < 1e-9, "got {}", d);
+        assert!(d < 0.0);
+    }
+
+    #[test]
+    fn test_drift_none_on_invalid_expected() {
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 0.0, 1.0),
+            None
+        );
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, -1.0, 1.0),
+            None
+        );
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, f64::NAN, 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn test_drift_none_on_non_finite_actual() {
+        // NaN actual on both sides => None (guard before any division).
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, f64::NAN),
+            None
+        );
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, f64::NAN),
+            None
+        );
+        // +Infinity actual on both sides => None.
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, f64::INFINITY),
+            None
+        );
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, f64::INFINITY),
+            None
+        );
+        // -Infinity actual on both sides => None.
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, f64::NEG_INFINITY),
+            None
+        );
+        assert_eq!(
+            ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, f64::NEG_INFINITY),
+            None
+        );
+    }
+
+    #[test]
+    fn test_drift_finite_actual_unchanged() {
+        // A finite actual with valid expected still yields the expected drift.
+        let buy = ExecutionRecord::quote_to_fill_drift_pct(Side::Buy, 100.0, 103.0).unwrap();
+        assert!((buy - 3.0).abs() < 1e-9);
+        let sell = ExecutionRecord::quote_to_fill_drift_pct(Side::Sell, 100.0, 97.0).unwrap();
+        assert!((sell - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_quoted_success_populates_expected_actual_and_slippage() {
+        let rec = ExecutionRecord::success_reconciled_quoted(
+            "mint".to_string(),
+            Side::Buy,
+            0.1,
+            0.1,
+            100.0,
+            103.0,
+            120,
+            "sig1".to_string(),
+        );
+        assert!(rec.success);
+        assert_eq!(rec.expected_price, Some(100.0));
+        assert_eq!(rec.actual_price, Some(103.0));
+        let drift = rec.slippage_pct.expect("quoted record must have drift");
+        assert!((drift - 3.0).abs() < 1e-9, "got {}", drift);
+    }
+
+    #[test]
+    fn test_unquoted_success_still_has_no_slippage() {
+        let rec = ExecutionRecord::success_reconciled_unquoted(
+            "mint".to_string(),
+            Side::Sell,
+            0.1,
+            0.09,
+            0.00123,
+            150,
+            "sig1".to_string(),
+        );
+        assert!(rec.success);
+        assert_eq!(rec.expected_price, None);
+        assert_eq!(rec.actual_price, Some(0.00123));
+        assert_eq!(rec.slippage_pct, None);
     }
 
     #[test]
