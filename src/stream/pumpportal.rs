@@ -31,6 +31,15 @@ use crate::error::{Error, Result};
 /// sanitized. Never echoes raw configured text.
 const SANITIZED_BASE_FALLBACK: &str = "wss://<pumpportal-base>";
 
+/// Finite bound on how long a single subscription wire write (replay or dynamic
+/// delta) may take (A4). The desired mutex is intentionally held across these
+/// bounded writes so `active == desired` equality stays frozen at the instant
+/// `Connected` is enqueued; a FINITE timeout is what makes holding the lock
+/// across the write safe (it can never be retained indefinitely). On timeout or
+/// sink error the connection returns `Err` and the outer loop reconnects and
+/// replays — there is no same-socket retry loop.
+const SUBSCRIPTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Command to send to the websocket for dynamic subscriptions.
 ///
 /// All variants update the persistent desired-state registry and are replayed
@@ -443,6 +452,38 @@ fn command_keys(cmd: &SubscriptionCommand) -> &[String] {
     }
 }
 
+/// Serialize and write a single subscription message to the socket under a
+/// FINITE timeout (A4). Secret-safe: on serialization failure, sink error, or
+/// timeout the error is built ONLY from the sanitized base (never the raw
+/// tungstenite error, which can carry the authenticated URL). A timeout or a
+/// sink error both map to a connection error so the outer loop reconnects and
+/// replays — no same-socket retry.
+///
+/// The caller holds the desired lock across this call; the timeout is what makes
+/// that safe (bounded lock retention).
+async fn send_subscription_message<S>(
+    write: &mut S,
+    msg: &SubscriptionMessage,
+    safe_base: &str,
+    context: &str,
+) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let json = serde_json::to_string(msg).map_err(|e| Error::Serialization(e.to_string()))?;
+    match tokio::time::timeout(SUBSCRIPTION_WRITE_TIMEOUT, write.send(Message::Text(json))).await {
+        // Write completed within the bound; map any sink error to a sanitized
+        // connection error (the raw sink error may reference the secret URL).
+        Ok(res) => res.map_err(|_| {
+            Error::ShredStreamConnection(format!("Failed to send {context} to base {safe_base}"))
+        }),
+        // Timed out: surface as a connection error so the outer loop reconnects.
+        Err(_) => Err(Error::ShredStreamConnection(format!(
+            "Timed out sending {context} to base {safe_base}"
+        ))),
+    }
+}
+
 /// New token event from PumpPortal.
 ///
 /// Numeric fields (`initial_buy`, `v_tokens_in_bonding_curve`,
@@ -811,31 +852,35 @@ impl PumpPortalClient {
         // Per-connection snapshot of what the socket has actually been sent.
         let active: SubscriptionRegistry;
 
-        // A4: replay + snapshot + Connected are ATOMIC under the desired lock so a
-        // concurrent CommandSender::send cannot slip a desired mutation into the
-        // gap between snapshot and Connected. Invariant at Connected: active ==
-        // current desired.
+        // A2 ORDERING (never await bounded event capacity while holding desired):
+        //   reserve Connected capacity  (may await; desired NOT held)
+        //   -> lock desired
+        //   -> replay CURRENT desired via bounded, finite-timeout writes (A4)
+        //   -> active = desired.clone()
+        //   -> permit.send(Connected)   (NON-awaiting; capacity already reserved)
+        //   -> unlock
+        // At the instant Connected is enqueued, active == current desired. Reserve
+        // failure => the receiver is gone; surface as an error so the outer loop
+        // treats it like a dropped connection.
+        let connected_permit = event_tx.reserve().await.map_err(|_| {
+            Error::Internal("PumpPortal event channel closed before Connected".to_string())
+        })?;
         {
             let desired_guard = desired.lock().await;
             for msg in desired_guard.replay_messages() {
-                let json =
-                    serde_json::to_string(&msg).map_err(|e| Error::Serialization(e.to_string()))?;
-                // A6: replay write failure returns Err => outer loop reconnects.
-                write.send(Message::Text(json)).await.map_err(|_| {
-                    Error::ShredStreamConnection(format!(
-                        "Failed to send subscription replay to base {safe_base}"
-                    ))
-                })?;
+                // A4/A6: replay write is finite-time bounded; timeout OR sink error
+                // returns Err => outer loop reconnects and replays.
+                send_subscription_message(&mut write, &msg, &safe_base, "subscription replay")
+                    .await?;
                 debug!("Replayed subscription: {}", msg.method);
             }
             // Snapshot the exact state the socket now reflects.
             active = desired_guard.clone();
 
-            // Signal readiness while still holding the lock.
-            event_tx
-                .send(PumpPortalEvent::Connected)
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to send event: {}", e)))?;
+            // A5: enqueue Connected WITHOUT awaiting — the permit was reserved
+            // before we took the desired lock, so this is synchronous and cannot
+            // block on channel capacity while holding desired.
+            connected_permit.send(PumpPortalEvent::Connected);
         }
         // active now == desired at the instant Connected was emitted.
         let mut active = active;
@@ -854,33 +899,57 @@ impl PumpPortalClient {
                 while nrx.try_recv().is_ok() {}
             }
             {
-                // Diff and send under the desired lock so Connected (sync ack)
-                // reflects exactly the state we synchronized (no concurrent
-                // desired mutation between diff, send, and Connected).
-                let desired_guard = desired.lock().await;
-                let deltas = active.diff_to(&desired_guard);
-                if !deltas.is_empty() {
-                    for msg in deltas {
-                        let json = serde_json::to_string(&msg)
-                            .map_err(|e| Error::Serialization(e.to_string()))?;
-                        // A6: any dynamic-delta write failure returns Err =>
-                        // reconnect; desired stays current so replay repairs it.
-                        write.send(Message::Text(json)).await.map_err(|_| {
-                            Error::ShredStreamConnection(format!(
-                                "Failed to send subscription delta to base {safe_base}"
-                            ))
-                        })?;
-                        debug!("Synchronized subscription: {}", msg.method);
+                // A3 dynamic sync — NEVER await bounded event capacity while
+                // holding desired, and always act on the LATEST desired.
+                //
+                // Step 1: SHORT desired lock only to test whether a sync is even
+                // needed, then release it before any (possibly awaiting) reserve.
+                let sync_needed = {
+                    let desired_guard = desired.lock().await;
+                    !active.diff_to(&desired_guard).is_empty()
+                };
+
+                if sync_needed {
+                    // Step 2: reserve Connected capacity while NOT holding desired
+                    // (this is the only place that may await for capacity).
+                    let permit = event_tx.reserve().await.map_err(|_| {
+                        Error::Internal(
+                            "PumpPortal event channel closed before Connected".to_string(),
+                        )
+                    })?;
+
+                    // Step 3: re-lock desired and RECOMPUTE the diff against the
+                    // LATEST desired (desired may have changed to C while we waited
+                    // on the permit). Never reuse the stale first diff.
+                    let desired_guard = desired.lock().await;
+                    let deltas = active.diff_to(&desired_guard);
+                    if deltas.is_empty() {
+                        // Desired converged back to active while we waited: drop the
+                        // permit (no Connected) and release the lock.
+                        drop(permit);
+                    } else {
+                        for msg in deltas {
+                            // A4/A6: finite-time bounded write; timeout OR sink error
+                            // returns Err => reconnect; desired stays current so
+                            // replay repairs it.
+                            send_subscription_message(
+                                &mut write,
+                                &msg,
+                                &safe_base,
+                                "subscription delta",
+                            )
+                            .await?;
+                            debug!("Synchronized subscription: {}", msg.method);
+                        }
+                        // Every delta sent successfully: active is now in sync with
+                        // the LATEST desired.
+                        active = desired_guard.clone();
+                        // A5: enqueue Connected WITHOUT awaiting while equality is
+                        // still protected by the held desired lock.
+                        permit.send(PumpPortalEvent::Connected);
                     }
-                    // Every delta sent successfully: active is now in sync.
-                    active = desired_guard.clone();
-                    // Emit Connected meaning "desired subscriptions synchronized".
-                    event_tx
-                        .send(PumpPortalEvent::Connected)
-                        .await
-                        .map_err(|e| Error::Internal(format!("Failed to send event: {}", e)))?;
                 }
-                // If deltas is empty, desired already == active: no wire message.
+                // If no sync was needed, desired already == active: no wire message.
             }
 
             tokio::select! {
@@ -1755,5 +1824,160 @@ mod tests {
         assert!(validate_trade(&trade_with(1.0, f64::INFINITY)).is_err());
         // Negative reserve rejected too.
         assert!(validate_trade(&trade_with(1.0, -0.5)).is_err());
+    }
+
+    // === AGENT A — BLOCKER A backpressure/deadlock regression tests ===========
+
+    /// A6.1 — Reserving a `Connected` permit while the bounded event channel is
+    /// FULL must not require the desired mutex. This is the core anti-deadlock
+    /// property: the worker reserves capacity BEFORE it takes the long desired
+    /// lock, so a concurrent `CommandSender::send` (which needs desired) can make
+    /// progress even while the worker is blocked waiting for channel capacity.
+    #[tokio::test]
+    async fn test_connected_capacity_wait_does_not_hold_desired_mutex() {
+        // Bounded event channel, capacity 1, prefilled so no capacity is free.
+        let (event_tx, mut event_rx) = mpsc::channel::<PumpPortalEvent>(1);
+        event_tx
+            .send(PumpPortalEvent::Disconnected)
+            .await
+            .expect("prefill the single slot");
+
+        let desired = Arc::new(Mutex::new(SubscriptionRegistry::default()));
+
+        // Task modelling the worker: reserve a permit BEFORE locking desired.
+        let tx_clone = event_tx.clone();
+        let reserver = tokio::spawn(async move {
+            // Blocks here until the channel slot is freed — desired is NOT held.
+            let permit = tx_clone.reserve_owned().await.expect("reserve");
+            let _guard = permit.send(PumpPortalEvent::Connected);
+        });
+
+        // While the reserver is blocked on capacity, another task must still be
+        // able to acquire the desired mutex and make progress.
+        {
+            let mut guard = desired.lock().await;
+            guard.new_tokens = true; // real progress under the lock
+            assert!(guard.new_tokens);
+        }
+
+        // The reservation is still pending (channel is full).
+        assert!(!reserver.is_finished());
+
+        // Free the slot; the reservation now completes and enqueues Connected.
+        let first = event_rx.recv().await.expect("prefilled item");
+        assert!(matches!(first, PumpPortalEvent::Disconnected));
+
+        reserver.await.expect("reserver task join");
+        let second = event_rx.recv().await.expect("connected item");
+        assert!(matches!(second, PumpPortalEvent::Connected));
+    }
+
+    /// A6.2 — After the permit wait, the dynamic sync must recompute the diff
+    /// against the LATEST desired, never a stale earlier observation. Models the
+    /// A3 ordering: observe desired=B, wait for a permit, desired mutates to C,
+    /// then the diff is recomputed under the re-taken lock and targets C.
+    #[tokio::test]
+    async fn test_dynamic_sync_recomputes_latest_desired_after_capacity_wait() {
+        // active = A (empty). desired starts as B (only PK_1).
+        let active = SubscriptionRegistry::default();
+        let mut b = SubscriptionRegistry::default();
+        b.token_trades.insert(VALID_PK_1.to_string());
+        let desired = Arc::new(Mutex::new(b));
+
+        // First (short-lock) observation: a sync is needed.
+        let first_sync_needed = {
+            let g = desired.lock().await;
+            !active.diff_to(&g).is_empty()
+        };
+        assert!(first_sync_needed);
+
+        // Full bounded channel forces the permit reservation to wait.
+        let (event_tx, mut event_rx) = mpsc::channel::<PumpPortalEvent>(1);
+        event_tx
+            .send(PumpPortalEvent::Disconnected)
+            .await
+            .unwrap();
+
+        let tx_clone = event_tx.clone();
+        let reserver = tokio::spawn(async move {
+            tx_clone.reserve_owned().await.expect("reserve")
+        });
+
+        // While the permit waits, mutate desired B -> C (only PK_2, PK_1 removed).
+        {
+            let mut g = desired.lock().await;
+            g.token_trades.clear();
+            g.token_trades.insert(VALID_PK_2.to_string());
+        }
+
+        // Free the slot so the permit resolves.
+        let _ = event_rx.recv().await;
+        let _permit = reserver.await.expect("join");
+
+        // Recompute the diff against the LATEST desired (C) under a fresh lock.
+        let g = desired.lock().await;
+        let deltas = active.diff_to(&g);
+        let sub = deltas
+            .iter()
+            .find(|m| m.method == "subscribeTokenTrade")
+            .expect("recomputed diff must subscribe C's key");
+        let keys = sub.keys.as_ref().unwrap();
+        // Targets C (PK_2), never stale B (PK_1).
+        assert!(keys.contains(&VALID_PK_2.to_string()));
+        assert!(!keys.contains(&VALID_PK_1.to_string()));
+    }
+
+    /// A6.3 — The subscription write timeout must be finite/small, and a write
+    /// that never completes must yield an Err (never hang). Exercises the real
+    /// `send_subscription_message` wrapper against a sink that never accepts an
+    /// item (its `poll_ready` is perpetually `Pending`).
+    #[tokio::test(start_paused = true)]
+    async fn test_subscription_write_timeout_policy_is_finite() {
+        // Finite and small.
+        assert!(SUBSCRIPTION_WRITE_TIMEOUT > Duration::from_secs(0));
+        assert!(SUBSCRIPTION_WRITE_TIMEOUT <= Duration::from_secs(10));
+
+        // A sink that never becomes ready — models a wedged socket write.
+        struct NeverReadySink;
+        impl futures_util::Sink<Message> for NeverReadySink {
+            type Error = std::io::Error;
+            fn poll_ready(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+            fn start_send(
+                self: std::pin::Pin<&mut Self>,
+                _item: Message,
+            ) -> std::result::Result<(), Self::Error> {
+                Ok(())
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        let mut sink = NeverReadySink;
+        let msg = SubscriptionMessage::subscribe_new_tokens();
+        let safe_base = sanitized_ws_base_for_log(PUMPPORTAL_WS_URL);
+
+        // With time paused, the timeout fires deterministically; the call returns
+        // Err rather than hanging. auto_advance moves the paused clock forward.
+        let err = send_subscription_message(&mut sink, &msg, &safe_base, "subscription replay")
+            .await
+            .expect_err("a never-ready sink must time out");
+        // Sanitized: base only, no secret.
+        assert!(format!("{err}").contains("pumpportal.fun"));
+        assert!(!format!("{err}").contains(SAMPLE_KEY));
     }
 }
