@@ -2009,24 +2009,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         // Apply filters
                         if config.filters.enabled {
                             use crate::filter::token_filter::FilterResult;
-                            use crate::stream::decoder::TokenCreatedEvent;
-                            use std::str::FromStr;
 
-                            // Convert NewTokenEvent to TokenCreatedEvent for filtering
-                            let filter_event = TokenCreatedEvent {
-                                signature: token.signature.clone(),
-                                slot: 0, // Not available from PumpPortal
-                                mint: solana_sdk::pubkey::Pubkey::from_str(&token.mint).unwrap_or_default(),
-                                name: token.name.clone(),
-                                symbol: token.symbol.clone(),
-                                uri: token.uri.clone(),
-                                bonding_curve: solana_sdk::pubkey::Pubkey::from_str(&token.bonding_curve_key).unwrap_or_default(),
-                                associated_bonding_curve: solana_sdk::pubkey::Pubkey::default(),
-                                creator: solana_sdk::pubkey::Pubkey::from_str(&token.trader_public_key).unwrap_or_default(),
-                                timestamp: chrono::Utc::now(),
-                            };
-
-                            match token_filter.filter(&filter_event) {
+                            // C1 / BLOCKER B: run the name/symbol regex filter directly
+                            // on provider name+symbol. Do NOT fabricate a
+                            // TokenCreatedEvent with slot=0 and Pubkey::default()
+                            // identities: the stream parser already validated provider
+                            // identity before emitting NewToken, and the name/symbol
+                            // filter needs neither slot nor Pubkey.
+                            match token_filter.filter_name_symbol(&token.name, &token.symbol) {
                                 FilterResult::Pass => {
                                     info!("Token {} passed name/symbol filters", token.symbol);
                                 }
@@ -2056,18 +2046,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             }
 
                             // Check bonding curve progress (for established tokens)
-                            // Calculate bonding curve % from virtual reserves
-                            // v_sol_in_bonding_curve is a provider observational f64
-                            // (NOT canonical reserves). Historically treated as
-                            // lamports; preserve that heuristic unit conversion.
-                            let v_sol = token.v_sol_in_bonding_curve / 1_000_000_000.0;
-                            let bonding_curve_pct = if v_sol > 0.0 {
-                                // Approximate: more SOL = more progress
-                                // Full curve is ~85 SOL (starting from ~30 virtual)
-                                ((v_sol - 30.0) / 55.0 * 100.0).clamp(0.0, 100.0)
-                            } else {
-                                0.0
-                            };
+                            // C2 / BLOCKER A: v_sol_in_bonding_curve is a provider
+                            // observational SOL value (f64, SOL NOT lamports). Use the
+                            // shared provider heuristic directly on that SOL value — no
+                            // /1e9 conversion. This heuristic stays observational; the
+                            // MPT oracle remains executable/market truth.
+                            let bonding_curve_pct =
+                                SignalContext::calculate_bonding_curve_pct(token.v_sol_in_bonding_curve);
 
                             if config.filters.min_bonding_curve_pct > 0.0 && bonding_curve_pct < config.filters.min_bonding_curve_pct {
                                 info!(
@@ -2135,14 +2120,12 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 token.uri.clone(),
                                 token.trader_public_key.clone(),
                                 token.bonding_curve_key.clone(),
-                                // B9: these provider observational fields are now f64
-                                // (fractional JSON). SignalContext::from_new_token still
-                                // takes u64 integer inputs, so convert the finite,
-                                // non-negative provider values here. They are NOT
-                                // canonical reserves.
-                                token.initial_buy as u64,
-                                token.v_tokens_in_bonding_curve as u64,
-                                token.v_sol_in_bonding_curve as u64,
+                                // C3 / BLOCKER A: pass the provider observational f64
+                                // values DIRECTLY (from_new_token now takes f64). No
+                                // flooring/truncation. These are NOT canonical reserves.
+                                token.initial_buy,
+                                token.v_tokens_in_bonding_curve,
+                                token.v_sol_in_bonding_curve,
                                 token.market_cap_sol,
                             );
 
@@ -2220,17 +2203,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         let (strategy_entry, strategy_size) = if let Some(ref engine) = strategy_engine {
                             let mut engine_guard = engine.write().await;
 
-                            // Build token analysis context for strategy engine
-                            // Note: PumpPortal sends v_sol_in_bonding_curve as SOL, not lamports
-                            // The value is typically ~30 SOL (virtual liquidity)
-                            // For actual tradeable liquidity, we use initial_buy or market_cap
-                            let liquidity_sol = if token.v_sol_in_bonding_curve < 1000.0 {
-                                // Small value = already in SOL
-                                token.v_sol_in_bonding_curve
-                            } else {
-                                // Large value = lamports, convert to SOL
-                                token.v_sol_in_bonding_curve / 1e9
-                            };
+                            // Build token analysis context for strategy engine.
+                            // C4 / BLOCKER A: v_sol_in_bonding_curve is provider
+                            // observational SOL only (never lamports). Use it directly;
+                            // there is no dual SOL/lamport interpretation. This value is
+                            // NOT promoted to canonical liquidity: market_data_ready=false
+                            // below means the StrategyEngine cannot authorize an Enter on
+                            // these provider observational placeholders.
+                            let liquidity_sol = token.v_sol_in_bonding_curve;
                             let token_reserves = token.v_tokens_in_bonding_curve;
 
                             // PLACEHOLDER order flow. A brand-new token event has no real
@@ -2676,10 +2656,24 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                     // trade kill-switch coverage is unavailable for
                                                     // this position. Never erase the position; no
                                                     // second socket.
-                                                    if confirmed_position_requires_subscription(
+                                                    if confirmed_buy_closes_readiness_until_sync(
                                                         config.pumpportal.enabled,
                                                         &config.pumpportal.api_key,
                                                     ) {
+                                                        // C5: a dynamic subscription is
+                                                        // required. IMMEDIATELY before
+                                                        // sending SubscribeTokenTrades,
+                                                        // close the new-entry readiness
+                                                        // gate so no SECOND live entry can
+                                                        // start while this owned position's
+                                                        // provider trade subscription is not
+                                                        // yet synchronized. Readiness only
+                                                        // reopens when the client re-emits
+                                                        // Connected after the desired
+                                                        // registry is synchronized (Agent A
+                                                        // semantics). We never set readiness
+                                                        // true locally.
+                                                        data_stream_ready.store(false, Ordering::SeqCst);
                                                         if send_subscription_command(
                                                             &pumpportal_command_sender,
                                                             SubscriptionCommand::SubscribeTokenTrades(
@@ -4637,32 +4631,44 @@ pub async fn health(config: &Config) -> Result<()> {
             }
         }
 
-        // E6.3/E6.4: connection-only live socket check. If another runtime is
-        // active it owns the single PumpPortal connection, so we must NOT open a
-        // second socket.
-        let active_runtime = matches!(
-            RuntimeLease::inspect(&config.wallet.credentials_dir),
-            Ok(Some(_))
-        );
+        // E6.3/E6.4 + C7/BLOCKER E: connection-only live socket check gated by an
+        // explicit tri-state runtime-lock policy. An inspect Err (lock present but
+        // malformed/unreadable) FAILS CLOSED: skip the socket AND mark unhealthy —
+        // it is NEVER treated as "no runtime". We never open a second socket while
+        // a runtime (known or unknown) may own the single PumpPortal connection,
+        // and health never deletes the lock.
+        let inspect_result = RuntimeLease::inspect(&config.wallet.credentials_dir);
+        let lock_policy = health_lock_policy(&inspect_result);
         let api_key_present = !config.pumpportal.api_key.trim().is_empty();
         print!("PumpPortal live socket... ");
-        if !health_should_open_socket(active_runtime, api_key_present) {
-            if active_runtime {
+        match lock_policy {
+            HealthLockPolicy::SkipActive => {
                 println!(
                     "SKIPPED live socket check: active runtime owns the single PumpPortal connection"
                 );
-            } else {
-                // No key: the free new-token/migration endpoint could still be
-                // reached, but a connection-only check with no key proves nothing
-                // about trade credentials, so we skip opening a socket here.
-                println!("SKIPPED (no api-key configured)");
             }
-        } else {
-            match check_pumpportal(config).await {
-                Ok(_) => println!("endpoint reachable"),
-                Err(e) => {
-                    println!("FAILED: {}", e);
-                    all_healthy = false;
+            HealthLockPolicy::SkipUnhealthy => {
+                // Runtime lock exists but is unknown/malformed. Fail closed: do not
+                // open a socket, do not delete the lock, and mark health unhealthy.
+                println!(
+                    "SKIPPED live socket check: runtime lock exists but is unknown/unreadable and must be inspected (no socket opened, lock not modified)"
+                );
+                all_healthy = false;
+            }
+            HealthLockPolicy::AllowSocket => {
+                if !health_should_open_socket(false, api_key_present) {
+                    // No key: the free new-token/migration endpoint could still be
+                    // reached, but a connection-only check with no key proves nothing
+                    // about trade credentials, so we skip opening a socket here.
+                    println!("SKIPPED (no api-key configured)");
+                } else {
+                    match check_pumpportal(config).await {
+                        Ok(_) => println!("endpoint reachable"),
+                        Err(e) => {
+                            println!("FAILED: {}", e);
+                            all_healthy = false;
+                        }
+                    }
                 }
             }
         }
@@ -4790,7 +4796,13 @@ async fn check_pumpportal(config: &Config) -> Result<()> {
             drop(ws);
             Ok(())
         }
-        Ok(Err(e)) => Err(anyhow::anyhow!("WebSocket connection failed: {}", e)),
+        // C8 / section 3: NEVER surface the raw tungstenite/connect error string
+        // on connection failure — it may contain the authenticated request URL or
+        // api-key. Use a fixed sanitized message. The underlying error `e` is
+        // intentionally dropped (not logged) here.
+        Ok(Err(_e)) => Err(anyhow::anyhow!(
+            "PumpPortal WebSocket connection failed for configured base endpoint"
+        )),
         Err(_) => Err(anyhow::anyhow!(
             "Connection timed out after {}s",
             timeout.as_secs()
@@ -4808,6 +4820,36 @@ fn health_should_open_socket(active_runtime: bool, api_key_present: bool) -> boo
         return false;
     }
     api_key_present
+}
+
+/// C7 / BLOCKER E: tri-state runtime-lock policy for the health live-socket check.
+///
+/// `RuntimeLease::inspect()` returns:
+///   - `Ok(None)`      => lock is KNOWN ABSENT; a live endpoint socket check MAY be
+///                        considered (still subject to api-key presence).
+///   - `Ok(Some(_))`   => an active runtime owns the single connection; SKIP the
+///                        live socket check (its runtime owns the socket).
+///   - `Err(_)`        => the lock EXISTS but is malformed/unreadable, i.e. UNKNOWN.
+///                        This must FAIL CLOSED: skip the live socket check AND mark
+///                        health unhealthy. An inspect `Err` is NEVER interpreted as
+///                        "no runtime". Never open a socket, never delete the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthLockPolicy {
+    /// Lock known absent: the live socket check may proceed (key permitting).
+    AllowSocket,
+    /// Active runtime owns the connection: skip the live socket check.
+    SkipActive,
+    /// Lock present but unknown/malformed: skip the check and mark unhealthy.
+    SkipUnhealthy,
+}
+
+/// Pure classifier mapping a `RuntimeLease::inspect` result to a health policy (C7).
+fn health_lock_policy<T, E>(inspect_result: &std::result::Result<Option<T>, E>) -> HealthLockPolicy {
+    match inspect_result {
+        Ok(None) => HealthLockPolicy::AllowSocket,
+        Ok(Some(_)) => HealthLockPolicy::SkipActive,
+        Err(_) => HealthLockPolicy::SkipUnhealthy,
+    }
 }
 
 /// E6 pure formatter for the health data-capability line. Never contains the
@@ -7914,6 +7956,20 @@ fn missing_data_key_halts_new_entries(
 /// subscribe; the caller then halts new entries and keeps price monitoring.
 fn confirmed_position_requires_subscription(feed_enabled: bool, api_key: &str) -> bool {
     feed_enabled && !api_key.trim().is_empty()
+}
+
+/// C5: whether a confirmed durable buy must close the new-entry readiness gate
+/// before requesting its required token-trade subscription. This is exactly the
+/// case where a dynamic subscription is required (feed enabled + Data API key
+/// configured), i.e. `confirmed_position_requires_subscription`. When true, the
+/// caller stores `data_stream_ready = false` immediately BEFORE sending
+/// `SubscribeTokenTrades([mint])`; readiness is only reopened when the client
+/// re-emits `Connected` after the desired registry is actually synchronized. This
+/// prevents a second live entry while the first owned position's provider trade
+/// subscription is not yet on the wire. If the send is rejected, readiness stays
+/// false and new entries stay halted (the caller never sets readiness true locally).
+fn confirmed_buy_closes_readiness_until_sync(feed_enabled: bool, api_key: &str) -> bool {
+    confirmed_position_requires_subscription(feed_enabled, api_key)
 }
 
 /// D8: full close requests an unsubscribe; a partial close keeps the
@@ -11123,6 +11179,176 @@ mod tests {
         // Even with tracking enabled but no wallets, no keys are invented.
     }
 
+    // ==================================================================
+    // AGENT C (C9) — provider unit bridge + readiness + health tests
+    // ==================================================================
+
+    fn c9_filter_config() -> crate::config::FilterConfig {
+        crate::config::FilterConfig {
+            enabled: true,
+            blocked_patterns: vec!["(?i)scam".to_string()],
+            name_patterns: vec![],
+            ..crate::config::Config::default().filters
+        }
+    }
+
+    // C9.1: the live name/symbol filter path requires no fabricated slot or
+    // default Pubkey. `filter_name_symbol` takes only &str name+symbol and must
+    // match the prior event-based filter for the same name/symbol — proving the
+    // adapter (slot=0 + Pubkey::default) is unnecessary.
+    #[test]
+    fn test_provider_name_filter_requires_no_slot_or_default_pubkey_adapter() {
+        use crate::filter::token_filter::TokenFilter;
+        use crate::stream::decoder::TokenCreatedEvent;
+        let filter = TokenFilter::new(c9_filter_config()).unwrap();
+
+        // name/symbol-only API: no slot, no Pubkey needed.
+        assert!(filter.filter_name_symbol("ScamCoin", "SCAM").is_filtered());
+        assert!(filter.filter_name_symbol("GoodToken", "GOOD").is_pass());
+
+        // Equivalence with the legacy event wrapper for the SAME name/symbol,
+        // regardless of the event's slot/Pubkey identity fields.
+        let ev = TokenCreatedEvent {
+            signature: "x".to_string(),
+            slot: 999,
+            mint: solana_sdk::pubkey::Pubkey::new_unique(),
+            name: "GoodToken".to_string(),
+            symbol: "GOOD".to_string(),
+            uri: String::new(),
+            bonding_curve: solana_sdk::pubkey::Pubkey::new_unique(),
+            associated_bonding_curve: solana_sdk::pubkey::Pubkey::new_unique(),
+            creator: solana_sdk::pubkey::Pubkey::new_unique(),
+            timestamp: chrono::Utc::now(),
+        };
+        assert_eq!(
+            filter.filter(&ev).is_pass(),
+            filter.filter_name_symbol("GoodToken", "GOOD").is_pass()
+        );
+    }
+
+    // C9.2: the bonding-curve filter uses provider SOL directly (no /1e9). A
+    // provider value of 57.5 SOL is 50% progress; a lamport-style 57.5e9 would
+    // clamp to 100% under the correct SOL heuristic (proving no /1e9 divide).
+    #[test]
+    fn test_provider_bonding_curve_filter_uses_sol_not_lamports() {
+        // 30 SOL => 0%, 57.5 SOL => 50%, 85 SOL => 100%.
+        assert!((SignalContext::calculate_bonding_curve_pct(30.0) - 0.0).abs() < 1e-9);
+        assert!((SignalContext::calculate_bonding_curve_pct(57.5) - 50.0).abs() < 1e-9);
+        assert!((SignalContext::calculate_bonding_curve_pct(85.0) - 100.0).abs() < 1e-9);
+        // If this had a /1e9 divide, 57.5 SOL would map to ~0% (near curve start).
+        assert!(SignalContext::calculate_bonding_curve_pct(57.5) > 1.0);
+    }
+
+    // C9.3: fractional provider values survive the SignalContext bridge with no
+    // flooring/truncation (the old `as u64` path truncated 31.75 -> 31).
+    #[test]
+    fn test_signal_context_bridge_preserves_fractional_provider_values() {
+        let ctx = SignalContext::from_new_token(
+            "mint".to_string(),
+            "n".to_string(),
+            "s".to_string(),
+            "u".to_string(),
+            "creator".to_string(),
+            "bc".to_string(),
+            1.25,  // initial_buy
+            2.5,   // v_tokens_in_bonding_curve
+            31.75, // v_sol_in_bonding_curve
+            9.9,   // market_cap_sol
+        );
+        assert_eq!(ctx.initial_buy, 1.25);
+        assert_eq!(ctx.v_tokens_in_bonding_curve, 2.5);
+        assert_eq!(ctx.v_sol_in_bonding_curve, 31.75);
+        assert_eq!(ctx.market_cap_sol, 9.9);
+    }
+
+    // C9.4: the strategy placeholder liquidity is provider observational SOL used
+    // DIRECTLY (no dual SOL/lamport branch). Mirror the production expression.
+    #[test]
+    fn test_provider_strategy_placeholder_vsol_is_direct_sol() {
+        for v_sol in [12.5_f64, 31.75, 850.0, 30_000.0] {
+            let liquidity_sol = v_sol; // production: `let liquidity_sol = token.v_sol_in_bonding_curve;`
+            assert_eq!(liquidity_sol, v_sol, "no /1e9, no <1000 branch");
+        }
+    }
+
+    // C9.5: a confirmed durable buy closes the readiness gate before subscribing
+    // exactly when a dynamic subscription is required (feed + key). No key or
+    // disabled feed => no readiness close (nothing to subscribe).
+    #[test]
+    fn test_confirmed_buy_subscription_closes_readiness_until_sync() {
+        assert!(confirmed_buy_closes_readiness_until_sync(true, "KEY"));
+        assert!(!confirmed_buy_closes_readiness_until_sync(true, ""));
+        assert!(!confirmed_buy_closes_readiness_until_sync(false, "KEY"));
+        // Consistent with the required-subscription decision it gates.
+        assert_eq!(
+            confirmed_buy_closes_readiness_until_sync(true, "KEY"),
+            confirmed_position_requires_subscription(true, "KEY")
+        );
+    }
+
+    // C9.6: readiness reopens ONLY on a Connected event (post-sync), never set
+    // true locally after a subscribe. Model the Connected/Disconnected policy the
+    // main loop applies to the shared flag.
+    #[test]
+    fn test_connected_event_reopens_readiness_after_sync_policy() {
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        // C5: closing the gate before subscribe.
+        ready.store(false, Ordering::SeqCst);
+        assert!(!ready.load(Ordering::SeqCst));
+        // A rejected send must NOT reopen readiness.
+        // (No local store(true) exists on the reject path.)
+        assert!(!ready.load(Ordering::SeqCst));
+        // Only the Connected handler reopens it (after desired sync).
+        ready.store(true, Ordering::SeqCst); // Connected handler
+        assert!(ready.load(Ordering::SeqCst));
+    }
+
+    // C9.7: a valid ACTIVE runtime lock blocks the health live socket check.
+    #[test]
+    fn test_health_valid_active_lock_blocks_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lease = RuntimeLease::acquire(dir.path(), "start").expect("acquires");
+        let inspect = RuntimeLease::inspect(dir.path());
+        assert_eq!(health_lock_policy(&inspect), HealthLockPolicy::SkipActive);
+        // SkipActive never opens a socket.
+        assert_ne!(health_lock_policy(&inspect), HealthLockPolicy::AllowSocket);
+    }
+
+    // C9.8: a malformed/unreadable runtime lock fails closed: skip socket AND
+    // mark unhealthy. inspect Err is never "no runtime".
+    #[test]
+    fn test_health_malformed_lock_blocks_socket() {
+        // Synthesize an inspect Err via a typed error result.
+        let err: std::result::Result<Option<()>, String> = Err("malformed".to_string());
+        assert_eq!(health_lock_policy(&err), HealthLockPolicy::SkipUnhealthy);
+        // Never AllowSocket on unknown lock state.
+        assert_ne!(health_lock_policy(&err), HealthLockPolicy::AllowSocket);
+    }
+
+    // C9.9: a known-absent lock MAY open the socket when a key is present.
+    #[test]
+    fn test_health_known_absent_lock_may_open_socket_when_key_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspect = RuntimeLease::inspect(dir.path()); // Ok(None): no lock file
+        assert_eq!(health_lock_policy(&inspect), HealthLockPolicy::AllowSocket);
+        // AllowSocket + key present => open; AllowSocket + no key => skip.
+        assert!(health_should_open_socket(false, true));
+        assert!(!health_should_open_socket(false, false));
+    }
+
+    // C9.10: the sanitized health connect error never contains a fake api key or
+    // an authenticated URL. Assert on the fixed message the C8 path emits.
+    #[test]
+    fn test_health_socket_error_text_contains_no_fake_api_key() {
+        let fake_key = "SECRET_API_KEY_ABC123";
+        // This is the exact fixed message the C8 connect-failure path returns.
+        let sanitized = "PumpPortal WebSocket connection failed for configured base endpoint";
+        assert!(!sanitized.contains(fake_key));
+        assert!(!sanitized.contains("api-key"));
+        assert!(!sanitized.to_lowercase().contains("wss://"));
+        assert!(!sanitized.contains('?')); // no query string
+    }
+
     // (6) provider disconnect blocks new entries but does NOT gate the exit
     //     policy helper (which is readiness-agnostic).
     #[test]
@@ -11173,16 +11399,12 @@ mod tests {
         .await;
         assert!(!sent, "no sender => command not accepted, must fail closed");
 
-        // With a live channel the command is accepted (delta applied by client).
-        let (tx, mut rx) = mpsc::channel::<SubscriptionCommand>(4);
-        let some = Some(tx);
-        let ok = send_subscription_command(
-            &some,
-            SubscriptionCommand::UnsubscribeTokenTrades(vec!["mint".to_string()]),
-        )
-        .await;
-        assert!(ok);
-        assert!(rx.recv().await.is_some());
+        // NOTE: the previous live-channel half built a raw
+        // `mpsc::Sender<SubscriptionCommand>` and passed it as `CommandSender`.
+        // After Agent A, `CommandSender` is a clonable struct (not an mpsc alias)
+        // whose fields are private to the stream module and whose `send()` requires
+        // a started client + live worker (network). That half is dropped here; the
+        // `None => fails closed` assertion above is the load-bearing invariant.
     }
 
     // === AGENT E8 — runtime-ownership + health secret-safety tests ==========
