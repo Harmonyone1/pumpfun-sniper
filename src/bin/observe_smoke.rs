@@ -131,6 +131,88 @@ fn smoke_passes(
         && counters.hypothetical_quote_successes >= 1
 }
 
+/// Pure early-termination policy. Only evaluated at a receive quiet point (a recv
+/// timeout with no already-queued event), so a queued fail-closed event is always
+/// processed first. Requires the stream currently connected and zero fail-closed
+/// counters, so we never early-PASS right after a known failure event.
+fn early_success_candidate(
+    target_new_tokens: usize,
+    stream_connected: bool,
+    counters: &Counters,
+) -> bool {
+    stream_connected
+        && counters.provider_errors == 0
+        && counters.unexpected_trade_events == 0
+        && counters.new_token_events >= target_new_tokens as u64
+        && counters.market_snapshot_successes >= 1
+        && counters.hypothetical_quote_successes >= 1
+}
+
+/// Control-event classification for the nonblocking final drain. Separate from the
+/// main loop's rich NewToken handling (which does async RPC/quote work); this only
+/// mutates counters/connectivity and never performs I/O or prints provider fields.
+enum TerminalKind {
+    Connected,
+    Disconnected,
+    Error,
+    Trade,
+    Migration,
+    NewToken,
+}
+
+/// Map an event to its terminal kind (no ownership of provider payloads needed).
+fn terminal_kind_of(event: &PumpPortalEvent) -> TerminalKind {
+    match event {
+        PumpPortalEvent::Connected => TerminalKind::Connected,
+        PumpPortalEvent::Disconnected => TerminalKind::Disconnected,
+        PumpPortalEvent::Error(_) => TerminalKind::Error,
+        PumpPortalEvent::Trade(_) => TerminalKind::Trade,
+        PumpPortalEvent::Migration(_) => TerminalKind::Migration,
+        PumpPortalEvent::NewToken(_) => TerminalKind::NewToken,
+    }
+}
+
+/// Pure application of a terminal-kind to observed state. No I/O, no printing.
+fn apply_terminal_kind(kind: TerminalKind, stream_connected: &mut bool, counters: &mut Counters) {
+    match kind {
+        TerminalKind::Connected => {
+            counters.connected_events += 1;
+            *stream_connected = true;
+        }
+        TerminalKind::Disconnected => {
+            counters.disconnect_events += 1;
+            *stream_connected = false;
+        }
+        TerminalKind::Error => {
+            counters.provider_errors += 1;
+        }
+        TerminalKind::Trade => {
+            counters.unexpected_trade_events += 1;
+        }
+        TerminalKind::Migration => {
+            counters.migration_events += 1;
+        }
+        TerminalKind::NewToken => {
+            // The observation window is over: count it, but launch NO RPC/market work.
+            counters.new_token_events += 1;
+        }
+    }
+}
+
+/// Nonblocking drain of events already delivered to the harness channel. Consumes
+/// only what is already queued (never waits for new events), so a queued
+/// Disconnected / provider Error / unexpected Trade is reflected in state/counters
+/// before the final PASS decision. No RPC, no quote calls, no provider output.
+fn drain_queued_terminal_events(
+    event_rx: &mut mpsc::Receiver<PumpPortalEvent>,
+    stream_connected: &mut bool,
+    counters: &mut Counters,
+) {
+    while let Ok(event) = event_rx.try_recv() {
+        apply_terminal_kind(terminal_kind_of(&event), stream_connected, counters);
+    }
+}
+
 /// Confirmed-state lag retry: attempt a fresh snapshot at 0/250/500/1000ms.
 /// Returns the first successful snapshot, or None if all attempts fail. Read-only.
 async fn snapshot_with_retry(
@@ -245,33 +327,38 @@ async fn main() -> Result<()> {
     let mut stream_connected = false;
 
     loop {
+        let now = Instant::now();
         // Stop when the overall window closes.
-        if Instant::now() >= overall_deadline {
-            break;
-        }
-        // Early success: enough new tokens AND at least one snapshot + one quote,
-        // AND the stream is currently connected (no unresolved disconnect).
-        if stream_connected
-            && counters.new_token_events >= target_new_tokens as u64
-            && counters.market_snapshot_successes >= 1
-            && counters.hypothetical_quote_successes >= 1
-        {
+        if now >= overall_deadline {
             break;
         }
         // Fail fast if never connected within the initial window.
-        if !ever_connected && Instant::now() >= connect_deadline {
+        if !ever_connected && now >= connect_deadline {
             return Err(anyhow!(
                 "no PumpPortal Connected event within {CONNECT_DEADLINE_SECS}s"
             ));
         }
 
-        let recv = tokio::time::timeout(Duration::from_millis(500), event_rx.recv()).await;
-        let event = match recv {
+        // Bounded wait, capped by the remaining window. If an event is ALREADY
+        // queued, recv returns it immediately, so early-success can never run
+        // ahead of a queued fail-closed event.
+        let remaining = overall_deadline.saturating_duration_since(now);
+        let wait = remaining.min(Duration::from_millis(500));
+        let event = match tokio::time::timeout(wait, event_rx.recv()).await {
             Ok(Some(ev)) => ev,
-            // Timeout: loop again to re-check deadlines.
-            Err(_) => continue,
-            // Channel closed: the worker is gone; stop observing.
-            Ok(None) => break,
+            // Channel closed: fail-closed for connectivity, then stop observing.
+            Ok(None) => {
+                stream_connected = false;
+                break;
+            }
+            // Quiet point (no queued event during this window): ONLY here may
+            // early success be evaluated.
+            Err(_) => {
+                if early_success_candidate(target_new_tokens, stream_connected, &counters) {
+                    break;
+                }
+                continue;
+            }
         };
 
         match event {
@@ -326,9 +413,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --- Clean shutdown. Give the worker a brief grace, then drop the lease. ---
+    // --- Drain any events already queued (e.g. a Disconnected / Error / Trade
+    // that arrived while the last NewToken's snapshot+quote RPC work ran) so a
+    // known fail-closed event can't be bypassed. Nonblocking; no RPC. ---
+    drain_queued_terminal_events(&mut event_rx, &mut stream_connected, &mut counters);
+
+    // --- Clean shutdown. Give the worker a brief grace, then a second drain
+    // (stronger), then drop the lease. ---
     client.stop();
     tokio::time::sleep(Duration::from_millis(250)).await;
+    drain_queued_terminal_events(&mut event_rx, &mut stream_connected, &mut counters);
 
     let rpc_mainnet = genesis.to_string() == MAINNET_GENESIS;
     let result_pass = smoke_passes(rpc_mainnet, current_slot, stream_connected, &counters);
@@ -601,5 +695,73 @@ mod tests {
         let plan = free_only_plan();
         assert_eq!(plan.token_trades.len(), 0);
         assert_eq!(plan.account_trades.len(), 0);
+    }
+
+    #[test]
+    fn test_early_success_candidate_requires_clean_connected_state() {
+        let counters = data_criteria_met();
+        // Connected + all data criteria + zero errors/trades => candidate true.
+        assert!(early_success_candidate(1, true, &counters));
+        // Not currently connected => false.
+        assert!(!early_success_candidate(1, false, &counters));
+        // A provider error present => false (do not early-terminate after failure).
+        let mut c_err = data_criteria_met();
+        c_err.provider_errors = 1;
+        assert!(!early_success_candidate(1, true, &c_err));
+        // An unexpected trade present => false.
+        let mut c_trade = data_criteria_met();
+        c_trade.unexpected_trade_events = 1;
+        assert!(!early_success_candidate(1, true, &c_trade));
+    }
+
+    #[test]
+    fn test_queued_disconnect_drain_blocks_pass() {
+        // Counters that would otherwise PASS, connected at the top.
+        let mut counters = data_criteria_met();
+        let mut stream_connected = true;
+        // A Disconnected is already sitting in the channel.
+        let (tx, mut rx) = mpsc::channel::<PumpPortalEvent>(4);
+        tx.try_send(PumpPortalEvent::Disconnected).unwrap();
+
+        drain_queued_terminal_events(&mut rx, &mut stream_connected, &mut counters);
+
+        assert!(
+            !stream_connected,
+            "queued disconnect must clear connectivity"
+        );
+        assert_eq!(counters.disconnect_events, 1);
+        assert!(
+            !smoke_passes(true, 42, stream_connected, &counters),
+            "a queued unresolved disconnect must block PASS"
+        );
+    }
+
+    #[test]
+    fn test_queued_unexpected_trade_blocks_pass() {
+        // Uses the pure control-event classifier so no fake TradeEvent is needed.
+        let mut counters = data_criteria_met();
+        let mut stream_connected = true;
+        apply_terminal_kind(TerminalKind::Trade, &mut stream_connected, &mut counters);
+        assert_eq!(counters.unexpected_trade_events, 1);
+        assert!(
+            !smoke_passes(true, 42, stream_connected, &counters),
+            "a queued unexpected trade must block PASS"
+        );
+    }
+
+    #[test]
+    fn test_channel_closed_is_fail_closed_for_connection() {
+        // A closed channel (sender dropped) yields Ok(None); the harness must set
+        // stream_connected=false rather than preserve a stale true.
+        let (tx, mut rx) = mpsc::channel::<PumpPortalEvent>(1);
+        drop(tx);
+        let mut stream_connected = true;
+        let mut counters = data_criteria_met();
+        // Draining a closed+empty channel makes no state change...
+        drain_queued_terminal_events(&mut rx, &mut stream_connected, &mut counters);
+        // ...but the loop's Ok(None) arm is what clears connectivity. Model that
+        // fail-closed transition explicitly here (the production loop does the same).
+        stream_connected = false;
+        assert!(!smoke_passes(true, 42, stream_connected, &counters));
     }
 }
