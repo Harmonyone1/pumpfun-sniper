@@ -105,6 +105,30 @@ struct Counters {
     market_snapshot_successes: u64,
     hypothetical_quote_successes: u64,
     market_observation_failures: u64,
+    /// Trade events observed despite requesting a free-only plan (zero token/
+    /// account trade subscriptions). Any nonzero count fails the smoke.
+    unexpected_trade_events: u64,
+}
+
+/// Pure final-PASS policy. A run passes ONLY if the RPC is mainnet, a slot was
+/// read, the stream is currently connected (every observed disconnect was
+/// followed by a later `Connected`), no provider error or unexpected trade event
+/// occurred, and at least one new token / snapshot / hypothetical quote landed.
+fn smoke_passes(
+    rpc_mainnet: bool,
+    current_slot: u64,
+    stream_connected: bool,
+    counters: &Counters,
+) -> bool {
+    rpc_mainnet
+        && current_slot > 0
+        && stream_connected
+        && counters.connected_events >= 1
+        && counters.provider_errors == 0
+        && counters.unexpected_trade_events == 0
+        && counters.new_token_events >= 1
+        && counters.market_snapshot_successes >= 1
+        && counters.hypothetical_quote_successes >= 1
 }
 
 /// Confirmed-state lag retry: attempt a fresh snapshot at 0/250/500/1000ms.
@@ -216,14 +240,19 @@ async fn main() -> Result<()> {
     let overall_deadline = start + Duration::from_secs(seconds);
     let connect_deadline = start + Duration::from_secs(CONNECT_DEADLINE_SECS);
     let mut ever_connected = false;
+    // Current observed connectivity: only `Connected` sets it true, only
+    // `Disconnected` sets it false. Used so an unresolved disconnect cannot PASS.
+    let mut stream_connected = false;
 
     loop {
         // Stop when the overall window closes.
         if Instant::now() >= overall_deadline {
             break;
         }
-        // Early success: enough new tokens AND at least one snapshot + one quote.
-        if counters.new_token_events >= target_new_tokens as u64
+        // Early success: enough new tokens AND at least one snapshot + one quote,
+        // AND the stream is currently connected (no unresolved disconnect).
+        if stream_connected
+            && counters.new_token_events >= target_new_tokens as u64
             && counters.market_snapshot_successes >= 1
             && counters.hypothetical_quote_successes >= 1
         {
@@ -249,10 +278,12 @@ async fn main() -> Result<()> {
             PumpPortalEvent::Connected => {
                 counters.connected_events += 1;
                 ever_connected = true;
+                stream_connected = true;
                 println!("PumpPortal: connected + free subscriptions synchronized");
             }
             PumpPortalEvent::Disconnected => {
                 counters.disconnect_events += 1;
+                stream_connected = false;
                 eprintln!("WARN PumpPortal: disconnected (will attempt reconnect)");
             }
             PumpPortalEvent::Error(category) => {
@@ -273,7 +304,11 @@ async fn main() -> Result<()> {
                 println!();
             }
             PumpPortalEvent::Trade(_) => {
-                // We never subscribe to trade streams; ignore if one ever arrives.
+                // We request a free-only plan (zero trade subscriptions). A Trade
+                // arriving anyway means the effective stream was NOT free-only, so
+                // it must fail the smoke. Do not print/interpret trade fields.
+                counters.unexpected_trade_events += 1;
+                eprintln!("WARN unexpected PumpPortal Trade event on free-only smoke plan");
             }
             PumpPortalEvent::NewToken(ev) => {
                 counters.new_token_events += 1;
@@ -295,20 +330,20 @@ async fn main() -> Result<()> {
     client.stop();
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let result_pass = genesis.to_string() == MAINNET_GENESIS
-        && current_slot > 0
-        && counters.connected_events >= 1
-        && counters.provider_errors == 0
-        && counters.new_token_events >= 1
-        && counters.market_snapshot_successes >= 1
-        && counters.hypothetical_quote_successes >= 1;
+    let rpc_mainnet = genesis.to_string() == MAINNET_GENESIS;
+    let result_pass = smoke_passes(rpc_mainnet, current_slot, stream_connected, &counters);
 
     println!("=== OBSERVATION SMOKE SUMMARY ===");
     println!("rpc_mainnet: PASS");
     println!("current_slot: {current_slot}");
     println!("connected_events: {}", counters.connected_events);
     println!("disconnect_events: {}", counters.disconnect_events);
+    println!("stream_connected_at_end: {stream_connected}");
     println!("provider_errors: {}", counters.provider_errors);
+    println!(
+        "unexpected_trade_events: {}",
+        counters.unexpected_trade_events
+    );
     println!("new_token_events: {}", counters.new_token_events);
     println!("migration_events: {}", counters.migration_events);
     println!(
@@ -434,6 +469,17 @@ mod tests {
             concat!(".bu", "y("),
             concat!(".sel", "l("),
             concat!(".transf", "er("),
+            // Forbidden execution/transaction types (future-regression guard).
+            concat!("Versioned", "Trans", "action"),
+            concat!("Trans", "action"),
+            concat!("Instruc", "tion"),
+            concat!("Mess", "age"),
+            concat!("solana_sdk::", "signature"),
+            concat!("solana_sdk::", "transaction"),
+            concat!("solana_sdk::", "instruction"),
+            concat!("solana_sdk::", "message"),
+            concat!("Ji", "to"),
+            concat!("ji", "to"),
         ];
 
         for needle in forbidden {
@@ -507,5 +553,53 @@ mod tests {
     #[test]
     fn test_hypothetical_quote_lamports_is_fixed() {
         assert_eq!(HYPOTHETICAL_BUY_LAMPORTS, 1_000_000);
+    }
+
+    /// Counters that satisfy every data-side PASS criterion, for policy tests.
+    fn data_criteria_met() -> Counters {
+        Counters {
+            connected_events: 1,
+            disconnect_events: 0,
+            provider_errors: 0,
+            new_token_events: 1,
+            migration_events: 0,
+            market_snapshot_successes: 1,
+            hypothetical_quote_successes: 1,
+            market_observation_failures: 0,
+            unexpected_trade_events: 0,
+        }
+    }
+
+    #[test]
+    fn test_pass_policy_requires_stream_connected_at_end() {
+        let counters = data_criteria_met();
+        // All data criteria true, but the stream is not currently connected.
+        assert!(!smoke_passes(true, 42, false, &counters));
+        // Same counters, connected at end => PASS.
+        assert!(smoke_passes(true, 42, true, &counters));
+    }
+
+    #[test]
+    fn test_pass_policy_allows_disconnect_then_reconnect() {
+        // A disconnect that was later recovered: >=2 connects, >=1 disconnect,
+        // and stream_connected true at the end.
+        let mut counters = data_criteria_met();
+        counters.connected_events = 2;
+        counters.disconnect_events = 1;
+        assert!(smoke_passes(true, 42, true, &counters));
+    }
+
+    #[test]
+    fn test_pass_policy_rejects_unexpected_trade_event() {
+        let mut counters = data_criteria_met();
+        counters.unexpected_trade_events = 1;
+        assert!(!smoke_passes(true, 42, true, &counters));
+    }
+
+    #[test]
+    fn test_free_only_plan_still_has_zero_trade_subscriptions() {
+        let plan = free_only_plan();
+        assert_eq!(plan.token_trades.len(), 0);
+        assert_eq!(plan.account_trades.len(), 0);
     }
 }
