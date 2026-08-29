@@ -287,9 +287,11 @@ impl EnrichmentWorker {
                 String::new(),
                 request.creator.clone(),
                 String::new(),
-                0,
-                0,
-                0,
+                // Provider observational fields are f64 (SOL / UI units, not raw);
+                // enrichment builds a zeroed minimal context.
+                0.0,
+                0.0,
+                0.0,
                 0.0,
             );
 

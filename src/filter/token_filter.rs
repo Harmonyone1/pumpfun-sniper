@@ -109,8 +109,13 @@ impl TokenFilter {
         })
     }
 
-    /// Filter a newly created token
-    pub fn filter(&self, event: &TokenCreatedEvent) -> FilterResult {
+    /// Filter a token by name and symbol only.
+    ///
+    /// This is the canonical regex/name/symbol matching entry point. It lets the
+    /// live PumpPortal path filter on the provider-validated name/symbol WITHOUT
+    /// fabricating a slot or synthetic Pubkeys. Identity validation stays in the
+    /// stream parser; this only inspects text.
+    pub fn filter_name_symbol(&self, name: &str, symbol: &str) -> FilterResult {
         // Check if filtering is enabled
         if !self.config.enabled {
             return FilterResult::Pass;
@@ -118,10 +123,10 @@ impl TokenFilter {
 
         // Check blocked patterns first
         for pattern in &self.blocked_patterns {
-            if pattern.is_match(&event.name) || pattern.is_match(&event.symbol) {
+            if pattern.is_match(name) || pattern.is_match(symbol) {
                 debug!(
                     "Token {} ({}) blocked by pattern: {}",
-                    event.name, event.symbol, pattern
+                    name, symbol, pattern
                 );
                 return FilterResult::Filtered(FilterReason::BlockedName(pattern.to_string()));
             }
@@ -132,12 +137,12 @@ impl TokenFilter {
             let matches = self
                 .name_patterns
                 .iter()
-                .any(|p| p.is_match(&event.name) || p.is_match(&event.symbol));
+                .any(|p| p.is_match(name) || p.is_match(symbol));
 
             if !matches {
                 debug!(
                     "Token {} ({}) doesn't match required patterns",
-                    event.name, event.symbol
+                    name, symbol
                 );
                 return FilterResult::Filtered(FilterReason::NamePatternMismatch);
             }
@@ -146,8 +151,16 @@ impl TokenFilter {
         // Note: Dev holdings and liquidity checks would require RPC calls
         // to fetch on-chain data. These are checked separately.
 
-        debug!("Token {} ({}) passed filters", event.name, event.symbol);
+        debug!("Token {} ({}) passed filters", name, symbol);
         FilterResult::Pass
+    }
+
+    /// Filter a newly created token.
+    ///
+    /// Compatibility wrapper: `TokenFilter::filter` only ever consulted the token
+    /// name and symbol, so it now delegates to `filter_name_symbol`.
+    pub fn filter(&self, event: &TokenCreatedEvent) -> FilterResult {
+        self.filter_name_symbol(&event.name, &event.symbol)
     }
 
     /// Check dev holdings percentage
@@ -325,5 +338,46 @@ mod tests {
 
         assert!(filter.check_dev_holdings(15.0).is_pass());
         assert!(filter.check_dev_holdings(25.0).is_filtered());
+    }
+
+    #[test]
+    fn test_filter_name_symbol_matches_existing_event_filter() {
+        let filter = TokenFilter::new(test_config()).unwrap();
+
+        // Passing case
+        let ev = test_event("GoodToken", "GOOD");
+        assert_eq!(
+            filter.filter(&ev).is_pass(),
+            filter.filter_name_symbol(&ev.name, &ev.symbol).is_pass()
+        );
+
+        // Blocked case
+        let ev = test_event("ScamCoin", "SCAM");
+        assert_eq!(
+            filter.filter(&ev).is_filtered(),
+            filter.filter_name_symbol(&ev.name, &ev.symbol).is_filtered()
+        );
+        assert!(filter.filter_name_symbol(&ev.name, &ev.symbol).is_filtered());
+    }
+
+    #[test]
+    fn test_filter_name_symbol_blocked_pattern() {
+        let filter = TokenFilter::new(test_config()).unwrap();
+        // "rug" is a blocked pattern (case-insensitive).
+        let result = filter.filter_name_symbol("SuperRugPull", "RUGX");
+        assert!(result.is_filtered());
+    }
+
+    #[test]
+    fn test_filter_name_symbol_required_pattern() {
+        let mut config = test_config();
+        // Require the name/symbol to contain "cat" (case-insensitive).
+        config.name_patterns = vec!["(?i)cat".to_string()];
+        let filter = TokenFilter::new(config).unwrap();
+
+        // Matches required pattern -> pass
+        assert!(filter.filter_name_symbol("CatCoin", "CAT").is_pass());
+        // Does not match required pattern -> filtered
+        assert!(filter.filter_name_symbol("DogCoin", "DOG").is_filtered());
     }
 }

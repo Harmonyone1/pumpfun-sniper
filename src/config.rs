@@ -745,6 +745,16 @@ impl Config {
             }
         }
 
+        // PumpPortal: ws_url is the BASE URL only; the secret must come from
+        // pumpportal.api_key, never embedded in the URL query. Reject any URL
+        // that carries a credential-bearing query parameter.
+        if url_query_has_credential(&self.pumpportal.ws_url) {
+            anyhow::bail!(
+                "pumpportal.ws_url must not contain an api-key/credential query; \
+                 set the secret via pumpportal.api_key instead"
+            );
+        }
+
         // Warn about backpressure policy
         if self.backpressure.drop_policy == DropPolicy::Block {
             tracing::warn!(
@@ -792,7 +802,7 @@ impl Config {
             self.jito.regions,
             self.jito.tip_percentile,
             self.pumpportal.enabled,
-            self.pumpportal.ws_url,
+            mask_url(&self.pumpportal.ws_url),
             self.pumpportal.use_for_trading,
             if self.pumpportal.api_key.is_empty() {
                 "(not set)"
@@ -813,13 +823,30 @@ impl Config {
     }
 }
 
-/// Mask URL for display (hide API keys in query params)
+/// Mask URL for display (hide API keys in query params, e.g. the Helius key
+/// embedded in an RPC URL).
 fn mask_url(url: &str) -> String {
     if let Some(idx) = url.find('?') {
         format!("{}?***", &url[..idx])
     } else {
         url.to_string()
     }
+}
+
+/// Return true if a URL's query string carries an obvious credential-bearing
+/// parameter (`api-key`, `api_key`, `apikey`, `key`, `token`, ...).
+fn url_query_has_credential(url: &str) -> bool {
+    let query = match url.split_once('?') {
+        Some((_, q)) => q,
+        None => return false,
+    };
+    query.split('&').any(|pair| {
+        let name = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            "api-key" | "api_key" | "apikey" | "key" | "token" | "auth" | "access_token"
+        )
+    })
 }
 
 impl Default for Config {
@@ -945,5 +972,42 @@ mod tests {
             mask_url("https://api.example.com"),
             "https://api.example.com"
         );
+    }
+
+    #[test]
+    fn test_default_pumpportal_ws_url_is_base_only() {
+        assert_eq!(
+            default_pumpportal_ws_url(),
+            "wss://pumpportal.fun/api/data"
+        );
+        assert!(!url_query_has_credential(&default_pumpportal_ws_url()));
+    }
+
+    #[test]
+    fn test_url_query_has_credential_detects_embedded_key() {
+        assert!(url_query_has_credential(
+            "wss://pumpportal.fun/api/data?api-key=secret"
+        ));
+        assert!(url_query_has_credential(
+            "https://rpc.helius.xyz/?api_key=secret"
+        ));
+        assert!(!url_query_has_credential("wss://pumpportal.fun/api/data"));
+    }
+
+    #[test]
+    fn test_embedded_ws_url_key_rejected_by_validation() {
+        let mut config = Config::default();
+        config.pumpportal.ws_url = "wss://pumpportal.fun/api/data?api-key=leaked".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_masked_display_hides_secrets() {
+        let mut config = Config::default();
+        config.pumpportal.api_key = "super-secret-key".to_string();
+        config.rpc.endpoint = "https://mainnet.helius-rpc.com/?api-key=helius-secret".to_string();
+        let display = config.masked_display();
+        assert!(!display.contains("super-secret-key"));
+        assert!(!display.contains("helius-secret"));
     }
 }

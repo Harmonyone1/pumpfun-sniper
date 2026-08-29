@@ -2,7 +2,8 @@
 //!
 //! Supports:
 //! - Jito ShredStream (fastest, requires approval) - enable with `shredstream` feature
-//! - PumpPortal WebSocket (free, no approval needed)
+//! - PumpPortal WebSocket (new token + migration: free; token/account trade
+//!   streams: authenticated + metered)
 
 pub mod backpressure;
 pub mod decoder;
@@ -12,7 +13,10 @@ pub mod pumpportal;
 pub mod shredstream;
 
 pub use backpressure::{BackpressureChannel, DropPolicy};
-pub use pumpportal::{PumpPortalClient, PumpPortalConfig, PumpPortalEvent};
+pub use pumpportal::{
+    MigrationEvent, PumpPortalClient, PumpPortalConfig, PumpPortalEvent, PumpPortalSubscriptionPlan,
+    SubscriptionCommand,
+};
 
 #[cfg(feature = "shredstream")]
 pub use shredstream::ShredStreamClient;

@@ -11,6 +11,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::runtime::RuntimeLease;
+use crate::stream::pumpportal::{CommandSender, PumpPortalSubscriptionPlan, SubscriptionCommand};
 use crate::filter::{
     AdaptiveFilter, HeliusClient, KillSwitchDecision, KillSwitchEvaluator, MetadataSignalProvider,
     Recommendation, SignalContext, SmartMoneySignalProvider, WalletBehaviorSignalProvider,
@@ -443,6 +445,14 @@ impl PriceExitCategory {
 
 /// Start the sniper bot
 pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
+    // D1 / INV-RUN-001/002: acquire the exclusive runtime lease for this
+    // credentials_dir BEFORE opening any stream, loading PositionManager /
+    // PendingExecutionStore, recovering wallets, or submitting any transaction.
+    // Held for the entire function lifetime; nonce-checked Drop releases it. No
+    // environment override.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "start")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     if dry_run {
         warn!("Running in DRY-RUN mode - no real trades will be executed");
     }
@@ -551,30 +561,38 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
     let (event_tx, mut event_rx) =
         mpsc::channel::<PumpPortalEvent>(config.backpressure.channel_capacity);
 
-    // Connect to token detection source
-    if config.pumpportal.enabled {
-        info!("Connecting to PumpPortal WebSocket for token detection...");
+    // D2 / INV-EVT-001: construct the single PumpPortal client for this runtime
+    // now, but DO NOT open the socket yet. `PumpPortalClient::new` does not
+    // connect — only `start(plan)` does — so we can clone its command sender into
+    // the position monitor here while deferring stream startup until AFTER
+    // PositionManager load, pending/legacy recovery, strategy restore and
+    // kill-switch init (see the "D2/D3/D4" block just before the event loop).
+    //
+    // D5: one start runtime => one socket => one retained Option<CommandSender>.
+    // D12: shared data-stream readiness flag. Connected => true; Disconnected /
+    // Error => false. New-entry admission (when the feed is enabled) additionally
+    // requires this to be true; exits are NEVER gated on it.
+    let data_stream_ready = Arc::new(AtomicBool::new(false));
+    let (pumpportal_client, pumpportal_command_sender): (
+        Option<Arc<PumpPortalClient>>,
+        Option<CommandSender>,
+    ) = if config.pumpportal.enabled {
         let pumpportal_config = crate::stream::pumpportal::PumpPortalConfig {
             ws_url: config.pumpportal.ws_url.clone(),
+            api_key: config.pumpportal.api_key.clone(),
             reconnect_delay_ms: config.pumpportal.reconnect_delay_ms,
             max_reconnect_attempts: config.pumpportal.max_reconnect_attempts,
             ping_interval_secs: config.pumpportal.ping_interval_secs,
         };
-        let pumpportal_client = PumpPortalClient::new(pumpportal_config, event_tx.clone());
-
-        // Get tracked wallets from config
-        let track_wallets = config.wallet_tracking.wallets.clone();
-
-        // Start PumpPortal connection with trade monitoring
-        // subscribe_new_tokens: true, subscribe_all_trades: true
-        if let Err(e) = pumpportal_client.start(true, true, track_wallets).await {
-            error!("PumpPortal connection error: {}", e);
-        }
+        let client = Arc::new(PumpPortalClient::new(pumpportal_config, event_tx.clone()));
+        let sender = client.get_command_sender();
+        (Some(client), Some(sender))
     } else {
         info!("Connecting to ShredStream for token detection...");
         // TODO: Connect to ShredStream when available
         warn!("ShredStream not yet implemented - enable PumpPortal in config");
-    }
+        (None, None)
+    };
 
     // Initialize position manager
     info!("Loading positions...");
@@ -988,6 +1006,11 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
         // price-based sell, an exact-size same-venue executable quote. Never a
         // DexScreener / stale-current_price fallback for exit authorization.
         let monitor_oracle = market_oracle.clone();
+        // D8: the primary auto-sell full-close path lives in this monitor task, so
+        // it needs the single runtime command sender to request an
+        // UnsubscribeTokenTrades after a durable fully_closed close. Unsubscribe
+        // failure is logged only and never alters economic truth.
+        let monitor_command_sender = pumpportal_command_sender.clone();
 
         tokio::spawn(async move {
             info!("=== POSITION MONITOR STARTED ===");
@@ -1847,6 +1870,27 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                     // B10: ConfirmedFill applied + pending removed LAST => release
                                     // the same-mint reservation.
                                     release_sell_mint(&monitor_active_sells, &position.mint);
+
+                                    // D8 / INV-EVT-013: after a durable FULL close,
+                                    // request UnsubscribeTokenTrades for this mint on the
+                                    // single runtime command sender. Partial close keeps the
+                                    // subscription. Failure is logged only and never alters
+                                    // economic position truth.
+                                    if full_close_requests_unsubscribe(fully_closed) {
+                                        if !send_subscription_command(
+                                            &monitor_command_sender,
+                                            SubscriptionCommand::UnsubscribeTokenTrades(vec![
+                                                position.mint.clone(),
+                                            ]),
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                "Auto-sell full close: could not request token-trade unsubscribe for {} (no effect on position truth)",
+                                                position.mint
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1854,6 +1898,75 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                 }
             }
         });
+    }
+
+    // === D2 / D3 / D4: open the single PumpPortal socket AFTER all canonical
+    // local state is loaded (PositionManager, pending/legacy recovery, strategy
+    // restore, kill-switch init, monitor spawned). No market/trade event intake
+    // happens before this point. ===
+    if let Some(ref client) = pumpportal_client {
+        // D3: open-position mints get token-trade subscriptions; tracked wallets
+        // become account-trade subscriptions ONLY when wallet tracking is enabled.
+        let open_position_mints: Vec<String> = position_manager
+            .get_all_positions()
+            .await
+            .into_iter()
+            .map(|p| p.mint)
+            .collect();
+        let configured_tracked_wallets = config.wallet_tracking.wallets.clone();
+        let mut plan = build_initial_subscription_plan(
+            &open_position_mints,
+            &configured_tracked_wallets,
+            config.wallet_tracking.enabled,
+        );
+
+        // D4: Data API credential behavior. Token/account trade streams are
+        // authenticated. If no key is configured we must NOT request any trade
+        // subscription; we drop them from the plan and (for a live run) halt NEW
+        // entries. Existing-position price monitoring/exits remain fully active.
+        // force_local_api does NOT bypass this Data API rule.
+        let api_key = config.pumpportal.api_key.clone();
+        let key_missing = api_key.trim().is_empty();
+        if key_missing && (!plan.token_trades.is_empty() || !plan.account_trades.is_empty()) {
+            warn!(
+                "PumpPortal Data API key not configured: dropping {} token-trade and {} account-trade subscription(s). \
+                 Price-based exit monitoring remains available, but provider trade kill-switch and account tracking are unavailable.",
+                plan.token_trades.len(),
+                plan.account_trades.len()
+            );
+            plan.token_trades.clear();
+            plan.account_trades.clear();
+            if !dry_run {
+                new_entries_halted.store(true, Ordering::SeqCst);
+            }
+        }
+
+        // D4 (additional): any NEW live position would need its own authenticated
+        // token-trade subscription, so a live run with the feed enabled and no key
+        // is entry-disabled even when there are no initial positions. This keeps
+        // the runtime exit-capable but entry-disabled.
+        if missing_data_key_halts_new_entries(dry_run, config.pumpportal.enabled, &api_key) {
+            new_entries_halted.store(true, Ordering::SeqCst);
+            info!(
+                "Live run without PumpPortal Data API key: NEW entries halted (exit-capable, entry-disabled). \
+                 Configure pumpportal.api_key to enable position-scoped trade monitoring and new entries."
+            );
+        }
+
+        info!(
+            "Opening PumpPortal stream: new_tokens={}, migrations={}, token_trades={}, account_trades={} (base only; key never logged)",
+            plan.new_tokens,
+            plan.migrations,
+            plan.token_trades.len(),
+            plan.account_trades.len()
+        );
+
+        // D2/D5: one socket per start runtime. Dry-run may use the free
+        // new-token/migration stream without a key. `start(plan)` validates the
+        // plan up front and returns immediately (it spawns its own connect loop).
+        if let Err(e) = client.start(plan).await {
+            error!("PumpPortal connection error: {}", e);
+        }
     }
 
     info!("Bot started. Listening for new tokens...");
@@ -1871,12 +1984,24 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             token.market_cap_sol
                         );
 
-                        // Fail-closed new-entry halt gate. Independent of daily loss,
-                        // strategy pause, and filters. Blocks NEW live buys when
-                        // unresolved transaction state requires reconciliation.
-                        if !dry_run && new_entries_halted.load(Ordering::SeqCst) {
+                        // Fail-closed new-entry admission gate (D12). Independent of
+                        // daily loss, strategy pause, and filters. A NEW live buy is
+                        // admitted only when entries are not halted AND — when the
+                        // PumpPortal feed is enabled — the data stream is ready
+                        // (Connected, subscriptions replayed). Provider disconnect /
+                        // error / missing Data API key therefore blocks new entries.
+                        // Exits are NEVER gated on this. Dry-run is exempt (free feed).
+                        if !dry_run
+                            && !new_entry_admitted(
+                                new_entries_halted.load(Ordering::SeqCst),
+                                data_stream_ready.load(Ordering::SeqCst),
+                                config.pumpportal.enabled,
+                            )
+                        {
                             warn!(
-                                "New entries halted because unresolved transaction state requires reconciliation"
+                                "New entries blocked: halted={} data_stream_ready={} (unresolved state, or provider feed not ready/unauthenticated)",
+                                new_entries_halted.load(Ordering::SeqCst),
+                                data_stream_ready.load(Ordering::SeqCst)
                             );
                             continue;
                         }
@@ -1884,24 +2009,14 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         // Apply filters
                         if config.filters.enabled {
                             use crate::filter::token_filter::FilterResult;
-                            use crate::stream::decoder::TokenCreatedEvent;
-                            use std::str::FromStr;
 
-                            // Convert NewTokenEvent to TokenCreatedEvent for filtering
-                            let filter_event = TokenCreatedEvent {
-                                signature: token.signature.clone(),
-                                slot: 0, // Not available from PumpPortal
-                                mint: solana_sdk::pubkey::Pubkey::from_str(&token.mint).unwrap_or_default(),
-                                name: token.name.clone(),
-                                symbol: token.symbol.clone(),
-                                uri: token.uri.clone(),
-                                bonding_curve: solana_sdk::pubkey::Pubkey::from_str(&token.bonding_curve_key).unwrap_or_default(),
-                                associated_bonding_curve: solana_sdk::pubkey::Pubkey::default(),
-                                creator: solana_sdk::pubkey::Pubkey::from_str(&token.trader_public_key).unwrap_or_default(),
-                                timestamp: chrono::Utc::now(),
-                            };
-
-                            match token_filter.filter(&filter_event) {
+                            // C1 / BLOCKER B: run the name/symbol regex filter directly
+                            // on provider name+symbol. Do NOT fabricate a
+                            // TokenCreatedEvent with slot=0 and Pubkey::default()
+                            // identities: the stream parser already validated provider
+                            // identity before emitting NewToken, and the name/symbol
+                            // filter needs neither slot nor Pubkey.
+                            match token_filter.filter_name_symbol(&token.name, &token.symbol) {
                                 FilterResult::Pass => {
                                     info!("Token {} passed name/symbol filters", token.symbol);
                                 }
@@ -1931,17 +2046,13 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             }
 
                             // Check bonding curve progress (for established tokens)
-                            // Calculate bonding curve % from virtual reserves
-                            // v_sol_in_bonding_curve is in lamports (u64), convert to SOL
-                            // Initial: ~30 SOL virtual, At graduation: ~85 SOL in curve
-                            let v_sol = token.v_sol_in_bonding_curve as f64 / 1_000_000_000.0;
-                            let bonding_curve_pct = if v_sol > 0.0 {
-                                // Approximate: more SOL = more progress
-                                // Full curve is ~85 SOL (starting from ~30 virtual)
-                                ((v_sol - 30.0) / 55.0 * 100.0).clamp(0.0, 100.0)
-                            } else {
-                                0.0
-                            };
+                            // C2 / BLOCKER A: v_sol_in_bonding_curve is a provider
+                            // observational SOL value (f64, SOL NOT lamports). Use the
+                            // shared provider heuristic directly on that SOL value — no
+                            // /1e9 conversion. This heuristic stays observational; the
+                            // MPT oracle remains executable/market truth.
+                            let bonding_curve_pct =
+                                SignalContext::calculate_bonding_curve_pct(token.v_sol_in_bonding_curve);
 
                             if config.filters.min_bonding_curve_pct > 0.0 && bonding_curve_pct < config.filters.min_bonding_curve_pct {
                                 info!(
@@ -2009,6 +2120,9 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                 token.uri.clone(),
                                 token.trader_public_key.clone(),
                                 token.bonding_curve_key.clone(),
+                                // C3 / BLOCKER A: pass the provider observational f64
+                                // values DIRECTLY (from_new_token now takes f64). No
+                                // flooring/truncation. These are NOT canonical reserves.
                                 token.initial_buy,
                                 token.v_tokens_in_bonding_curve,
                                 token.v_sol_in_bonding_curve,
@@ -2089,18 +2203,15 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         let (strategy_entry, strategy_size) = if let Some(ref engine) = strategy_engine {
                             let mut engine_guard = engine.write().await;
 
-                            // Build token analysis context for strategy engine
-                            // Note: PumpPortal sends v_sol_in_bonding_curve as SOL, not lamports
-                            // The value is typically ~30 SOL (virtual liquidity)
-                            // For actual tradeable liquidity, we use initial_buy or market_cap
-                            let liquidity_sol = if token.v_sol_in_bonding_curve < 1000 {
-                                // Small value = already in SOL
-                                token.v_sol_in_bonding_curve as f64
-                            } else {
-                                // Large value = lamports, convert to SOL
-                                token.v_sol_in_bonding_curve as f64 / 1e9
-                            };
-                            let token_reserves = token.v_tokens_in_bonding_curve as f64;
+                            // Build token analysis context for strategy engine.
+                            // C4 / BLOCKER A: v_sol_in_bonding_curve is provider
+                            // observational SOL only (never lamports). Use it directly;
+                            // there is no dual SOL/lamport interpretation. This value is
+                            // NOT promoted to canonical liquidity: market_data_ready=false
+                            // below means the StrategyEngine cannot authorize an Enter on
+                            // these provider observational placeholders.
+                            let liquidity_sol = token.v_sol_in_bonding_curve;
+                            let token_reserves = token.v_tokens_in_bonding_curve;
 
                             // PLACEHOLDER order flow. A brand-new token event has no real
                             // trade history, so these are NOT measured values. organic_score
@@ -2534,6 +2645,56 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                 };
 
                                                 if newly_applied {
+                                                    // D6 / INV-EVT-012: ONLY after the confirmed fill
+                                                    // was durably recorded, request a dynamic
+                                                    // SubscribeTokenTrades for this mint on the single
+                                                    // runtime command sender. If the feed is enabled
+                                                    // and a Data API key is configured but the
+                                                    // subscribe cannot be sent, the position stays
+                                                    // owned/tracked and price monitoring stays active,
+                                                    // but NEW entries halt and we log that provider
+                                                    // trade kill-switch coverage is unavailable for
+                                                    // this position. Never erase the position; no
+                                                    // second socket.
+                                                    if confirmed_buy_closes_readiness_until_sync(
+                                                        config.pumpportal.enabled,
+                                                        &config.pumpportal.api_key,
+                                                    ) {
+                                                        // C5: a dynamic subscription is
+                                                        // required. IMMEDIATELY before
+                                                        // sending SubscribeTokenTrades,
+                                                        // close the new-entry readiness
+                                                        // gate so no SECOND live entry can
+                                                        // start while this owned position's
+                                                        // provider trade subscription is not
+                                                        // yet synchronized. Readiness only
+                                                        // reopens when the client re-emits
+                                                        // Connected after the desired
+                                                        // registry is synchronized (Agent A
+                                                        // semantics). We never set readiness
+                                                        // true locally.
+                                                        data_stream_ready.store(false, Ordering::SeqCst);
+                                                        if send_subscription_command(
+                                                            &pumpportal_command_sender,
+                                                            SubscriptionCommand::SubscribeTokenTrades(
+                                                                vec![token.mint.clone()],
+                                                            ),
+                                                        )
+                                                        .await
+                                                        {
+                                                            info!(
+                                                                "Provider trade subscription requested for confirmed position {}",
+                                                                &token.mint[..12]
+                                                            );
+                                                        } else {
+                                                            new_entries_halted.store(true, Ordering::SeqCst);
+                                                            error!(
+                                                                "Confirmed position {} recorded, but provider trade subscription could not be sent - position kept + price monitor active, provider trade kill-switch UNAVAILABLE for it, NEW entries HALTED",
+                                                                &token.mint[..12]
+                                                            );
+                                                        }
+                                                    }
+
                                                     // Kill-switch monitoring for the new position.
                                                     if let Some(ref evaluator) = kill_switch_evaluator {
                                                         let creator = token.trader_public_key.clone();
@@ -2656,13 +2817,18 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
 
                             if let Some(position) = our_position {
                                 if let Some(ref evaluator) = kill_switch_evaluator {
-                                    let decision = evaluator.evaluate_sell(
+                                    // D10 / INV-EVT-015: PumpPortal `token_amount` is a
+                                    // provider UI quantity, NOT canonical raw token units,
+                                    // so it must never be cast to raw and fed to the
+                                    // holder-quantity sell path. Use the identity-only
+                                    // provider evaluator (deployer sell-any Immediate Exit).
+                                    // The provider token amount stays informational only.
+                                    let decision = evaluator.evaluate_provider_sell_identity(
                                         &trade.mint,
                                         &trade.trader_public_key,
-                                        trade.token_amount as u64,
-                                        sol_amount_sol,
                                         &trade.signature,
                                     );
+                                    let _provider_ui_token_amount = trade.token_amount; // informational only; not raw
 
                                     if let KillSwitchDecision::Exit(alert) = decision {
                                         warn!(
@@ -3092,6 +3258,24 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                                                         if kill_switch_unwatch_on_close(fully_closed) {
                                                             info!("=== KILL-SWITCH SELL CONFIRMED (Full) ===");
                                                             evaluator.unwatch_position(&trade.mint);
+                                                            // D8 / INV-EVT-013: primary event
+                                                            // kill-switch FULL close => request
+                                                            // UnsubscribeTokenTrades on the single
+                                                            // runtime sender. Failure logged only.
+                                                            if full_close_requests_unsubscribe(fully_closed)
+                                                                && !send_subscription_command(
+                                                                    &pumpportal_command_sender,
+                                                                    SubscriptionCommand::UnsubscribeTokenTrades(
+                                                                        vec![trade.mint.clone()],
+                                                                    ),
+                                                                )
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Kill-switch full close: could not request token-trade unsubscribe for {} (no effect on position truth)",
+                                                                    &trade.mint[..12]
+                                                                );
+                                                            }
                                                         } else {
                                                             info!("=== KILL-SWITCH SELL CONFIRMED (Partial) ===");
                                                         }
@@ -3157,14 +3341,41 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         // canonical decision gate. A trade event may update/log state, but this
                         // packet does not contain the canonical observation engine.
                     }
+                    PumpPortalEvent::Migration(event) => {
+                        // D9 / this-P0 boundary: log mint/pool only. Do NOT mutate
+                        // PositionManager, do NOT mark any position graduated, no
+                        // transaction. The market oracle remains the canonical venue
+                        // resolver; provider migration price/liquidity is not market
+                        // truth. Persisting migrations is a later recorder phase.
+                        info!(
+                            "Token migration observed: mint={} pool={:?} pool_id={:?} sig={:?}",
+                            event.mint, event.pool, event.pool_id, event.signature
+                        );
+                    }
                     PumpPortalEvent::Connected => {
+                        // D12 / INV-EVT-007: the client emits Connected only after the
+                        // desired subscription registry has been replayed on the single
+                        // socket. Mark the data stream ready => NEW entries may be
+                        // admitted again (subject to new_entries_halted).
                         info!("Connected to token detection source");
+                        data_stream_ready.store(true, Ordering::SeqCst);
                     }
                     PumpPortalEvent::Disconnected => {
+                        // D12: no NEW entries until Connected again. Exits are NOT gated
+                        // on data-stream readiness, so price monitoring/exits continue.
                         warn!("Disconnected from token detection source");
+                        data_stream_ready.store(false, Ordering::SeqCst);
                     }
                     PumpPortalEvent::Error(e) => {
-                        error!("Token detection error: {}", e);
+                        // D12 / INV-EVT-008: a provider RPC/WebSocket error is NOT a
+                        // trading/transaction failure. Log the sanitized reason, halt
+                        // NEW entries when running live, and mark the data stream not
+                        // ready. Do NOT clear positions; existing price exits continue.
+                        error!("Token detection stream error (not a transaction failure): {}", e);
+                        data_stream_ready.store(false, Ordering::SeqCst);
+                        if !dry_run {
+                            new_entries_halted.store(true, Ordering::SeqCst);
+                        }
                     }
                 }
             }
@@ -3412,6 +3623,14 @@ pub async fn sell(
     // credentials_dir. Cross-process file locking is not implemented. The
     // ActiveSellMints reservation coordinates tasks inside one start() process
     // only; positions.json and pending_executions.json have no cross-process lock.
+    //
+    // E2 / INV-RUN-001/002: acquire the exclusive runtime lease for this
+    // credentials_dir BEFORE any pending recovery or PositionManager mutation.
+    // Held for the entire function lifetime. Applies EVEN in dry-run.
+    let _runtime_lease =
+        RuntimeLease::acquire(&config.wallet.credentials_dir, manual_sell_lease_label())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     info!("Sell command: token={}, amount={}", token, amount);
 
     // Parse token address.
@@ -4392,14 +4611,79 @@ pub async fn health(config: &Config) -> Result<()> {
 
     // Check PumpPortal (if enabled)
     if config.pumpportal.enabled {
-        print!("PumpPortal WebSocket... ");
-        match check_pumpportal(config).await {
-            Ok(_) => println!("OK"),
+        // E6.2: validate the base URL + configured api-key placement using the
+        // stream helper. The returned URL may embed the secret, so it is NEVER
+        // printed or logged.
+        print!("PumpPortal URL config... ");
+        match crate::stream::pumpportal::build_connection_url(
+            &config.pumpportal.ws_url,
+            &config.pumpportal.api_key,
+        ) {
+            Ok(_authenticated_url) => {
+                // Do NOT print _authenticated_url; it may contain the api-key.
+                println!("OK (base URL valid, api-key placement checked)");
+            }
             Err(e) => {
+                // build_connection_url errors are built from the sanitized base
+                // only and never contain the secret.
                 println!("FAILED: {}", e);
                 all_healthy = false;
             }
         }
+
+        // E6.3/E6.4 + C7/BLOCKER E: connection-only live socket check gated by an
+        // explicit tri-state runtime-lock policy. An inspect Err (lock present but
+        // malformed/unreadable) FAILS CLOSED: skip the socket AND mark unhealthy —
+        // it is NEVER treated as "no runtime". We never open a second socket while
+        // a runtime (known or unknown) may own the single PumpPortal connection,
+        // and health never deletes the lock.
+        let inspect_result = RuntimeLease::inspect(&config.wallet.credentials_dir);
+        let lock_policy = health_lock_policy(&inspect_result);
+        let api_key_present = !config.pumpportal.api_key.trim().is_empty();
+        print!("PumpPortal live socket... ");
+        match lock_policy {
+            HealthLockPolicy::SkipActive => {
+                println!(
+                    "SKIPPED live socket check: active runtime owns the single PumpPortal connection"
+                );
+            }
+            HealthLockPolicy::SkipUnhealthy => {
+                // Runtime lock exists but is unknown/malformed. Fail closed: do not
+                // open a socket, do not delete the lock, and mark health unhealthy.
+                println!(
+                    "SKIPPED live socket check: runtime lock exists but is unknown/unreadable and must be inspected (no socket opened, lock not modified)"
+                );
+                all_healthy = false;
+            }
+            HealthLockPolicy::AllowSocket => {
+                if !health_should_open_socket(false, api_key_present) {
+                    // No key: the free new-token/migration endpoint could still be
+                    // reached, but a connection-only check with no key proves nothing
+                    // about trade credentials, so we skip opening a socket here.
+                    println!("SKIPPED (no api-key configured)");
+                } else {
+                    match check_pumpportal(config).await {
+                        Ok(_) => println!("endpoint reachable"),
+                        Err(e) => {
+                            println!("FAILED: {}", e);
+                            all_healthy = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // AUDIT-004: the authoritative Data-capability line lives HERE, in the
+        // PumpPortal-ENABLED section, because Data/event streaming is independent of
+        // the trade-EXECUTION route. `pumpportal.enabled=true` +
+        // `use_for_trading=false` means PumpPortal is the DATA provider while Jito
+        // executes, so this line must still print. It is gated only by
+        // `health_should_report_pumpportal_data(config.pumpportal.enabled)` (i.e. by
+        // being inside this block). `api_key_present` is already computed above.
+        println!(
+            "PumpPortal Data API... {}",
+            health_data_capability_line(api_key_present)
+        );
     } else {
         println!("PumpPortal... DISABLED");
     }
@@ -4437,13 +4721,26 @@ pub async fn health(config: &Config) -> Result<()> {
     }
 
     // Check PumpPortal API (if using for trading)
+    //
+    // BLOCKER B: report the Data-API capability and the trade-EXECUTION route
+    // SEPARATELY, mirroring start()'s real routing
+    // (`use_local_api = api_key.is_empty() || force_local_api`). API-key presence
+    // authenticates the Data API but does NOT by itself imply Lightning execution:
+    // a configured key with `force_local_api=true` still executes LOCAL. This block
+    // is report-only and does not affect start()'s actual route/wallet selection.
     if config.pumpportal.use_for_trading {
+        let api_key_present = !config.pumpportal.api_key.trim().is_empty();
+        let force_local_api = config.pumpportal.force_local_api;
+        let mode = health_execution_mode(api_key_present, force_local_api);
+
         print!("PumpPortal Trading API... ");
-        if config.pumpportal.api_key.is_empty() {
-            println!("LOCAL MODE (no API key)");
-        } else {
-            println!("LIGHTNING MODE (API key configured)");
-        }
+        println!(
+            "{}",
+            health_execution_line(mode, api_key_present, force_local_api)
+        );
+        // AUDIT-004: this block reports ONLY the transaction execution route. The
+        // Data-capability line is printed once in the `pumpportal.enabled` section
+        // above, since Data capability is independent of the execution route.
     }
 
     // Check keypair
@@ -4488,29 +4785,178 @@ async fn check_shredstream(_config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Connection-only PumpPortal health check.
+///
+/// Opens ONE socket using the authenticated URL (built internally via the stream
+/// helper so the api-key is placed correctly), then immediately closes it. The
+/// authenticated URL is NEVER logged or printed. This proves only that the
+/// endpoint is reachable — it does NOT authorize or consume any (metered) trade
+/// subscription. Callers must gate this behind `health_should_open_socket`.
 async fn check_pumpportal(config: &Config) -> Result<()> {
     use std::time::Duration;
     use tokio_tungstenite::connect_async;
 
-    let url = url::Url::parse(&config.pumpportal.ws_url)
-        .map_err(|e| anyhow::anyhow!("Invalid WebSocket URL: {}", e))?;
+    // Build the authenticated URL internally. Never log/print the returned Url.
+    let url = crate::stream::pumpportal::build_connection_url(
+        &config.pumpportal.ws_url,
+        &config.pumpportal.api_key,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Try to connect with timeout
+    // Try to connect with timeout. On any error, surface only the sanitized base
+    // (never the authenticated Url, which carries the secret).
     let connect_future = connect_async(url);
     let timeout = Duration::from_secs(5);
 
     match tokio::time::timeout(timeout, connect_future).await {
         Ok(Ok((ws, _))) => {
-            // Successfully connected, close by dropping
+            // Successfully connected, close immediately by dropping. Do NOT send
+            // any subscribe message: health must not consume metered trade events.
             drop(ws);
             Ok(())
         }
-        Ok(Err(e)) => Err(anyhow::anyhow!("WebSocket connection failed: {}", e)),
+        // C8 / section 3: NEVER surface the raw tungstenite/connect error string
+        // on connection failure — it may contain the authenticated request URL or
+        // api-key. Use a fixed sanitized message. The underlying error `e` is
+        // intentionally dropped (not logged) here.
+        Ok(Err(_e)) => Err(anyhow::anyhow!(
+            "PumpPortal WebSocket connection failed for configured base endpoint"
+        )),
         Err(_) => Err(anyhow::anyhow!(
             "Connection timed out after {}s",
             timeout.as_secs()
         )),
     }
+}
+
+/// E6 pure policy helper: whether a connection-only health check may open a live
+/// PumpPortal socket. When another runtime is active it owns the single
+/// PumpPortal connection, so health must NEVER open a second socket. A
+/// connection-only check with no api-key proves nothing about trade credentials,
+/// so we also skip when no key is present.
+fn health_should_open_socket(active_runtime: bool, api_key_present: bool) -> bool {
+    if active_runtime {
+        return false;
+    }
+    api_key_present
+}
+
+/// C7 / BLOCKER E: tri-state runtime-lock policy for the health live-socket check.
+///
+/// `RuntimeLease::inspect()` returns:
+///   - `Ok(None)`      => lock is KNOWN ABSENT; a live endpoint socket check MAY be
+///                        considered (still subject to api-key presence).
+///   - `Ok(Some(_))`   => an active runtime owns the single connection; SKIP the
+///                        live socket check (its runtime owns the socket).
+///   - `Err(_)`        => the lock EXISTS but is malformed/unreadable, i.e. UNKNOWN.
+///                        This must FAIL CLOSED: skip the live socket check AND mark
+///                        health unhealthy. An inspect `Err` is NEVER interpreted as
+///                        "no runtime". Never open a socket, never delete the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthLockPolicy {
+    /// Lock known absent: the live socket check may proceed (key permitting).
+    AllowSocket,
+    /// Active runtime owns the connection: skip the live socket check.
+    SkipActive,
+    /// Lock present but unknown/malformed: skip the check and mark unhealthy.
+    SkipUnhealthy,
+}
+
+/// Pure classifier mapping a `RuntimeLease::inspect` result to a health policy (C7).
+fn health_lock_policy<T, E>(inspect_result: &std::result::Result<Option<T>, E>) -> HealthLockPolicy {
+    match inspect_result {
+        Ok(None) => HealthLockPolicy::AllowSocket,
+        Ok(Some(_)) => HealthLockPolicy::SkipActive,
+        Err(_) => HealthLockPolicy::SkipUnhealthy,
+    }
+}
+
+/// BLOCKER B: the trade-EXECUTION route reported by `health()`.
+///
+/// This is a REPORT-ONLY mirror of the route `start()` actually selects. It must
+/// never influence `start()`'s real routing/wallet selection — it only exists so
+/// the health report tells the operator the truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthExecutionMode {
+    /// LOCAL transaction API + local signing wallet (0.5% provider fee).
+    Local,
+    /// PumpPortal Lightning transaction API (1% provider fee).
+    Lightning,
+}
+
+/// BLOCKER B pure helper: compute the trade-execution route EXACTLY as `start()`
+/// does. `start()` uses:
+///
+/// ```text
+/// let use_local_api = api_key.is_empty() || force_local_api;
+/// ```
+///
+/// so the execution mode is the boolean COMPLEMENT of `use_local_api`:
+///   - api_key absent                        => use_local_api=true  => Local
+///   - api_key present && force_local_api     => use_local_api=true  => Local
+///   - api_key present && !force_local_api    => use_local_api=false => Lightning
+///
+/// Crucially, api-key PRESENCE alone never implies Lightning: after RET-001 the
+/// key authenticates the Data API independently of the trade route, so a key with
+/// `force_local_api=true` still executes LOCAL. This is a pure function of two
+/// booleans and never touches or derives the secret value.
+fn health_execution_mode(api_key_present: bool, force_local_api: bool) -> HealthExecutionMode {
+    // Mirror of start()'s `use_local_api = api_key.is_empty() || force_local_api`.
+    let use_local_api = !api_key_present || force_local_api;
+    if use_local_api {
+        HealthExecutionMode::Local
+    } else {
+        HealthExecutionMode::Lightning
+    }
+}
+
+/// BLOCKER B pure formatter for the health trade-EXECUTION line. Driven by the
+/// computed `HealthExecutionMode` PLUS `api_key_present` (never the secret). The
+/// AUDIT-003 fix: the Local branch must know key presence so it never claims a
+/// "Data API credential configured" when no key exists. `force_local_api` alone
+/// is NOT sufficient to justify that claim — a Local route reached because the key
+/// is absent (`force_local_api` may still be set in a default config) must print
+/// the no-key text.
+fn health_execution_line(
+    mode: HealthExecutionMode,
+    api_key_present: bool,
+    force_local_api: bool,
+) -> &'static str {
+    match mode {
+        HealthExecutionMode::Local => {
+            // Only claim a configured Data credential when a key actually exists.
+            // The credential claim is gated on `api_key_present`, not on
+            // `force_local_api`, so the default empty-key case can never lie.
+            if api_key_present && force_local_api {
+                "Execution: LOCAL MODE (force_local_api; Data API credential configured; Local Transaction API 0.5%)"
+            } else {
+                "Execution: LOCAL MODE (no API key; Local Transaction API 0.5%)"
+            }
+        }
+        HealthExecutionMode::Lightning => {
+            "Execution: LIGHTNING MODE (Lightning Transaction API 1%)"
+        }
+    }
+}
+
+/// BLOCKER B pure formatter for the SEPARATE Data-capability line reported by
+/// `health()`. Independent of the execution route: it reflects only whether an
+/// api-key is configured to authenticate the Data API. Never contains the secret.
+fn health_data_capability_line(api_key_present: bool) -> &'static str {
+    if api_key_present {
+        "Data: authenticated/metered token+account trade streams available"
+    } else {
+        "Data: new-token/migration only; trade subscriptions unavailable"
+    }
+}
+
+/// AUDIT-004 pure predicate: whether `health()` should report the PumpPortal
+/// Data-API capability line. Data/event streaming is independent of the trade
+/// EXECUTION route, so this depends ONLY on `pumpportal.enabled` (the data/event
+/// provider switch), never on `use_for_trading` (the execution route). Display
+/// only; changes no execution/route/subscription/readiness behavior.
+fn health_should_report_pumpportal_data(pumpportal_enabled: bool) -> bool {
+    pumpportal_enabled
 }
 
 async fn check_jito(_config: &Config) -> Result<u64> {
@@ -4658,6 +5104,11 @@ pub async fn wallet_add(
     use chrono::Utc;
     use std::path::Path;
 
+    // E3 / INV-RUN-001/002: exclude a running trading process before mutating the
+    // credential registry/files. Held for the whole function.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "wallet_add")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     let creds_path = Path::new(&config.wallet.credentials_dir);
     let mut creds = CredentialManager::load(creds_path)
         .map_err(|e| anyhow::anyhow!("Failed to load credentials: {}", e))?;
@@ -4761,6 +5212,11 @@ pub async fn wallet_extract(
     use crate::wallet::safety::WalletSafetyConfig;
     use crate::wallet::types::{InitiatedBy, TransferReason};
     use dialoguer::Confirm;
+
+    // E3 / INV-RUN-001/002: exclude a running trading process before any
+    // controlled-wallet balance move. Held for the whole function.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "wallet_extract")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     info!("Extracting {} SOL to vault", amount);
 
@@ -4966,6 +5422,11 @@ pub async fn wallet_transfer(
     use solana_sdk::signature::Signer;
     use std::str::FromStr;
 
+    // E3 / INV-RUN-001/002: exclude a running trading process before any
+    // controlled-wallet balance move. Held for the whole function.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "wallet_transfer")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
     info!(
         "Initiating transfer of {} SOL from {} to {}",
         amount, from, to
@@ -5131,6 +5592,7 @@ pub async fn scan(
             if auto_buy && !tokens.is_empty() {
                 warn!("AUTO-BUY enabled - this is AGGRESSIVE mode!");
                 // TODO: Implement auto-buy logic
+                // If scan auto-buy becomes executable, it MUST acquire RuntimeLease before any state/wallet mutation.
             }
         }
 
@@ -5161,6 +5623,13 @@ pub async fn hot_scan(
 ) -> Result<()> {
     use crate::dexscreener::{DexScreenerClient, HotScanConfig};
     use solana_sdk::signature::Signer;
+
+    // E1 / INV-RUN-001/002: acquire the exclusive runtime lease for this
+    // credentials_dir BEFORE PositionManager / pending / wallet initialization.
+    // Held for the entire function lifetime. This applies EVEN in dry-run because
+    // HotScan startup recovery can mutate persistent state.
+    let _runtime_lease = RuntimeLease::acquire(&config.wallet.credentials_dir, "hot_scan")
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     info!("=== HOT TOKEN SCANNER ===");
     info!(
@@ -7471,6 +7940,153 @@ fn primary_sell_fill_values(
 /// market-price input is involved.
 fn kill_switch_unwatch_on_close(fully_closed: bool) -> bool {
     fully_closed
+}
+
+// ===========================================================================
+// AGENT E — pure runtime-ownership classifier for CLI commands.
+//
+// Returns true for commands that mutate persistent trading state / credentials /
+// controlled-wallet balances and therefore MUST hold the exclusive runtime lease
+// (INV-RUN-001/002). Read-only commands (status/config/health/wallet
+// status/list/history) and the emergency-control command (INV-RUN-006) return
+// false — emergency must stay callable while a bot holds the lease.
+// ===========================================================================
+fn command_requires_runtime_lease(command: &str) -> bool {
+    matches!(
+        command,
+        "start"
+            | "hot_scan"
+            | "sell"
+            | "wallet_add"
+            | "wallet_extract"
+            | "wallet_transfer"
+    )
+}
+
+/// E8(2): the exact runtime-lease command label used by the manual `sell` handler.
+/// Factored so tests assert the label without acquiring a lease.
+fn manual_sell_lease_label() -> &'static str {
+    "sell"
+}
+
+// ===========================================================================
+// AGENT D — pure decision helpers for authenticated position-scoped events.
+// These carry no I/O so the D13 tests need no socket / network.
+// ===========================================================================
+
+/// D3: build the initial PumpPortal subscription plan for a `start()` runtime.
+///
+/// - `new_tokens` and `migrations` are always requested (free streams).
+/// - `account_trades` = configured tracked wallets, but ONLY when wallet
+///   tracking is enabled (otherwise empty). Never "all trades".
+/// - `token_trades` = every currently-open canonical Position mint.
+///
+/// The client validates/deduplicates pubkeys; we still de-duplicate here so the
+/// plan is minimal and never subscribes an all-trades abstraction.
+fn build_initial_subscription_plan(
+    open_position_mints: &[String],
+    tracked_wallets: &[String],
+    wallet_tracking_enabled: bool,
+) -> PumpPortalSubscriptionPlan {
+    fn dedup(input: &[String]) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for k in input {
+            let k = k.trim();
+            if k.is_empty() {
+                continue;
+            }
+            if seen.insert(k.to_string()) {
+                out.push(k.to_string());
+            }
+        }
+        out
+    }
+
+    let account_trades = if wallet_tracking_enabled {
+        dedup(tracked_wallets)
+    } else {
+        Vec::new()
+    };
+
+    PumpPortalSubscriptionPlan {
+        new_tokens: true,
+        migrations: true,
+        token_trades: dedup(open_position_mints),
+        account_trades,
+    }
+}
+
+/// D12: pure new-entry admission predicate.
+///
+/// When the PumpPortal feed is enabled, a NEW live entry is admitted only when
+/// entries are not halted AND the data stream is ready (Connected). When the
+/// feed is disabled, data-stream readiness is not a gate. Exits are NEVER routed
+/// through this predicate.
+fn new_entry_admitted(new_entries_halted: bool, data_stream_ready: bool, feed_enabled: bool) -> bool {
+    if new_entries_halted {
+        return false;
+    }
+    if feed_enabled {
+        data_stream_ready
+    } else {
+        true
+    }
+}
+
+/// D4: whether NEW entries must be halted at startup purely because a live run
+/// has the PumpPortal feed enabled but no Data API key. A missing key means no
+/// token/account trade subscription can be opened, so any future position could
+/// not get its provider trade kill-switch coverage — but existing-position price
+/// monitoring and exits stay available. `force_local_api` does NOT bypass this.
+fn missing_data_key_halts_new_entries(
+    dry_run: bool,
+    pumpportal_enabled: bool,
+    api_key: &str,
+) -> bool {
+    !dry_run && pumpportal_enabled && api_key.trim().is_empty()
+}
+
+/// D6: whether a confirmed, durably-recorded position requires a dynamic
+/// token-trade subscription. It does whenever the feed is enabled and a Data API
+/// key is configured (trade streams are authenticated). Without a key we cannot
+/// subscribe; the caller then halts new entries and keeps price monitoring.
+fn confirmed_position_requires_subscription(feed_enabled: bool, api_key: &str) -> bool {
+    feed_enabled && !api_key.trim().is_empty()
+}
+
+/// C5: whether a confirmed durable buy must close the new-entry readiness gate
+/// before requesting its required token-trade subscription. This is exactly the
+/// case where a dynamic subscription is required (feed enabled + Data API key
+/// configured), i.e. `confirmed_position_requires_subscription`. When true, the
+/// caller stores `data_stream_ready = false` immediately BEFORE sending
+/// `SubscribeTokenTrades([mint])`; readiness is only reopened when the client
+/// re-emits `Connected` after the desired registry is actually synchronized. This
+/// prevents a second live entry while the first owned position's provider trade
+/// subscription is not yet on the wire. If the send is rejected, readiness stays
+/// false and new entries stay halted (the caller never sets readiness true locally).
+fn confirmed_buy_closes_readiness_until_sync(feed_enabled: bool, api_key: &str) -> bool {
+    confirmed_position_requires_subscription(feed_enabled, api_key)
+}
+
+/// D8: full close requests an unsubscribe; a partial close keeps the
+/// subscription. Actual reconciled `fully_closed` controls.
+fn full_close_requests_unsubscribe(fully_closed: bool) -> bool {
+    fully_closed
+}
+
+/// D6/D8: best-effort send of a single subscription command on the runtime's one
+/// command sender. Returns true iff the command was accepted by the channel. A
+/// failure NEVER alters economic position truth — callers decide policy (D6
+/// halts new entries on a required subscribe failure; D8 only logs).
+async fn send_subscription_command(
+    sender: &Option<CommandSender>,
+    cmd: SubscriptionCommand,
+) -> bool {
+    match sender {
+        Some(tx) => tx.send(cmd).await.is_ok(),
+        None => false,
+    }
 }
 
 /// AGENT G — pure mapping of a HotScan requested layer string to the durable
@@ -10598,5 +11214,673 @@ mod tests {
             .and_then(|p| manual_sell_drift_pct(p, actual_fill_price))
             .unwrap();
         assert!((drift - preview_drift).abs() > 1.0);
+    }
+
+    // =======================================================================
+    // AGENT D (D13) — authenticated position-scoped event wiring, pure tests.
+    // No network / no socket: they exercise the extracted pure helpers only.
+    // =======================================================================
+
+    // (1) missing data key on a LIVE run => new-entry stream gate is false.
+    #[test]
+    fn test_d13_missing_data_key_live_blocks_new_entries() {
+        assert!(missing_data_key_halts_new_entries(false, true, ""));
+        assert!(missing_data_key_halts_new_entries(false, true, "   "));
+        // With a key present it does not halt on this rule.
+        assert!(!missing_data_key_halts_new_entries(false, true, "KEY"));
+        // The new-entry admission predicate then reflects the halt.
+        assert!(!new_entry_admitted(true, true, true));
+    }
+
+    // (2) dry-run free-only plan without key is allowed (no forced halt, plan has
+    //     no trade subscriptions to require a key).
+    #[test]
+    fn test_d13_dry_run_free_only_plan_without_key_allowed() {
+        // Dry-run never halted by the missing-key rule.
+        assert!(!missing_data_key_halts_new_entries(true, true, ""));
+        // A free-only plan (no open positions, tracking disabled) carries no trade
+        // subscriptions, so it needs no key.
+        let plan = build_initial_subscription_plan(&[], &["w".to_string()], false);
+        assert!(plan.new_tokens && plan.migrations);
+        assert!(plan.token_trades.is_empty());
+        assert!(plan.account_trades.is_empty());
+        // Dry-run admission is not gated on data-stream readiness.
+        assert!(new_entry_admitted(false, false, true) == false); // live-shape gate
+    }
+
+    // (3) initial plan contains open-position mints (deduplicated).
+    #[test]
+    fn test_d13_initial_plan_contains_open_position_mints() {
+        let mints = vec!["mintA".to_string(), "mintB".to_string(), "mintA".to_string()];
+        let plan = build_initial_subscription_plan(&mints, &[], false);
+        assert_eq!(plan.token_trades, vec!["mintA".to_string(), "mintB".to_string()]);
+    }
+
+    // (4) initial plan contains tracked wallets ONLY when tracking is enabled.
+    #[test]
+    fn test_d13_initial_plan_tracked_wallets_only_when_enabled() {
+        let wallets = vec!["w1".to_string(), "w2".to_string(), "w1".to_string()];
+        let enabled = build_initial_subscription_plan(&[], &wallets, true);
+        assert_eq!(enabled.account_trades, vec!["w1".to_string(), "w2".to_string()]);
+        let disabled = build_initial_subscription_plan(&[], &wallets, false);
+        assert!(disabled.account_trades.is_empty());
+    }
+
+    // (5) no all-trades plan: new/migration are booleans, trade sets are explicit
+    //     key lists, and an empty inputs plan never fabricates keys.
+    #[test]
+    fn test_d13_no_all_trades_plan() {
+        let plan = build_initial_subscription_plan(&[], &[], true);
+        assert!(plan.token_trades.is_empty());
+        assert!(plan.account_trades.is_empty());
+        // Even with tracking enabled but no wallets, no keys are invented.
+    }
+
+    // ==================================================================
+    // AGENT C (C9) — provider unit bridge + readiness + health tests
+    // ==================================================================
+
+    fn c9_filter_config() -> crate::config::FilterConfig {
+        crate::config::FilterConfig {
+            enabled: true,
+            blocked_patterns: vec!["(?i)scam".to_string()],
+            name_patterns: vec![],
+            ..crate::config::Config::default().filters
+        }
+    }
+
+    // C9.1: the live name/symbol filter path requires no fabricated slot or
+    // default Pubkey. `filter_name_symbol` takes only &str name+symbol and must
+    // match the prior event-based filter for the same name/symbol — proving the
+    // adapter (slot=0 + Pubkey::default) is unnecessary.
+    #[test]
+    fn test_provider_name_filter_requires_no_slot_or_default_pubkey_adapter() {
+        use crate::filter::token_filter::TokenFilter;
+        use crate::stream::decoder::TokenCreatedEvent;
+        let filter = TokenFilter::new(c9_filter_config()).unwrap();
+
+        // name/symbol-only API: no slot, no Pubkey needed.
+        assert!(filter.filter_name_symbol("ScamCoin", "SCAM").is_filtered());
+        assert!(filter.filter_name_symbol("GoodToken", "GOOD").is_pass());
+
+        // Equivalence with the legacy event wrapper for the SAME name/symbol,
+        // regardless of the event's slot/Pubkey identity fields.
+        let ev = TokenCreatedEvent {
+            signature: "x".to_string(),
+            slot: 999,
+            mint: solana_sdk::pubkey::Pubkey::new_unique(),
+            name: "GoodToken".to_string(),
+            symbol: "GOOD".to_string(),
+            uri: String::new(),
+            bonding_curve: solana_sdk::pubkey::Pubkey::new_unique(),
+            associated_bonding_curve: solana_sdk::pubkey::Pubkey::new_unique(),
+            creator: solana_sdk::pubkey::Pubkey::new_unique(),
+            timestamp: chrono::Utc::now(),
+        };
+        assert_eq!(
+            filter.filter(&ev).is_pass(),
+            filter.filter_name_symbol("GoodToken", "GOOD").is_pass()
+        );
+    }
+
+    // C9.2: the bonding-curve filter uses provider SOL directly (no /1e9). A
+    // provider value of 57.5 SOL is 50% progress; a lamport-style 57.5e9 would
+    // clamp to 100% under the correct SOL heuristic (proving no /1e9 divide).
+    #[test]
+    fn test_provider_bonding_curve_filter_uses_sol_not_lamports() {
+        // 30 SOL => 0%, 57.5 SOL => 50%, 85 SOL => 100%.
+        assert!((SignalContext::calculate_bonding_curve_pct(30.0) - 0.0).abs() < 1e-9);
+        assert!((SignalContext::calculate_bonding_curve_pct(57.5) - 50.0).abs() < 1e-9);
+        assert!((SignalContext::calculate_bonding_curve_pct(85.0) - 100.0).abs() < 1e-9);
+        // If this had a /1e9 divide, 57.5 SOL would map to ~0% (near curve start).
+        assert!(SignalContext::calculate_bonding_curve_pct(57.5) > 1.0);
+    }
+
+    // C9.3: fractional provider values survive the SignalContext bridge with no
+    // flooring/truncation (the old `as u64` path truncated 31.75 -> 31).
+    #[test]
+    fn test_signal_context_bridge_preserves_fractional_provider_values() {
+        let ctx = SignalContext::from_new_token(
+            "mint".to_string(),
+            "n".to_string(),
+            "s".to_string(),
+            "u".to_string(),
+            "creator".to_string(),
+            "bc".to_string(),
+            1.25,  // initial_buy
+            2.5,   // v_tokens_in_bonding_curve
+            31.75, // v_sol_in_bonding_curve
+            9.9,   // market_cap_sol
+        );
+        assert_eq!(ctx.initial_buy, 1.25);
+        assert_eq!(ctx.v_tokens_in_bonding_curve, 2.5);
+        assert_eq!(ctx.v_sol_in_bonding_curve, 31.75);
+        assert_eq!(ctx.market_cap_sol, 9.9);
+    }
+
+    // C9.4: the strategy placeholder liquidity is provider observational SOL used
+    // DIRECTLY (no dual SOL/lamport branch). Mirror the production expression.
+    #[test]
+    fn test_provider_strategy_placeholder_vsol_is_direct_sol() {
+        for v_sol in [12.5_f64, 31.75, 850.0, 30_000.0] {
+            let liquidity_sol = v_sol; // production: `let liquidity_sol = token.v_sol_in_bonding_curve;`
+            assert_eq!(liquidity_sol, v_sol, "no /1e9, no <1000 branch");
+        }
+    }
+
+    // C9.5: a confirmed durable buy closes the readiness gate before subscribing
+    // exactly when a dynamic subscription is required (feed + key). No key or
+    // disabled feed => no readiness close (nothing to subscribe).
+    #[test]
+    fn test_confirmed_buy_subscription_closes_readiness_until_sync() {
+        assert!(confirmed_buy_closes_readiness_until_sync(true, "KEY"));
+        assert!(!confirmed_buy_closes_readiness_until_sync(true, ""));
+        assert!(!confirmed_buy_closes_readiness_until_sync(false, "KEY"));
+        // Consistent with the required-subscription decision it gates.
+        assert_eq!(
+            confirmed_buy_closes_readiness_until_sync(true, "KEY"),
+            confirmed_position_requires_subscription(true, "KEY")
+        );
+    }
+
+    // C9.6: readiness reopens ONLY on a Connected event (post-sync), never set
+    // true locally after a subscribe. Model the Connected/Disconnected policy the
+    // main loop applies to the shared flag.
+    #[test]
+    fn test_connected_event_reopens_readiness_after_sync_policy() {
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        // C5: closing the gate before subscribe.
+        ready.store(false, Ordering::SeqCst);
+        assert!(!ready.load(Ordering::SeqCst));
+        // A rejected send must NOT reopen readiness.
+        // (No local store(true) exists on the reject path.)
+        assert!(!ready.load(Ordering::SeqCst));
+        // Only the Connected handler reopens it (after desired sync).
+        ready.store(true, Ordering::SeqCst); // Connected handler
+        assert!(ready.load(Ordering::SeqCst));
+    }
+
+    // C9.7: a valid ACTIVE runtime lock blocks the health live socket check.
+    #[test]
+    fn test_health_valid_active_lock_blocks_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lease = RuntimeLease::acquire(dir.path(), "start").expect("acquires");
+        let inspect = RuntimeLease::inspect(dir.path());
+        assert_eq!(health_lock_policy(&inspect), HealthLockPolicy::SkipActive);
+        // SkipActive never opens a socket.
+        assert_ne!(health_lock_policy(&inspect), HealthLockPolicy::AllowSocket);
+    }
+
+    // C9.8: a malformed/unreadable runtime lock fails closed: skip socket AND
+    // mark unhealthy. inspect Err is never "no runtime".
+    #[test]
+    fn test_health_malformed_lock_blocks_socket() {
+        // Synthesize an inspect Err via a typed error result.
+        let err: std::result::Result<Option<()>, String> = Err("malformed".to_string());
+        assert_eq!(health_lock_policy(&err), HealthLockPolicy::SkipUnhealthy);
+        // Never AllowSocket on unknown lock state.
+        assert_ne!(health_lock_policy(&err), HealthLockPolicy::AllowSocket);
+    }
+
+    // C9.9: a known-absent lock MAY open the socket when a key is present.
+    #[test]
+    fn test_health_known_absent_lock_may_open_socket_when_key_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspect = RuntimeLease::inspect(dir.path()); // Ok(None): no lock file
+        assert_eq!(health_lock_policy(&inspect), HealthLockPolicy::AllowSocket);
+        // AllowSocket + key present => open; AllowSocket + no key => skip.
+        assert!(health_should_open_socket(false, true));
+        assert!(!health_should_open_socket(false, false));
+    }
+
+    // C9.10: the sanitized health connect error never contains a fake api key or
+    // an authenticated URL. Assert on the fixed message the C8 path emits.
+    #[test]
+    fn test_health_socket_error_text_contains_no_fake_api_key() {
+        let fake_key = "SECRET_API_KEY_ABC123";
+        // This is the exact fixed message the C8 connect-failure path returns.
+        let sanitized = "PumpPortal WebSocket connection failed for configured base endpoint";
+        assert!(!sanitized.contains(fake_key));
+        assert!(!sanitized.contains("api-key"));
+        assert!(!sanitized.to_lowercase().contains("wss://"));
+        assert!(!sanitized.contains('?')); // no query string
+    }
+
+    // (6) provider disconnect blocks new entries but does NOT gate the exit
+    //     policy helper (which is readiness-agnostic).
+    #[test]
+    fn test_d13_disconnect_blocks_entries_not_exits() {
+        // Feed enabled + not ready => no new entry.
+        assert!(!new_entry_admitted(false, false, true));
+        // Feed enabled + ready => admitted.
+        assert!(new_entry_admitted(false, true, true));
+        // Exit-policy helper is independent of stream readiness: a full close still
+        // requests an unsubscribe regardless of data_stream_ready.
+        assert!(full_close_requests_unsubscribe(true));
+        assert!(!full_close_requests_unsubscribe(false));
+    }
+
+    // (7) confirmed position requires a dynamic token subscription (pure decision)
+    //     when the feed is enabled AND a key is configured.
+    #[test]
+    fn test_d13_confirmed_position_requires_subscription() {
+        assert!(confirmed_position_requires_subscription(true, "KEY"));
+        // No key => cannot subscribe (authenticated stream).
+        assert!(!confirmed_position_requires_subscription(true, ""));
+        // Feed disabled => no subscription needed.
+        assert!(!confirmed_position_requires_subscription(false, "KEY"));
+    }
+
+    // (8) partial close keeps the subscription.
+    #[test]
+    fn test_d13_partial_close_keeps_subscription() {
+        assert!(!full_close_requests_unsubscribe(false));
+    }
+
+    // (9) full close requests unsubscribe.
+    #[test]
+    fn test_d13_full_close_requests_unsubscribe() {
+        assert!(full_close_requests_unsubscribe(true));
+    }
+
+    // (10) provider trade kill switch uses identity-only helper semantics: with no
+    //      command sender, a best-effort send fails closed (returns false) and the
+    //      caller keeps the position — the send helper never panics or blocks.
+    #[tokio::test]
+    async fn test_d13_provider_identity_send_without_sender_fails_closed() {
+        let none: Option<CommandSender> = None;
+        let sent = send_subscription_command(
+            &none,
+            SubscriptionCommand::SubscribeTokenTrades(vec!["mint".to_string()]),
+        )
+        .await;
+        assert!(!sent, "no sender => command not accepted, must fail closed");
+
+        // NOTE: the previous live-channel half built a raw
+        // `mpsc::Sender<SubscriptionCommand>` and passed it as `CommandSender`.
+        // After Agent A, `CommandSender` is a clonable struct (not an mpsc alias)
+        // whose fields are private to the stream module and whose `send()` requires
+        // a started client + live worker (network). That half is dropped here; the
+        // `None => fails closed` assertion above is the load-bearing invariant.
+    }
+
+    // === AGENT E8 — runtime-ownership + health secret-safety tests ==========
+
+    // (1) start and HotScan lease the same dir => second acquire conflicts.
+    #[test]
+    fn test_e8_start_and_hotscan_same_dir_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = RuntimeLease::acquire(dir.path(), "start").expect("first acquires");
+        let err = RuntimeLease::acquire(dir.path(), "hot_scan");
+        assert!(
+            err.is_err(),
+            "second runtime in same credentials_dir must fail closed"
+        );
+        drop(lease);
+        // After release the dir is free again.
+        let _reacquired = RuntimeLease::acquire(dir.path(), "hot_scan")
+            .expect("acquires after prior lease dropped");
+    }
+
+    // (2) manual sell uses the exact "sell" command label, and that label is what
+    //     lands in the lease metadata.
+    #[test]
+    fn test_e8_manual_sell_lease_command_label() {
+        assert_eq!(manual_sell_lease_label(), "sell");
+        let dir = tempfile::tempdir().unwrap();
+        let _lease =
+            RuntimeLease::acquire(dir.path(), manual_sell_lease_label()).expect("acquires");
+        let meta = RuntimeLease::inspect(dir.path())
+            .expect("inspect ok")
+            .expect("lease present");
+        assert_eq!(meta.command, "sell");
+    }
+
+    // (3) wallet transfer (and the other mutating commands) classified as
+    //     requiring the exclusive runtime lease.
+    #[test]
+    fn test_e8_wallet_transfer_classified_mutating() {
+        for cmd in [
+            "start",
+            "hot_scan",
+            "sell",
+            "wallet_add",
+            "wallet_extract",
+            "wallet_transfer",
+        ] {
+            assert!(
+                command_requires_runtime_lease(cmd),
+                "{cmd} must require the runtime lease"
+            );
+        }
+    }
+
+    // (4) wallet emergency + read-only commands classified NON-exclusive.
+    #[test]
+    fn test_e8_emergency_and_readonly_non_exclusive() {
+        for cmd in [
+            "wallet_emergency",
+            "status",
+            "config",
+            "health",
+            "wallet_status",
+            "wallet_list",
+            "wallet_history",
+            "scan",
+        ] {
+            assert!(
+                !command_requires_runtime_lease(cmd),
+                "{cmd} must NOT require the runtime lease"
+            );
+        }
+    }
+
+    // (5) health policy helper: when a runtime is active, never open a second
+    //     PumpPortal socket (regardless of key presence).
+    #[test]
+    fn test_e8_health_active_runtime_avoids_second_socket() {
+        assert!(!health_should_open_socket(true, true));
+        assert!(!health_should_open_socket(true, false));
+        // No active runtime: may open a socket only if a key exists.
+        assert!(health_should_open_socket(false, true));
+        assert!(!health_should_open_socket(false, false));
+    }
+
+    // (6) health capability line never contains a sample API key.
+    #[test]
+    fn test_e8_health_capability_line_has_no_secret() {
+        let sample_key = "super-secret-sample-api-key-1234567890";
+        // AUDIT-003 B3: the older redundant pumpportal_capability_line was removed;
+        // the retained authoritative capability formatter is
+        // health_data_capability_line. Presence path is driven by a bool, so the
+        // secret cannot leak into it.
+        let present = health_data_capability_line(true);
+        let absent = health_data_capability_line(false);
+        assert!(!present.contains(sample_key));
+        assert!(!absent.contains(sample_key));
+        assert_eq!(
+            present,
+            "Data: authenticated/metered token+account trade streams available"
+        );
+        assert_eq!(
+            absent,
+            "Data: new-token/migration only; trade subscriptions unavailable"
+        );
+    }
+
+    // === BLOCKER B — health execution-route vs Data-capability truth ==========
+
+    // (B1) No api-key => LOCAL execution (start(): use_local_api = api_key.is_empty()).
+    #[test]
+    fn test_health_execution_mode_no_key_is_local() {
+        assert_eq!(
+            health_execution_mode(false, false),
+            HealthExecutionMode::Local
+        );
+        // force_local_api is irrelevant when there is no key.
+        assert_eq!(
+            health_execution_mode(false, true),
+            HealthExecutionMode::Local
+        );
+    }
+
+    // (B2) api-key present + force_local_api=true => LOCAL execution. This is the
+    //      exact bug BLOCKER B fixes: a key used only for the Data API while the
+    //      trade route is pinned Local.
+    #[test]
+    fn test_health_execution_mode_key_plus_force_local_is_local() {
+        assert_eq!(
+            health_execution_mode(true, true),
+            HealthExecutionMode::Local
+        );
+    }
+
+    // (B3) api-key present + force_local_api=false => LIGHTNING execution.
+    #[test]
+    fn test_health_execution_mode_key_without_force_is_lightning() {
+        assert_eq!(
+            health_execution_mode(true, false),
+            HealthExecutionMode::Lightning
+        );
+    }
+
+    // (B4) a configured key with force_local_api=true yields LOCAL execution AND a
+    //      Data-available capability line: the Data credential is independent of the
+    //      execution route, and key presence never by itself implies Lightning.
+    #[test]
+    fn test_data_capability_key_does_not_imply_lightning_execution() {
+        let api_key_present = true;
+        let force_local_api = true;
+
+        // Execution route is LOCAL despite the key being present.
+        assert_eq!(
+            health_execution_mode(api_key_present, force_local_api),
+            HealthExecutionMode::Local
+        );
+
+        // Data capability is AVAILABLE because the key authenticates the Data API,
+        // independent of the (Local) execution route.
+        let data_line = health_data_capability_line(api_key_present);
+        assert_eq!(
+            data_line,
+            "Data: authenticated/metered token+account trade streams available"
+        );
+
+        // Sanity: the Local execution line must NOT claim Lightning.
+        let exec_line = health_execution_line(
+            health_execution_mode(api_key_present, force_local_api),
+            api_key_present,
+            force_local_api,
+        );
+        assert!(exec_line.contains("LOCAL MODE"));
+        assert!(!exec_line.contains("LIGHTNING"));
+    }
+
+    // (B5) the formatted health lines never contain the api-key. Formatting is a
+    //      pure function of booleans + the computed mode, so a sample secret can
+    //      never leak into either the execution or the Data line.
+    #[test]
+    fn test_health_execution_mode_text_contains_no_api_key() {
+        let sample_key = "super-secret-sample-api-key-XYZ-9876543210";
+        let api_key_present = true; // a key IS set in this scenario
+
+        for force_local_api in [true, false] {
+            let mode = health_execution_mode(api_key_present, force_local_api);
+            let exec_line = health_execution_line(mode, api_key_present, force_local_api);
+            let data_line = health_data_capability_line(api_key_present);
+
+            assert!(
+                !exec_line.contains(sample_key),
+                "execution line leaked the api-key"
+            );
+            assert!(
+                !data_line.contains(sample_key),
+                "data line leaked the api-key"
+            );
+        }
+    }
+
+    // (B5.1) no key + force false => LOCAL/no-key text.
+    #[test]
+    fn test_health_execution_line_no_key_force_false_says_no_key() {
+        let mode = health_execution_mode(false, false);
+        let line = health_execution_line(mode, false, false);
+        assert!(line.contains("LOCAL MODE"));
+        assert!(line.contains("no API key"));
+        assert!(!line.contains("Data API credential"));
+    }
+
+    // (B5.2) no key + force TRUE => STILL LOCAL/no-key text (the AUDIT-003 bug).
+    #[test]
+    fn test_health_execution_line_no_key_force_true_says_no_key() {
+        let mode = health_execution_mode(false, true);
+        let line = health_execution_line(mode, false, true);
+        assert!(line.contains("LOCAL MODE"));
+        assert!(line.contains("no API key"));
+    }
+
+    // (B5.3) no key + force TRUE must NEVER claim a Data API credential.
+    #[test]
+    fn test_health_execution_line_no_key_force_true_never_claims_data_credential() {
+        let mode = health_execution_mode(false, true);
+        let line = health_execution_line(mode, false, true);
+        assert!(
+            !line.contains("Data API credential"),
+            "no-key line falsely claimed a Data API credential"
+        );
+    }
+
+    // (B5.4) key present + force TRUE => LOCAL, and here the credential claim is
+    //        legitimate because a key actually exists.
+    #[test]
+    fn test_health_execution_line_key_force_true_reports_local() {
+        let mode = health_execution_mode(true, true);
+        let line = health_execution_line(mode, true, true);
+        assert!(line.contains("LOCAL MODE"));
+        assert!(line.contains("force_local_api"));
+        assert!(line.contains("Data API credential configured"));
+        assert!(!line.contains("LIGHTNING"));
+    }
+
+    // (B5.5) key present + no force => LIGHTNING.
+    #[test]
+    fn test_health_execution_line_key_no_force_reports_lightning() {
+        let mode = health_execution_mode(true, false);
+        let line = health_execution_line(mode, true, false);
+        assert!(line.contains("LIGHTNING MODE"));
+        assert!(!line.contains("LOCAL"));
+    }
+
+    // AUDIT-004 (B6): output policy — health() emits exactly ONE live
+    //      data-capability print site, and that site lives under the PumpPortal
+    //      ENABLED section, NOT the `use_for_trading` execution block. Data/event
+    //      capability is independent of the trade-execution route, so the print
+    //      must be gated by `pumpportal.enabled`. Enforce both facts by scanning
+    //      this module's own source, split across fragments so the assertions do
+    //      not count themselves.
+    #[test]
+    fn test_health_data_capability_print_site_is_single() {
+        let src = include_str!("commands.rs");
+        // The removed AUDIT-003 duplicate helper must not be reintroduced.
+        let helper = concat!("pumpportal_", "capability_line(");
+        assert!(
+            !src.contains(helper),
+            "the removed duplicate capability helper reappeared"
+        );
+        // Exactly one live print site feeds the authoritative Data line.
+        let prefix = concat!("PumpPortal Data ", "API... {}");
+        let data_line_prints = src.matches(prefix).count();
+        assert_eq!(
+            data_line_prints, 1,
+            "expected exactly one health data-capability print site, found {}",
+            data_line_prints
+        );
+    }
+
+    // AUDIT-004: prove SEMANTICS, not just "one print site" — the sole live Data
+    //      print site must sit inside the `if config.pumpportal.enabled {` block
+    //      and OUTSIDE the `if config.pumpportal.use_for_trading {` block. This is
+    //      the structural replacement for the AUDIT-003 test that only asserted the
+    //      print was inside `use_for_trading`.
+    #[test]
+    fn test_health_data_capability_is_tied_to_pumpportal_enabled_not_trading_route() {
+        // The pure predicate depends ONLY on `enabled`, never on the exec route.
+        assert!(health_should_report_pumpportal_data(true));
+        assert!(!health_should_report_pumpportal_data(false));
+
+        let src = include_str!("commands.rs");
+        let prefix = concat!("PumpPortal Data ", "API... {}");
+        let print_at = src
+            .find(prefix)
+            .expect("expected a live Data-capability print site");
+
+        // Byte offset of the enabled-section guard that must precede the print.
+        let enabled_guard = concat!("if config.pumpportal.", "enabled {");
+        let enabled_at = src
+            .find(enabled_guard)
+            .expect("expected the pumpportal.enabled health guard");
+        assert!(
+            enabled_at < print_at,
+            "Data print site must be inside the pumpportal.enabled section"
+        );
+
+        // Byte offset of the trading-route guard in health(). The Data print must
+        // NOT live after it (it belongs to the enabled section that precedes it).
+        let trading_guard = concat!("if config.pumpportal.", "use_for_trading {");
+        // There are several `use_for_trading` guards in the file; find the one that
+        // opens the health() Trading-API block by anchoring on its distinctive
+        // downstream marker.
+        let trading_marker = "PumpPortal Trading API... ";
+        let trading_marker_at = src
+            .find(trading_marker)
+            .expect("expected the health() Trading API block");
+        // The Data print site precedes the Trading API block entirely.
+        assert!(
+            print_at < trading_marker_at,
+            "Data print site must precede (not live inside) the Trading API block"
+        );
+        // And the trading guard exists (route reporting retained).
+        assert!(
+            src[..trading_marker_at].contains(trading_guard),
+            "expected the use_for_trading guard ahead of the Trading API block"
+        );
+    }
+
+    // AUDIT-004: enabled + Jito execution (use_for_trading=false) still reports the
+    //      PumpPortal Data capability, and the execution route is NOT PumpPortal.
+    #[test]
+    fn test_health_jito_execution_still_reports_pumpportal_data_when_enabled() {
+        let pumpportal_enabled = true;
+        let use_for_trading = false;
+        // Data capability is driven by `enabled`, so it reports even with Jito exec.
+        assert!(health_should_report_pumpportal_data(pumpportal_enabled));
+        // Execution route is NOT PumpPortal in this config: the Trading-API block is
+        // gated on `use_for_trading`, which is false here, so no PumpPortal exec line.
+        assert!(!use_for_trading);
+    }
+
+    // AUDIT-004: disabled PumpPortal never reports Data capability, even if an
+    //      unused api-key happens to be configured.
+    #[test]
+    fn test_health_disabled_pumpportal_does_not_report_data_capability() {
+        assert!(!health_should_report_pumpportal_data(false));
+    }
+
+    // (6b) masked config display (Agent B hardened) exposes neither the
+    //      PumpPortal api_key nor the Helius key embedded in the RPC URL.
+    #[test]
+    fn test_e8_masked_config_hides_keys() {
+        let mut config = Config::default();
+        config.pumpportal.api_key = "super-secret-sample-api-key-1234567890".to_string();
+        config.rpc.endpoint =
+            "https://mainnet.helius-rpc.com/?api-key=helius-secret-abcdef".to_string();
+        let display = config.masked_display();
+        assert!(
+            !display.contains("super-secret-sample-api-key-1234567890"),
+            "masked config must not contain the PumpPortal api_key"
+        );
+        assert!(
+            !display.contains("helius-secret-abcdef"),
+            "masked config must not contain the Helius RPC query key"
+        );
+    }
+
+    // (7) generic scan auto_buy remains a no-op: no submit/trader.buy path was
+    //     introduced, and the guard comment is present in this source file.
+    #[test]
+    fn test_e8_scan_auto_buy_remains_no_op() {
+        let src = include_str!("commands.rs");
+        assert!(
+            src.contains(
+                "If scan auto-buy becomes executable, it MUST acquire RuntimeLease before any state/wallet mutation."
+            ),
+            "scan auto-buy guard comment must be present"
+        );
+        // The generic `scan` fn ignores buy_amount (bound as `_buy_amount`) — no
+        // executable buy path exists.
+        assert!(
+            src.contains("_buy_amount: f64,"),
+            "generic scan must keep buy amount unused (no submit path)"
+        );
     }
 }

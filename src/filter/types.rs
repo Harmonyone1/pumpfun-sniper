@@ -312,9 +312,12 @@ pub struct SignalContext {
     pub uri: String,
     pub creator: String,
     pub bonding_curve: String,
-    pub initial_buy: u64,
-    pub v_tokens_in_bonding_curve: u64,
-    pub v_sol_in_bonding_curve: u64,
+    /// PumpPortal provider observational UI amount; not canonical raw units.
+    pub initial_buy: f64,
+    /// PumpPortal provider observational token reserve figure; not canonical raw units.
+    pub v_tokens_in_bonding_curve: f64,
+    /// PumpPortal provider observational SOL reserve figure; SOL, NOT lamports.
+    pub v_sol_in_bonding_curve: f64,
     pub market_cap_sol: f64,
     pub timestamp: DateTime<Utc>,
 
@@ -338,14 +341,15 @@ impl SignalContext {
         uri: String,
         creator: String,
         bonding_curve: String,
-        initial_buy: u64,
-        v_tokens_in_bonding_curve: u64,
-        v_sol_in_bonding_curve: u64,
+        initial_buy: f64,
+        v_tokens_in_bonding_curve: f64,
+        v_sol_in_bonding_curve: f64,
         market_cap_sol: f64,
     ) -> Self {
-        // Calculate bonding curve percentage
+        // Calculate bonding curve percentage from the provider's observational SOL
+        // reserve figure (already SOL, NOT lamports).
         // pump.fun bonding curve completes at ~85 SOL, starts at ~30 SOL virtual
-        // Progress = (current_sol - 30) / (85 - 30) * 100
+        // Progress = (provider_v_sol - 30) / (85 - 30) * 100
         let bc_pct = Self::calculate_bonding_curve_pct(v_sol_in_bonding_curve);
 
         Self {
@@ -368,24 +372,45 @@ impl SignalContext {
         }
     }
 
-    /// Calculate bonding curve progress percentage
-    /// pump.fun bonding curve: starts at ~30 SOL virtual, completes at ~85 SOL
-    pub fn calculate_bonding_curve_pct(v_sol_in_bonding_curve: u64) -> f64 {
-        const INITIAL_VIRTUAL_SOL: f64 = 30.0;
-        const COMPLETION_SOL: f64 = 85.0;
-        const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
-
-        let current_sol = v_sol_in_bonding_curve as f64 / LAMPORTS_PER_SOL;
-        let progress = ((current_sol - INITIAL_VIRTUAL_SOL) / (COMPLETION_SOL - INITIAL_VIRTUAL_SOL)) * 100.0;
+    /// Bonding-curve progress heuristic from the provider's observational SOL figure.
+    ///
+    /// Input is the PumpPortal provider `v_sol_in_bonding_curve` value, which is
+    /// already SOL (NOT lamports). There is intentionally NO `/1e9` conversion here.
+    ///
+    /// IMPORTANT: this is a provider heuristic only. It is NOT canonical
+    /// PumpMarketOracle state and NOT executable market truth. Do not use it to
+    /// authorize live-money entry/exit; the MPT executable quote remains the final
+    /// market gate.
+    ///
+    /// pump.fun bonding curve: starts at ~30 SOL virtual, completes at ~85 SOL.
+    /// If the input is non-finite, this returns a conservative `0.0`
+    /// (unavailable-safe). Production stream validation should already reject
+    /// non-finite provider values before they reach here.
+    pub fn calculate_bonding_curve_pct(provider_v_sol: f64) -> f64 {
+        if !provider_v_sol.is_finite() {
+            return 0.0;
+        }
+        let progress = ((provider_v_sol - 30.0) / (85.0 - 30.0)) * 100.0;
         progress.clamp(0.0, 100.0)
     }
 
-    /// Calculate estimated token price from bonding curve
+    /// Estimated token price as a provider observational reserve-ratio estimate.
+    ///
+    /// This operates directly on the provider observational f64 reserve figures
+    /// (SOL over tokens). It is NOT a canonical or executable price and must never
+    /// be treated as market truth; it is a rough provider ratio only. Returns
+    /// `0.0` for a zero/non-finite denominator or any non-finite result.
     pub fn estimated_price(&self) -> f64 {
-        if self.v_tokens_in_bonding_curve == 0 {
+        let denom = self.v_tokens_in_bonding_curve;
+        if denom == 0.0 || !denom.is_finite() {
             return 0.0;
         }
-        self.v_sol_in_bonding_curve as f64 / self.v_tokens_in_bonding_curve as f64
+        let price = self.v_sol_in_bonding_curve / denom;
+        if price.is_finite() {
+            price
+        } else {
+            0.0
+        }
     }
 }
 
@@ -454,22 +479,86 @@ mod tests {
         assert!(age >= 29.9 && age <= 30.1);
     }
 
-    #[test]
-    fn test_signal_context_price() {
-        let ctx = SignalContext::from_new_token(
+    fn sample_context(
+        initial_buy: f64,
+        v_tokens: f64,
+        v_sol: f64,
+    ) -> SignalContext {
+        SignalContext::from_new_token(
             "mint".to_string(),
             "Test".to_string(),
             "TST".to_string(),
             "uri".to_string(),
             "creator".to_string(),
             "curve".to_string(),
-            1000,
-            1_000_000_000,
-            100_000_000,
+            initial_buy,
+            v_tokens,
+            v_sol,
             1.0,
-        );
+        )
+    }
+
+    #[test]
+    fn test_signal_context_price() {
+        // Provider observational reserve ratio: 10 SOL / 100 tokens = 0.1
+        let ctx = sample_context(1000.0, 100.0, 10.0);
         let price = ctx.estimated_price();
         assert!((price - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_provider_bonding_curve_30_sol_is_zero_percent() {
+        assert_eq!(SignalContext::calculate_bonding_curve_pct(30.0), 0.0);
+    }
+
+    #[test]
+    fn test_provider_bonding_curve_57_5_sol_is_fifty_percent() {
+        // (57.5 - 30) / (85 - 30) * 100 = 50
+        let pct = SignalContext::calculate_bonding_curve_pct(57.5);
+        assert!((pct - 50.0).abs() < 1e-9, "expected 50%, got {}", pct);
+    }
+
+    #[test]
+    fn test_provider_bonding_curve_85_sol_is_hundred_percent() {
+        assert_eq!(SignalContext::calculate_bonding_curve_pct(85.0), 100.0);
+    }
+
+    #[test]
+    fn test_provider_bonding_curve_fractional_sol_not_truncated() {
+        // 31.75 SOL must yield a small positive pct, NOT zero (old /1e9 truncation bug).
+        let pct = SignalContext::calculate_bonding_curve_pct(31.75);
+        assert!(pct > 0.0, "fractional provider SOL truncated to zero: {}", pct);
+        // Sanity: (31.75 - 30) / 55 * 100 ≈ 3.1818
+        assert!((pct - 3.181818).abs() < 1e-4, "unexpected pct {}", pct);
+    }
+
+    #[test]
+    fn test_provider_bonding_curve_nonfinite_is_zero() {
+        // Documented conservative unavailable-safe behavior for non-finite input.
+        assert_eq!(SignalContext::calculate_bonding_curve_pct(f64::NAN), 0.0);
+        assert_eq!(SignalContext::calculate_bonding_curve_pct(f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn test_signal_context_preserves_fractional_provider_values() {
+        let ctx = sample_context(31.75, 42.5, 31.75);
+        // Fractional provider values must survive the bridge untruncated.
+        assert_eq!(ctx.initial_buy, 31.75);
+        assert_eq!(ctx.v_tokens_in_bonding_curve, 42.5);
+        assert_eq!(ctx.v_sol_in_bonding_curve, 31.75);
+        // Derived bonding-curve pct should reflect the fractional SOL, not zero.
+        assert!(ctx.bonding_curve_pct.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_provider_estimated_price_is_observational_ratio() {
+        // Direct reserve ratio on f64 fields: 15.5 SOL / 62.0 tokens = 0.25
+        let ctx = sample_context(0.0, 62.0, 15.5);
+        assert!((ctx.estimated_price() - 0.25).abs() < 1e-9);
+
+        // Zero denominator returns 0.0 (not NaN/inf).
+        let zero_denom = sample_context(0.0, 0.0, 15.5);
+        assert_eq!(zero_denom.estimated_price(), 0.0);
     }
 
     #[test]
