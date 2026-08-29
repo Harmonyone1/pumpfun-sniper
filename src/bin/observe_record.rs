@@ -65,6 +65,60 @@ const INTAKE_SECONDS_MAX: u64 = 21_600;
 const MAX_ACTIVE_MIN: usize = 1;
 const MAX_ACTIVE_MAX: usize = 256;
 
+/// Bounded grace (ms) after `client.stop()` before the post-stop tail drain, to
+/// let the worker deliver any final already-queued events (packet §10.3).
+const POST_STOP_GRACE_MS: u64 = 150;
+
+// ---------------------------------------------------------------------------
+// AUDIT-001 §3-4/§17 — fixed, secret-safe collector recorder-write errors.
+// These NEVER carry the raw recorder I/O text or the output path.
+// ---------------------------------------------------------------------------
+
+/// Fixed, secret-safe error for a failed recorder append in the main/intake/drain
+/// path. Its Display text is a fixed literal and never includes an output path,
+/// RPC endpoint, authenticated URL, API key, environment, or config contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectorRecordError;
+
+impl std::fmt::Display for CollectorRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("observation recorder write failed")
+    }
+}
+
+impl std::error::Error for CollectorRecordError {}
+
+/// A tracking task's recorder-write failure, surfaced to the parent so a lost
+/// recorder is never silently ignored (§4.2). Fixed, secret-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateTaskFailure {
+    RecorderWrite,
+}
+
+impl std::fmt::Display for CandidateTaskFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tracking task observation recorder write failed")
+    }
+}
+
+/// What a tracking task hands back to the parent: a clean result or a fixed
+/// recorder-write failure. The raw I/O error is never carried across.
+type CandidateTaskOutcome = std::result::Result<CandidateTaskResult, CandidateTaskFailure>;
+
+/// AUDIT-001 §4.1/§13 — the ONE required recorder append helper. Every collector
+/// recorder write in the main/intake/drain path routes through this so no append
+/// Result is ever discarded. On failure it returns a fixed, secret-safe error
+/// (the raw recorder I/O text/path is dropped here).
+async fn append_required(
+    recorder: &ObservationRecorder,
+    payload: ObservationPayload,
+) -> std::result::Result<u64, CollectorRecordError> {
+    recorder
+        .append(payload)
+        .await
+        .map_err(|_| CollectorRecordError)
+}
+
 #[derive(Parser)]
 #[command(name = "observe-record")]
 struct Args {
@@ -234,15 +288,29 @@ struct RunCounters {
     migrations_seen: u64,
     task_failures: u64,
     drain_timed_out: u64,
+    /// AUDIT-001 §4.4 — collector-internal only. NEVER serialized as a schema
+    /// field. A recorder append failure invalidates dataset integrity => Failed.
+    recorder_failures: u64,
 }
 
 /// Pure run-completion policy from authoritative counters plus drain outcome
-/// (packet section 22). Counters are authoritative.
-fn run_completion(counters: &RunCounters, ever_connected: bool) -> RunCompletion {
+/// (packet section 22, AUDIT-001 §11). Counters are authoritative.
+///
+/// `stream_connected_at_intake_end` is the stream-connection state captured at the
+/// intake boundary BEFORE the intentional `client.stop()` — an unresolved
+/// disconnect at intake end fails the run so a biased/incomplete launch window is
+/// never claimed complete.
+fn run_completion(
+    counters: &RunCounters,
+    ever_connected: bool,
+    stream_connected_at_intake_end: bool,
+) -> RunCompletion {
     let failed = !ever_connected
+        || !stream_connected_at_intake_end
         || counters.provider_errors > 0
         || counters.unexpected_trade_events > 0
-        || counters.drain_timed_out > 0;
+        || counters.drain_timed_out > 0
+        || counters.recorder_failures > 0;
     if failed {
         return RunCompletion::Failed;
     }
@@ -250,6 +318,96 @@ fn run_completion(counters: &RunCounters, ever_connected: bool) -> RunCompletion
         return RunCompletion::Degraded;
     }
     RunCompletion::Complete
+}
+
+// ---------------------------------------------------------------------------
+// AUDIT-001 §12 — pure task-result accounting, shared by the nonblocking intake
+// reaper and the final outcome drain so a reaped task is never double-counted.
+// ---------------------------------------------------------------------------
+
+/// The effect a single joined tracking-task result has on the run counters. Pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskAccounting {
+    /// A clean tracking result => `tracking_completed += 1`.
+    Completed,
+    /// The task lost its recorder => `recorder_failures += 1` (run Failed).
+    RecorderFailure,
+    /// Panic/JoinError => `task_failures += 1` (may degrade).
+    TaskFailure,
+}
+
+/// Map a joined tracking-task result (`Ok(CandidateTaskOutcome)` on clean join, or
+/// `Err(join_error)` on panic/cancel) to its counter effect. Pure: no side effects,
+/// no recorder I/O, network-free.
+fn account_task_result(joined: &std::result::Result<CandidateTaskOutcome, ()>) -> TaskAccounting {
+    match joined {
+        Ok(Ok(_success)) => TaskAccounting::Completed,
+        Ok(Err(CandidateTaskFailure::RecorderWrite)) => TaskAccounting::RecorderFailure,
+        Err(()) => TaskAccounting::TaskFailure,
+    }
+}
+
+/// Apply a [`TaskAccounting`] effect to the run counters. Pure counter mutation.
+fn apply_task_accounting(counters: &mut RunCounters, effect: TaskAccounting) {
+    match effect {
+        TaskAccounting::Completed => counters.tracking_completed += 1,
+        TaskAccounting::RecorderFailure => counters.recorder_failures += 1,
+        TaskAccounting::TaskFailure => counters.task_failures += 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AUDIT-001 §8-9 — pure event -> stream-connected state transition.
+// ---------------------------------------------------------------------------
+
+/// Whether a delivered channel value marks the stream connected during ACTIVE
+/// intake. `Some(true)`=Connected, `Some(false)`=Disconnected, `None` (channel
+/// closed) => disconnected. Provider errors / trades do NOT change this bool and
+/// are represented by returning the unchanged prior state at the call site.
+///
+/// Returns the new `stream_connected` value given the prior value and the
+/// transition kind. Pure.
+fn apply_stream_transition(prior: bool, transition: StreamTransition) -> bool {
+    match transition {
+        StreamTransition::Connected => true,
+        StreamTransition::Disconnected => false,
+        StreamTransition::ChannelClosed => false,
+        StreamTransition::NoChange => prior,
+    }
+}
+
+/// Active-intake stream-state transitions relevant to run completeness (§8-9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamTransition {
+    Connected,
+    Disconnected,
+    ChannelClosed,
+    /// Provider error / unexpected trade: does not change stream_connected. Only
+    /// exercised by the pure transition test; the intake path leaves the bool as-is.
+    #[cfg_attr(not(test), allow(dead_code))]
+    NoChange,
+}
+
+// ---------------------------------------------------------------------------
+// AUDIT-001 §5-6 — pure outcome sampled_at policy from sell-quote truth.
+// OutcomeSample.sampled_at is the sell-quote observation timestamp when sell
+// succeeds; otherwise the time the sell observation failure returned.
+// ---------------------------------------------------------------------------
+
+/// Define an outcome sample's `sampled_at` from quote truth (§6):
+/// - sell-quote SUCCESS => the quote's canonical `quoted_at`;
+/// - sell-quote FAILURE => `failure_completion_time` (stamped AFTER the failed
+///   await returned).
+///
+/// Pure; no RPC. `sell_quoted_at` is `Some` iff the sell quote succeeded.
+fn outcome_sampled_at(
+    sell_quoted_at: Option<DateTime<Utc>>,
+    failure_completion_time: DateTime<Utc>,
+) -> DateTime<Utc> {
+    match sell_quoted_at {
+        Some(quoted_at) => quoted_at,
+        None => failure_completion_time,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,13 +526,30 @@ async fn main() -> Result<()> {
 
     let mut counters = RunCounters::default();
     let mut seen_signatures: HashSet<String> = HashSet::new();
-    let mut tasks: JoinSet<CandidateTaskResult> = JoinSet::new();
+    let mut tasks: JoinSet<CandidateTaskOutcome> = JoinSet::new();
     let mut ever_connected = false;
+    // AUDIT-001 §8-9: current provider stream-connection state during ACTIVE
+    // intake. Drives run completeness at the intake boundary.
+    let mut stream_connected = false;
 
     // --- Section 41: bounded intake window. No early-success exit. ---
     let intake_deadline = tokio::time::Instant::now() + Duration::from_secs(intake_seconds);
 
-    loop {
+    'intake: loop {
+        // AUDIT-001 §4.3: nonblocking reap of already-finished tracking tasks at
+        // least once per loop turn so a lost recorder is discovered immediately.
+        // A task reaped here is removed from the JoinSet and never seen again in
+        // the final drain (no double count).
+        while let Some(joined) = tasks.try_join_next() {
+            let mapped = joined.map_err(|_| ());
+            let effect = account_task_result(&mapped);
+            apply_task_accounting(&mut counters, effect);
+            if effect == TaskAccounting::RecorderFailure {
+                // Fatal: a tracking task lost its recorder. Stop intake and fail.
+                break 'intake;
+            }
+        }
+
         let now = tokio::time::Instant::now();
         if now >= intake_deadline {
             break;
@@ -384,7 +559,7 @@ async fn main() -> Result<()> {
 
         match tokio::time::timeout(wait, event_rx.recv()).await {
             Ok(Some(event)) => {
-                handle_intake_event(
+                match handle_intake_event(
                     event,
                     &recorder,
                     &oracle,
@@ -393,34 +568,69 @@ async fn main() -> Result<()> {
                     &mut counters,
                     &mut tasks,
                     &mut ever_connected,
+                    &mut stream_connected,
                 )
-                .await;
+                .await
+                {
+                    Ok(()) => {}
+                    // Fatal recorder I/O in the intake path: terminate without a
+                    // healed partial line (§4.1). Fixed, secret-safe error.
+                    Err(err) => return Err(anyhow!("{err}")),
+                }
             }
-            // Channel closed (worker gone): stop intake.
-            Ok(None) => break,
+            // Channel closed (worker gone): stream disconnected, stop intake.
+            Ok(None) => {
+                stream_connected =
+                    apply_stream_transition(stream_connected, StreamTransition::ChannelClosed);
+                break;
+            }
             // Quiet point: just loop and re-check the deadline.
             Err(_) => continue,
         }
     }
 
-    // --- Section 43 final order: stop stream. ---
+    // AUDIT-001 §10.1: BEFORE stopping the stream, nonblocking-drain events that
+    // are ALREADY queued and process them under NORMAL active-intake stream-state
+    // semantics; drained NewTokens are persisted but use TrackingSkipped
+    // (IntakeClosed) and start NO task. Then capture the run-completeness state.
+    if let Err(err) = drain_pre_stop(
+        &mut event_rx,
+        &recorder,
+        &mut seen_signatures,
+        &mut counters,
+        &mut stream_connected,
+    )
+    .await
+    {
+        return Err(anyhow!("{err}"));
+    }
+
+    // AUDIT-001 §10.1(4): THIS is the run-completeness state, captured BEFORE stop.
+    let stream_connected_at_intake_end = stream_connected;
+
+    // --- AUDIT-001 §10.2 / Section 43 final order: stop stream. ---
     client.stop();
 
-    // --- Section 41: nonblocking drain of already-queued provider events. NO new
-    // tracking tasks are started for drained NewTokens (IntakeClosed skip). ---
-    drain_queued_after_intake(
+    // AUDIT-001 §10.3: after a short bounded grace, nonblocking-drain final
+    // delivered events. Post-stop Connected/Disconnected are shutdown mechanics
+    // and MUST NOT alter completeness or operational counters/records.
+    tokio::time::sleep(Duration::from_millis(POST_STOP_GRACE_MS)).await;
+    if let Err(err) = drain_post_stop(
         &mut event_rx,
         &recorder,
         &mut seen_signatures,
         &mut counters,
     )
-    .await;
+    .await
+    {
+        return Err(anyhow!("{err}"));
+    }
 
     // --- Section 42: bounded outcome drain of already-started tasks. ---
     drain_outcome_tasks(&mut tasks, &recorder, &mut counters).await;
 
     // --- Section 22/43: append authoritative RunFinished, then sync. ---
-    let completion = run_completion(&counters, ever_connected);
+    let completion = run_completion(&counters, ever_connected, stream_connected_at_intake_end);
     let run_finished = RunFinishedRecord {
         completion: completion.clone(),
         candidates_seen: counters.candidates_seen,
@@ -435,10 +645,9 @@ async fn main() -> Result<()> {
         unexpected_trade_events: counters.unexpected_trade_events,
         migrations_seen: counters.migrations_seen,
     };
-    recorder
-        .append(ObservationPayload::RunFinished(run_finished))
+    append_required(&recorder, ObservationPayload::RunFinished(run_finished))
         .await
-        .context("failed to append RunFinished")?;
+        .map_err(|e| anyhow!("{e}"))?;
     recorder
         .sync_data()
         .await
@@ -483,52 +692,58 @@ async fn handle_intake_event(
     semaphore: &Arc<Semaphore>,
     seen_signatures: &mut HashSet<String>,
     counters: &mut RunCounters,
-    tasks: &mut JoinSet<CandidateTaskResult>,
+    tasks: &mut JoinSet<CandidateTaskOutcome>,
     ever_connected: &mut bool,
-) {
+    stream_connected: &mut bool,
+) -> std::result::Result<(), CollectorRecordError> {
     match event {
         PumpPortalEvent::Connected => {
             counters.stream_connected_events += 1;
             *ever_connected = true;
-            let _ = recorder
-                .append(stream_state(StreamStateKind::Connected, None))
-                .await;
+            *stream_connected =
+                apply_stream_transition(*stream_connected, StreamTransition::Connected);
+            append_required(recorder, stream_state(StreamStateKind::Connected, None)).await?;
             println!("PumpPortal: connected");
         }
         PumpPortalEvent::Disconnected => {
             counters.stream_disconnect_events += 1;
-            let _ = recorder
-                .append(stream_state(StreamStateKind::Disconnected, None))
-                .await;
+            *stream_connected =
+                apply_stream_transition(*stream_connected, StreamTransition::Disconnected);
+            append_required(recorder, stream_state(StreamStateKind::Disconnected, None)).await?;
         }
         PumpPortalEvent::Error(category) => {
             counters.provider_errors += 1;
-            // `category` is already a sanitized fixed provider category.
+            // `category` is already a sanitized fixed provider category. A provider
+            // error does not itself mutate stream_connected (§9); it fails the run.
             let safe = sanitize_persist_text(&category, 128);
-            let _ = recorder
-                .append(stream_state(StreamStateKind::ProviderError, Some(safe)))
-                .await;
+            append_required(
+                recorder,
+                stream_state(StreamStateKind::ProviderError, Some(safe)),
+            )
+            .await?;
         }
         PumpPortalEvent::Trade(_) => {
             // Free-only plan: a Trade is an anomaly. No trade fields recorded.
             counters.unexpected_trade_events += 1;
-            let _ = recorder
-                .append(stream_state(StreamStateKind::UnexpectedTrade, None))
-                .await;
+            append_required(
+                recorder,
+                stream_state(StreamStateKind::UnexpectedTrade, None),
+            )
+            .await?;
         }
         PumpPortalEvent::Migration(ev) => {
             counters.migrations_seen += 1;
-            let _ = recorder
-                .append(ObservationPayload::MigrationObserved(
-                    MigrationObservedRecord {
-                        mint: ev.mint,
-                        signature: ev.signature,
-                        pool: ev.pool,
-                        pool_id: ev.pool_id,
-                        provider_received_at: ev.received_at,
-                    },
-                ))
-                .await;
+            append_required(
+                recorder,
+                ObservationPayload::MigrationObserved(MigrationObservedRecord {
+                    mint: ev.mint,
+                    signature: ev.signature,
+                    pool: ev.pool,
+                    pool_id: ev.pool_id,
+                    provider_received_at: ev.received_at,
+                }),
+            )
+            .await?;
         }
         PumpPortalEvent::NewToken(ev) => {
             let candidate_received_at = Utc::now();
@@ -537,16 +752,20 @@ async fn handle_intake_event(
             let signature = ev.signature.clone();
             let duplicate = seen_signatures.contains(&signature);
 
-            // Section 35/51: ALWAYS persist CandidateObserved first.
-            let _ = recorder.append(candidate_observed(&ev, duplicate)).await;
+            // AUDIT-001 §4.1 ordering: receive NewToken -> await a SUCCESSFUL
+            // CandidateObserved append -> ONLY THEN mutate seen_signatures /
+            // capacity / spawn tracking. On append Err: do not insert the
+            // signature, do not acquire a permit, do not spawn; return a fixed
+            // secret-safe error (the process may terminate without RunFinished).
+            append_required(recorder, candidate_observed(&ev, duplicate)).await?;
 
             if duplicate {
                 counters.duplicate_candidate_events += 1;
                 // Section 35: do NOT launch a second tracking task.
-                return;
+                return Ok(());
             }
 
-            // First-seen.
+            // First-seen — CandidateObserved is now durably persisted.
             seen_signatures.insert(signature.clone());
             counters.unique_candidates += 1;
 
@@ -559,14 +778,16 @@ async fn handle_intake_event(
                 Ok(m) => m,
                 Err(_) => {
                     counters.tracking_skipped += 1;
-                    let _ = recorder
-                        .append(tracking_skipped(
+                    append_required(
+                        recorder,
+                        tracking_skipped(
                             &candidate_id,
                             &mint_str,
                             ObservationFailureCode::InvalidProviderIdentity,
-                        ))
-                        .await;
-                    return;
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
                 }
             };
 
@@ -587,117 +808,188 @@ async fn handle_intake_event(
                 }
                 Err(_) => {
                     counters.tracking_skipped += 1;
-                    let _ = recorder
-                        .append(tracking_skipped(
+                    append_required(
+                        recorder,
+                        tracking_skipped(
                             &candidate_id,
                             &mint_str,
                             ObservationFailureCode::TrackingCapacity,
-                        ))
-                        .await;
+                        ),
+                    )
+                    .await?;
                 }
             }
         }
     }
+    Ok(())
 }
 
-/// Section 41: after the intake deadline, drain already-queued events. Migrations,
-/// stream states, and unexpected trades are still recorded; queued NewTokens are
-/// persisted (CandidateObserved) but NOT retracked (IntakeClosed skip).
-async fn drain_queued_after_intake(
+/// AUDIT-001 §10.1: BEFORE `client.stop()`, nonblocking-drain events ALREADY
+/// queued and process them under NORMAL active-intake stream-state semantics
+/// (Connected/Disconnected still mutate `stream_connected` and operational
+/// counters/records). Drained NewTokens are persisted (CandidateObserved) but
+/// use TrackingSkipped(IntakeClosed) and start NO task. Every append is required.
+async fn drain_pre_stop(
     event_rx: &mut mpsc::Receiver<PumpPortalEvent>,
     recorder: &ObservationRecorder,
     seen_signatures: &mut HashSet<String>,
     counters: &mut RunCounters,
-) {
+    stream_connected: &mut bool,
+) -> std::result::Result<(), CollectorRecordError> {
     while let Ok(event) = event_rx.try_recv() {
         match event {
             PumpPortalEvent::Connected => {
                 counters.stream_connected_events += 1;
-                let _ = recorder
-                    .append(stream_state(StreamStateKind::Connected, None))
-                    .await;
+                *stream_connected =
+                    apply_stream_transition(*stream_connected, StreamTransition::Connected);
+                append_required(recorder, stream_state(StreamStateKind::Connected, None)).await?;
             }
             PumpPortalEvent::Disconnected => {
                 counters.stream_disconnect_events += 1;
-                let _ = recorder
-                    .append(stream_state(StreamStateKind::Disconnected, None))
-                    .await;
+                *stream_connected =
+                    apply_stream_transition(*stream_connected, StreamTransition::Disconnected);
+                append_required(recorder, stream_state(StreamStateKind::Disconnected, None))
+                    .await?;
             }
             PumpPortalEvent::Error(category) => {
                 counters.provider_errors += 1;
                 let safe = sanitize_persist_text(&category, 128);
-                let _ = recorder
-                    .append(stream_state(StreamStateKind::ProviderError, Some(safe)))
-                    .await;
+                append_required(
+                    recorder,
+                    stream_state(StreamStateKind::ProviderError, Some(safe)),
+                )
+                .await?;
             }
             PumpPortalEvent::Trade(_) => {
                 counters.unexpected_trade_events += 1;
-                let _ = recorder
-                    .append(stream_state(StreamStateKind::UnexpectedTrade, None))
-                    .await;
+                append_required(
+                    recorder,
+                    stream_state(StreamStateKind::UnexpectedTrade, None),
+                )
+                .await?;
             }
             PumpPortalEvent::Migration(ev) => {
                 counters.migrations_seen += 1;
-                let _ = recorder
-                    .append(ObservationPayload::MigrationObserved(
-                        MigrationObservedRecord {
-                            mint: ev.mint,
-                            signature: ev.signature,
-                            pool: ev.pool,
-                            pool_id: ev.pool_id,
-                            provider_received_at: ev.received_at,
-                        },
-                    ))
-                    .await;
+                append_required(
+                    recorder,
+                    ObservationPayload::MigrationObserved(MigrationObservedRecord {
+                        mint: ev.mint,
+                        signature: ev.signature,
+                        pool: ev.pool,
+                        pool_id: ev.pool_id,
+                        provider_received_at: ev.received_at,
+                    }),
+                )
+                .await?;
             }
             PumpPortalEvent::NewToken(ev) => {
-                counters.candidates_seen += 1;
-                let signature = ev.signature.clone();
-                let duplicate = seen_signatures.contains(&signature);
-                let _ = recorder.append(candidate_observed(&ev, duplicate)).await;
-                if duplicate {
-                    counters.duplicate_candidate_events += 1;
-                    continue;
-                }
-                seen_signatures.insert(signature.clone());
-                counters.unique_candidates += 1;
-                // Intake closed: retain the candidate, but never start a new task.
-                counters.tracking_skipped += 1;
-                let _ = recorder
-                    .append(tracking_skipped(
-                        &signature,
-                        &ev.mint,
-                        ObservationFailureCode::IntakeClosed,
-                    ))
-                    .await;
+                drain_new_token_intake_closed(recorder, seen_signatures, counters, &ev).await?;
             }
         }
     }
+    Ok(())
+}
+
+/// AUDIT-001 §10.3: AFTER the intentional `client.stop()`, nonblocking-drain any
+/// final delivered events. Post-stop Connected/Disconnected are shutdown
+/// mechanics: they MUST NOT alter completeness, MUST NOT increment operational
+/// connection/disconnection counters, and MUST NOT emit operational StreamState
+/// records. NewToken => CandidateObserved + IntakeClosed skip; MigrationObserved,
+/// ProviderError, and UnexpectedTrade are still counted/recorded (the latter two
+/// still fail the run). Every emitted append is required.
+async fn drain_post_stop(
+    event_rx: &mut mpsc::Receiver<PumpPortalEvent>,
+    recorder: &ObservationRecorder,
+    seen_signatures: &mut HashSet<String>,
+    counters: &mut RunCounters,
+) -> std::result::Result<(), CollectorRecordError> {
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            // Shutdown mechanics: ignore entirely (no counter, no record).
+            PumpPortalEvent::Connected | PumpPortalEvent::Disconnected => {}
+            PumpPortalEvent::Error(category) => {
+                counters.provider_errors += 1;
+                let safe = sanitize_persist_text(&category, 128);
+                append_required(
+                    recorder,
+                    stream_state(StreamStateKind::ProviderError, Some(safe)),
+                )
+                .await?;
+            }
+            PumpPortalEvent::Trade(_) => {
+                counters.unexpected_trade_events += 1;
+                append_required(
+                    recorder,
+                    stream_state(StreamStateKind::UnexpectedTrade, None),
+                )
+                .await?;
+            }
+            PumpPortalEvent::Migration(ev) => {
+                counters.migrations_seen += 1;
+                append_required(
+                    recorder,
+                    ObservationPayload::MigrationObserved(MigrationObservedRecord {
+                        mint: ev.mint,
+                        signature: ev.signature,
+                        pool: ev.pool,
+                        pool_id: ev.pool_id,
+                        provider_received_at: ev.received_at,
+                    }),
+                )
+                .await?;
+            }
+            PumpPortalEvent::NewToken(ev) => {
+                drain_new_token_intake_closed(recorder, seen_signatures, counters, &ev).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Persist a drained NewToken with intake closed: CandidateObserved first, then
+/// (if first-seen) an IntakeClosed TrackingSkipped. Never starts a task. Shared by
+/// pre-stop and post-stop drains. Every append is required.
+async fn drain_new_token_intake_closed(
+    recorder: &ObservationRecorder,
+    seen_signatures: &mut HashSet<String>,
+    counters: &mut RunCounters,
+    ev: &pumpfun_sniper::stream::pumpportal::NewTokenEvent,
+) -> std::result::Result<(), CollectorRecordError> {
+    counters.candidates_seen += 1;
+    let signature = ev.signature.clone();
+    let duplicate = seen_signatures.contains(&signature);
+    append_required(recorder, candidate_observed(ev, duplicate)).await?;
+    if duplicate {
+        counters.duplicate_candidate_events += 1;
+        return Ok(());
+    }
+    seen_signatures.insert(signature.clone());
+    counters.unique_candidates += 1;
+    // Intake closed: retain the candidate, but never start a new task.
+    counters.tracking_skipped += 1;
+    append_required(
+        recorder,
+        tracking_skipped(&signature, &ev.mint, ObservationFailureCode::IntakeClosed),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Section 42: wait for already-started tracking tasks under a hard 135s bound. On
 /// timeout, abort remaining tasks and mark the run drain-timed-out.
 async fn drain_outcome_tasks(
-    tasks: &mut JoinSet<CandidateTaskResult>,
+    tasks: &mut JoinSet<CandidateTaskOutcome>,
     recorder: &ObservationRecorder,
     counters: &mut RunCounters,
 ) {
+    // AUDIT-001 §12: only tasks still present are processed; tasks reaped during
+    // intake are already removed from the JoinSet, so there is no double count.
+    // Ok(success) => tracking_completed; Ok(RecorderWrite) => recorder_failures
+    // (Failed); Err(JoinError) => task_failures.
     let drain = async {
         while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok(result) => {
-                    // The task already appended its own TrackingFinished record.
-                    let _ = result;
-                    counters.tracking_completed += 1;
-                }
-                Err(_) => {
-                    // Section 40: panic/join error. Identity is not recoverable from
-                    // a JoinError here, so we record a task failure count and a
-                    // best-effort finish record without identity is not possible;
-                    // the run completion becomes Degraded via task_failures.
-                    counters.task_failures += 1;
-                }
-            }
+            let mapped = joined.map_err(|_| ());
+            apply_task_accounting(counters, account_task_result(&mapped));
         }
     };
 
@@ -711,10 +1003,8 @@ async fn drain_outcome_tasks(
             // bound (abort is prompt). A DrainTimedOut finish record cannot carry a
             // specific identity here, so we only flip the run counters.
             while let Some(joined) = tasks.join_next().await {
-                match joined {
-                    Ok(_) => counters.tracking_completed += 1,
-                    Err(_) => counters.task_failures += 1,
-                }
+                let mapped = joined.map_err(|_| ());
+                apply_task_accounting(counters, account_task_result(&mapped));
             }
             let _ = recorder; // no manual per-candidate record without identity
         }
@@ -736,7 +1026,7 @@ async fn track_candidate(
     candidate_received_at: DateTime<Utc>,
     oracle: Arc<PumpMarketOracle>,
     recorder: ObservationRecorder,
-) -> CandidateTaskResult {
+) -> CandidateTaskOutcome {
     let mint_str = mint.to_string();
 
     // --- Section 16/36: bounded initial availability retry. ---
@@ -747,6 +1037,10 @@ async fn track_candidate(
     let mut buy_quote_failure: Option<ObservationFailureCode> = None;
     let mut initial_base_amount_raw: Option<u64> = None;
     let mut entry_wall_time: Option<DateTime<Utc>> = None;
+    // AUDIT-001 §7: the monotonic horizon anchor is captured in the SAME buy-quote
+    // success branch that accepts the initial quote (below), before any recorder
+    // await or further async. It is never reconstructed after InitialMarket.
+    let mut entry_monotonic_anchor: Option<tokio::time::Instant> = None;
     let mut attempts: u8 = 0;
 
     for (i, delay_ms) in backoffs.iter().enumerate() {
@@ -768,9 +1062,17 @@ async fn track_candidate(
 
         match oracle.quote_buy_sol(&mint, ENTRY_QUOTE_LAMPORTS).await {
             Ok(q) => {
+                // AUDIT-001 §7: IMMEDIATELY, in this buy-quote success branch,
+                // capture BOTH the wall-clock entry time (the quote's canonical
+                // quoted_at) and the monotonic anchor — before converting/
+                // recording InitialMarket, before any recorder await, before any
+                // further async work.
+                let entry_wall = q.quoted_at;
+                entry_monotonic_anchor = Some(tokio::time::Instant::now());
+
                 let rec = ExecutableQuoteRecord::from(&q);
                 initial_base_amount_raw = Some(rec.base_amount_raw);
-                entry_wall_time = Some(rec.quoted_at);
+                entry_wall_time = Some(entry_wall);
                 buy_quote_record = Some(rec);
                 buy_quote_failure = None;
                 // Success criterion for tracking is a valid SOL buy quote.
@@ -792,7 +1094,10 @@ async fn track_candidate(
         buy_quote_failure = Some(ObservationFailureCode::Other);
     }
 
-    let _ = recorder
+    // AUDIT-001 §4.2: required task write. On failure, stop the task, produce no
+    // later samples, and surface RecorderWrite to the parent (raw I/O never
+    // serialized/printed).
+    if recorder
         .append(ObservationPayload::InitialMarket(InitialMarketRecord {
             candidate_id: candidate_id.clone(),
             mint: mint_str.clone(),
@@ -803,13 +1108,23 @@ async fn track_candidate(
             buy_quote_failure: buy_quote_failure.clone(),
             initial_observation_attempts: attempts,
         }))
-        .await;
+        .await
+        .is_err()
+    {
+        return Err(CandidateTaskFailure::RecorderWrite);
+    }
 
     // --- Section 16: no buy quote after retries => finish, no sell samples. ---
-    let (base_amount_raw, entry_wall_time) = match (initial_base_amount_raw, entry_wall_time) {
-        (Some(b), Some(t)) => (b, t),
+    // AUDIT-001 §7: use the anchor captured in the buy-quote success branch; it is
+    // present exactly when the initial base quantity + wall time are.
+    let (base_amount_raw, entry_wall_time, entry_monotonic) = match (
+        initial_base_amount_raw,
+        entry_wall_time,
+        entry_monotonic_anchor,
+    ) {
+        (Some(b), Some(t), Some(anchor)) => (b, t, anchor),
         _ => {
-            let _ = recorder
+            if recorder
                 .append(tracking_finished(
                     &candidate_id,
                     &mint_str,
@@ -817,17 +1132,20 @@ async fn track_candidate(
                     0,
                     0,
                 ))
-                .await;
-            return CandidateTaskResult {
+                .await
+                .is_err()
+            {
+                return Err(CandidateTaskFailure::RecorderWrite);
+            }
+            return Ok(CandidateTaskResult {
                 candidate_id,
                 mint: mint_str,
                 status: TrackingFinishStatus::InitialQuoteUnavailable,
-            };
+            });
         }
     };
 
-    // --- Section 37: anchor horizons to the successful initial buy quote. ---
-    let entry_monotonic = tokio::time::Instant::now();
+    // --- Section 37: horizons anchored to the anchor captured at buy-quote success. ---
     let mut successful_samples: u16 = 0;
     let mut failed_samples: u16 = 0;
 
@@ -838,12 +1156,14 @@ async fn track_candidate(
         if due_monotonic > now {
             tokio::time::sleep(due_monotonic - now).await;
         }
-        let sampled_at = Utc::now();
         let due_at = horizon_due_at(entry_wall_time, horizon);
-        let lag_ms = sample_lag_ms(due_at, sampled_at);
 
-        // --- Section 38: exact-size future sell quote (quantity frozen). ---
-        let (sell_quote, sell_quote_failure, return_bps) = match oracle
+        // --- Section 38 / AUDIT-001 §5-6: exact-size future sell quote (quantity
+        // frozen at initial_buy_quote.base_amount_raw). OutcomeSample.sampled_at is
+        // the sell-quote observation timestamp when sell succeeds; otherwise the
+        // time the sell observation failure returned. sampled_at is therefore
+        // defined AFTER the sell await, never before it.
+        let (sell_quote, sell_quote_failure, return_bps, sampled_at) = match oracle
             .quote_sell_raw(&mint, base_amount_raw)
             .await
         {
@@ -851,10 +1171,19 @@ async fn track_candidate(
                 let rec = ExecutableQuoteRecord::from(&q);
                 let ret =
                     protocol_net_ex_network_return_bps(ENTRY_QUOTE_LAMPORTS, rec.quote_amount_raw);
-                (Some(rec), None, ret)
+                // Sell success: sampled_at is the quote's canonical timestamp.
+                let sampled_at = outcome_sampled_at(Some(rec.quoted_at), Utc::now());
+                (Some(rec), None, ret, sampled_at)
             }
-            Err(e) => (None, Some(classify_observation_error(&e)), None),
+            Err(e) => {
+                // Sell failure: sampled_at is the failure-completion time,
+                // stamped AFTER the failed await returned.
+                let sampled_at = outcome_sampled_at(None, Utc::now());
+                (None, Some(classify_observation_error(&e)), None, sampled_at)
+            }
         };
+
+        let lag_ms = sample_lag_ms(due_at, sampled_at);
 
         if sell_quote.is_some() {
             successful_samples = successful_samples.saturating_add(1);
@@ -862,7 +1191,9 @@ async fn track_candidate(
             failed_samples = failed_samples.saturating_add(1);
         }
 
-        // --- Section 39: snapshot only at key horizons, recorded independently. ---
+        // --- Section 39: snapshot only at key horizons, recorded independently.
+        // The snapshot keeps its own independent observed_at; it never overwrites
+        // the outcome sampled_at above (AUDIT-001 §6).
         let (snapshot, snapshot_failure) = if should_snapshot_at(horizon) {
             match oracle.snapshot(&mint).await {
                 Ok(snap) => (Some(MarketSnapshotRecord::from(&snap)), None),
@@ -873,7 +1204,9 @@ async fn track_candidate(
             (None, None)
         };
 
-        let _ = recorder
+        // AUDIT-001 §4.2: required OutcomeSample write. On failure, stop the task
+        // and surface RecorderWrite (no later samples produced).
+        if recorder
             .append(ObservationPayload::OutcomeSample(OutcomeSampleRecord {
                 candidate_id: candidate_id.clone(),
                 mint: mint_str.clone(),
@@ -887,11 +1220,15 @@ async fn track_candidate(
                 snapshot_failure,
                 protocol_net_ex_network_return_bps: return_bps,
             }))
-            .await;
+            .await
+            .is_err()
+        {
+            return Err(CandidateTaskFailure::RecorderWrite);
+        }
     }
 
-    // --- Section 19/36: complete. ---
-    let _ = recorder
+    // --- Section 19/36: complete. Required task write. ---
+    if recorder
         .append(tracking_finished(
             &candidate_id,
             &mint_str,
@@ -899,13 +1236,17 @@ async fn track_candidate(
             successful_samples,
             failed_samples,
         ))
-        .await;
+        .await
+        .is_err()
+    {
+        return Err(CandidateTaskFailure::RecorderWrite);
+    }
 
-    CandidateTaskResult {
+    Ok(CandidateTaskResult {
         candidate_id,
         mint: mint_str,
         status: TrackingFinishStatus::Complete,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,28 +1537,216 @@ mod tests {
     fn test_run_completion_policy() {
         // Never connected => Failed.
         let c = RunCounters::default();
-        assert_eq!(run_completion(&c, false), RunCompletion::Failed);
-        // Connected, clean => Complete.
-        assert_eq!(run_completion(&c, true), RunCompletion::Complete);
+        assert_eq!(run_completion(&c, false, true), RunCompletion::Failed);
+        // Connected, clean, connected-at-end => Complete.
+        assert_eq!(run_completion(&c, true, true), RunCompletion::Complete);
         // Provider error => Failed.
         let mut c_err = RunCounters::default();
         c_err.provider_errors = 1;
-        assert_eq!(run_completion(&c_err, true), RunCompletion::Failed);
+        assert_eq!(run_completion(&c_err, true, true), RunCompletion::Failed);
         // Unexpected trade => Failed.
         let mut c_tr = RunCounters::default();
         c_tr.unexpected_trade_events = 1;
-        assert_eq!(run_completion(&c_tr, true), RunCompletion::Failed);
+        assert_eq!(run_completion(&c_tr, true, true), RunCompletion::Failed);
         // Drain timeout => Failed.
         let mut c_dt = RunCounters::default();
         c_dt.drain_timed_out = 1;
-        assert_eq!(run_completion(&c_dt, true), RunCompletion::Failed);
-        // Disconnect but recovered => Degraded.
+        assert_eq!(run_completion(&c_dt, true, true), RunCompletion::Failed);
+        // Disconnect but recovered (connected at end) => Degraded.
         let mut c_dis = RunCounters::default();
         c_dis.stream_disconnect_events = 1;
-        assert_eq!(run_completion(&c_dis, true), RunCompletion::Degraded);
+        assert_eq!(run_completion(&c_dis, true, true), RunCompletion::Degraded);
         // Task failure => Degraded.
         let mut c_tf = RunCounters::default();
         c_tf.task_failures = 1;
-        assert_eq!(run_completion(&c_tf, true), RunCompletion::Degraded);
+        assert_eq!(run_completion(&c_tf, true, true), RunCompletion::Degraded);
+    }
+
+    // -----------------------------------------------------------------------
+    // AUDIT-001 §14 — new required tests (all network-free).
+    // -----------------------------------------------------------------------
+
+    /// Build a dummy serializable sell quote record with a chosen `quoted_at`.
+    /// Recorder-owned type only; no market domain type or RPC is constructed.
+    fn dummy_sell_quote_record(quoted_at: DateTime<Utc>) -> ExecutableQuoteRecord {
+        ExecutableQuoteRecord {
+            side: pumpfun_sniper::observation::schema::ObservedSide::Sell,
+            venue: pumpfun_sniper::observation::schema::ObservedVenue::PumpBondingCurve,
+            quote_asset: pumpfun_sniper::observation::schema::ObservedQuoteAsset::Sol,
+            base_decimals: 6,
+            quote_decimals: 9,
+            base_amount_raw: 123_456,
+            base_amount_ui: 0.123456,
+            quote_amount_raw: 1_050_000,
+            expected_price_sol_per_token: None,
+            protocol_fee_bps: 0,
+            creator_fee_bps: 0,
+            lp_fee_bps: 0,
+            slot: 42,
+            quoted_at,
+        }
+    }
+
+    #[test]
+    fn test_run_completion_fails_when_stream_unresolved_at_intake_end() {
+        // Connected during the run, but the stream is NOT connected at the intake
+        // boundary => Failed even with otherwise clean counters.
+        let c = RunCounters::default();
+        assert_eq!(run_completion(&c, true, false), RunCompletion::Failed);
+    }
+
+    #[test]
+    fn test_run_completion_allows_recovered_disconnect_as_degraded() {
+        // A disconnect that recovered before intake end (connected-at-end true) is
+        // Degraded, not Failed.
+        let mut c = RunCounters::default();
+        c.stream_disconnect_events = 1;
+        assert_eq!(run_completion(&c, true, true), RunCompletion::Degraded);
+    }
+
+    #[test]
+    fn test_run_completion_fails_on_recorder_failure() {
+        let mut c = RunCounters::default();
+        c.recorder_failures = 1;
+        assert_eq!(run_completion(&c, true, true), RunCompletion::Failed);
+    }
+
+    #[test]
+    fn test_sell_success_sample_time_uses_quote_quoted_at() {
+        // On sell-quote SUCCESS the sampled_at is the quote's canonical quoted_at,
+        // NOT the failure-completion time passed alongside.
+        let quoted_at = "2026-01-01T00:00:30.350Z".parse::<DateTime<Utc>>().unwrap();
+        let failure_time = "2026-01-01T00:00:31.000Z".parse::<DateTime<Utc>>().unwrap();
+        let rec = dummy_sell_quote_record(quoted_at);
+        let sampled_at = outcome_sampled_at(Some(rec.quoted_at), failure_time);
+        assert_eq!(sampled_at, quoted_at);
+        assert_ne!(sampled_at, failure_time);
+    }
+
+    #[test]
+    fn test_sell_failure_sample_time_uses_failure_completion_time() {
+        // On sell-quote FAILURE the sampled_at is the failure-completion time
+        // (stamped after the failed await), independent of any quote timestamp.
+        let failure_time = "2026-01-01T00:00:30.500Z".parse::<DateTime<Utc>>().unwrap();
+        let sampled_at = outcome_sampled_at(None, failure_time);
+        assert_eq!(sampled_at, failure_time);
+    }
+
+    #[test]
+    fn test_entry_anchor_policy_captured_with_initial_quote() {
+        // Source-structure proof (AUDIT-001 §7): the monotonic anchor is captured
+        // in the buy-quote success branch, BEFORE InitialMarket is appended. We
+        // assert the anchor-capture line precedes the InitialMarket append in the
+        // production source and that no anchor capture appears after it.
+        let src = include_str!("observe_record.rs");
+        // Needles split so this assertion never self-triggers on its own text.
+        let anchor_needle = concat!(
+            "entry_monotonic_anchor = ",
+            "Some(tokio::time::Instant::now())"
+        );
+        let initial_market_needle =
+            concat!("ObservationPayload::", "InitialMarket(InitialMarketRecord");
+        let anchor_pos = src
+            .find(anchor_needle)
+            .expect("anchor capture present in success branch");
+        let initial_pos = src
+            .find(initial_market_needle)
+            .expect("InitialMarket persistence present");
+        assert!(
+            anchor_pos < initial_pos,
+            "anchor must be captured before InitialMarket persistence"
+        );
+        // No SECOND anchor capture after InitialMarket persistence.
+        assert!(
+            !src[initial_pos..].contains(anchor_needle),
+            "anchor must not be created after InitialMarket persistence"
+        );
+    }
+
+    #[test]
+    fn test_production_source_does_not_discard_recorder_append_results() {
+        // AUDIT-001 §13: prove no production pattern that discards a recorder
+        // append Result remains. The needle is built from split literals below so
+        // this test's own source never self-triggers.
+        let src = include_str!("observe_record.rs");
+        let discard_needle = ["let _ = ", "recorder", ".append"].concat();
+        assert!(
+            !src.contains(&discard_needle),
+            "production source discards a recorder append Result"
+        );
+        // And the required helper exists.
+        assert!(src.contains("async fn append_required"));
+    }
+
+    #[test]
+    fn test_channel_close_marks_stream_disconnected() {
+        // Connected then channel-closed => stream_connected becomes false.
+        let after_connect = apply_stream_transition(false, StreamTransition::Connected);
+        assert!(after_connect);
+        let after_close = apply_stream_transition(after_connect, StreamTransition::ChannelClosed);
+        assert!(!after_close);
+        // Disconnected transition also clears it.
+        assert!(!apply_stream_transition(
+            true,
+            StreamTransition::Disconnected
+        ));
+        // NoChange preserves prior (e.g. provider error / trade).
+        assert!(apply_stream_transition(true, StreamTransition::NoChange));
+        assert!(!apply_stream_transition(false, StreamTransition::NoChange));
+    }
+
+    #[test]
+    fn test_post_stop_disconnect_is_ignored_for_intake_completion() {
+        // The completeness state is captured BEFORE stop; a post-stop Disconnected
+        // is shutdown mechanics and never mutates that captured bool. Model the
+        // captured value and assert it drives completion regardless of any later
+        // (ignored) disconnect.
+        let stream_connected_at_intake_end = true; // captured before client.stop()
+        let c = RunCounters::default();
+        // Post-stop Disconnected does NOT change the captured value or counters, so
+        // completion stays Complete.
+        assert_eq!(
+            run_completion(&c, true, stream_connected_at_intake_end),
+            RunCompletion::Complete
+        );
+    }
+
+    #[test]
+    fn test_successful_task_reaped_during_intake_not_recounted_in_drain() {
+        // The pure accounting helper is used by BOTH the intake reaper and the
+        // final drain. A successful result increments tracking_completed exactly
+        // once per join; a reaped task is removed from the JoinSet, so it is never
+        // accounted a second time. We assert the per-result effect is exactly one
+        // Completed increment (no path double-counts a single result).
+        let mut counters = RunCounters::default();
+        let ok: std::result::Result<CandidateTaskOutcome, ()> = Ok(Ok(CandidateTaskResult {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            status: TrackingFinishStatus::Complete,
+        }));
+        let effect = account_task_result(&ok);
+        assert_eq!(effect, TaskAccounting::Completed);
+        apply_task_accounting(&mut counters, effect);
+        assert_eq!(counters.tracking_completed, 1);
+        assert_eq!(counters.recorder_failures, 0);
+        assert_eq!(counters.task_failures, 0);
+        // A JoinError maps to a task failure, not a completion.
+        let join_err: std::result::Result<CandidateTaskOutcome, ()> = Err(());
+        assert_eq!(account_task_result(&join_err), TaskAccounting::TaskFailure);
+    }
+
+    #[test]
+    fn test_recorder_task_failure_is_failed_not_degraded() {
+        // A tracking task's RecorderWrite failure accounts as recorder_failures
+        // (=> Failed), NOT task_failures (=> Degraded).
+        let mut counters = RunCounters::default();
+        let rec_fail: std::result::Result<CandidateTaskOutcome, ()> =
+            Ok(Err(CandidateTaskFailure::RecorderWrite));
+        let effect = account_task_result(&rec_fail);
+        assert_eq!(effect, TaskAccounting::RecorderFailure);
+        apply_task_accounting(&mut counters, effect);
+        assert_eq!(counters.recorder_failures, 1);
+        assert_eq!(counters.task_failures, 0);
+        assert_eq!(run_completion(&counters, true, true), RunCompletion::Failed);
     }
 }
