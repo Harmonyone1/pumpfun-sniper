@@ -4673,11 +4673,10 @@ pub async fn health(config: &Config) -> Result<()> {
             }
         }
 
-        // E6.5: separate data-capability line. Never prints the secret.
-        println!(
-            "PumpPortal data capability... {}",
-            pumpportal_capability_line(api_key_present)
-        );
+        // AUDIT-003 B3: the authoritative Data-capability line is printed once
+        // below via `health_data_capability_line` in the `use_for_trading` block.
+        // The older redundant "PumpPortal data capability..." line was removed to
+        // avoid two contradictory capability reports.
     } else {
         println!("PumpPortal... DISABLED");
     }
@@ -4728,7 +4727,10 @@ pub async fn health(config: &Config) -> Result<()> {
         let mode = health_execution_mode(api_key_present, force_local_api);
 
         print!("PumpPortal Trading API... ");
-        println!("{}", health_execution_line(mode, force_local_api));
+        println!(
+            "{}",
+            health_execution_line(mode, api_key_present, force_local_api)
+        );
         // Separate Data-capability line: independent of the execution route.
         println!(
             "PumpPortal Data API... {}",
@@ -4903,14 +4905,25 @@ fn health_execution_mode(api_key_present: bool, force_local_api: bool) -> Health
     }
 }
 
-/// BLOCKER B pure formatter for the health trade-EXECUTION line. Driven only by
-/// the computed `HealthExecutionMode` (never the secret). The `force_local_api`
-/// flag is surfaced only to explain why a configured key is still routing Local.
-fn health_execution_line(mode: HealthExecutionMode, force_local_api: bool) -> &'static str {
+/// BLOCKER B pure formatter for the health trade-EXECUTION line. Driven by the
+/// computed `HealthExecutionMode` PLUS `api_key_present` (never the secret). The
+/// AUDIT-003 fix: the Local branch must know key presence so it never claims a
+/// "Data API credential configured" when no key exists. `force_local_api` alone
+/// is NOT sufficient to justify that claim — a Local route reached because the key
+/// is absent (`force_local_api` may still be set in a default config) must print
+/// the no-key text.
+fn health_execution_line(
+    mode: HealthExecutionMode,
+    api_key_present: bool,
+    force_local_api: bool,
+) -> &'static str {
     match mode {
         HealthExecutionMode::Local => {
-            if force_local_api {
-                "Execution: LOCAL MODE (force_local_api; Data API credential configured, Local Transaction API 0.5%)"
+            // Only claim a configured Data credential when a key actually exists.
+            // The credential claim is gated on `api_key_present`, not on
+            // `force_local_api`, so the default empty-key case can never lie.
+            if api_key_present && force_local_api {
+                "Execution: LOCAL MODE (force_local_api; Data API credential configured; Local Transaction API 0.5%)"
             } else {
                 "Execution: LOCAL MODE (no API key; Local Transaction API 0.5%)"
             }
@@ -4929,16 +4942,6 @@ fn health_data_capability_line(api_key_present: bool) -> &'static str {
         "Data: authenticated/metered token+account trade streams available"
     } else {
         "Data: new-token/migration only; trade subscriptions unavailable"
-    }
-}
-
-/// E6 pure formatter for the health data-capability line. Never contains the
-/// secret — only a boolean presence flag drives it.
-fn pumpportal_capability_line(api_key_present: bool) -> &'static str {
-    if api_key_present {
-        "trade subscription credential configured"
-    } else {
-        "new-token/migration only; trade subscriptions unavailable"
     }
 }
 
@@ -11573,15 +11576,21 @@ mod tests {
     #[test]
     fn test_e8_health_capability_line_has_no_secret() {
         let sample_key = "super-secret-sample-api-key-1234567890";
-        // Presence path is driven by a bool, so the secret cannot leak into it.
-        let present = pumpportal_capability_line(true);
-        let absent = pumpportal_capability_line(false);
+        // AUDIT-003 B3: the older redundant pumpportal_capability_line was removed;
+        // the retained authoritative capability formatter is
+        // health_data_capability_line. Presence path is driven by a bool, so the
+        // secret cannot leak into it.
+        let present = health_data_capability_line(true);
+        let absent = health_data_capability_line(false);
         assert!(!present.contains(sample_key));
         assert!(!absent.contains(sample_key));
-        assert_eq!(present, "trade subscription credential configured");
+        assert_eq!(
+            present,
+            "Data: authenticated/metered token+account trade streams available"
+        );
         assert_eq!(
             absent,
-            "new-token/migration only; trade subscriptions unavailable"
+            "Data: new-token/migration only; trade subscriptions unavailable"
         );
     }
 
@@ -11646,6 +11655,7 @@ mod tests {
         // Sanity: the Local execution line must NOT claim Lightning.
         let exec_line = health_execution_line(
             health_execution_mode(api_key_present, force_local_api),
+            api_key_present,
             force_local_api,
         );
         assert!(exec_line.contains("LOCAL MODE"));
@@ -11662,7 +11672,7 @@ mod tests {
 
         for force_local_api in [true, false] {
             let mode = health_execution_mode(api_key_present, force_local_api);
-            let exec_line = health_execution_line(mode, force_local_api);
+            let exec_line = health_execution_line(mode, api_key_present, force_local_api);
             let data_line = health_data_capability_line(api_key_present);
 
             assert!(
@@ -11674,6 +11684,86 @@ mod tests {
                 "data line leaked the api-key"
             );
         }
+    }
+
+    // (B5.1) no key + force false => LOCAL/no-key text.
+    #[test]
+    fn test_health_execution_line_no_key_force_false_says_no_key() {
+        let mode = health_execution_mode(false, false);
+        let line = health_execution_line(mode, false, false);
+        assert!(line.contains("LOCAL MODE"));
+        assert!(line.contains("no API key"));
+        assert!(!line.contains("Data API credential"));
+    }
+
+    // (B5.2) no key + force TRUE => STILL LOCAL/no-key text (the AUDIT-003 bug).
+    #[test]
+    fn test_health_execution_line_no_key_force_true_says_no_key() {
+        let mode = health_execution_mode(false, true);
+        let line = health_execution_line(mode, false, true);
+        assert!(line.contains("LOCAL MODE"));
+        assert!(line.contains("no API key"));
+    }
+
+    // (B5.3) no key + force TRUE must NEVER claim a Data API credential.
+    #[test]
+    fn test_health_execution_line_no_key_force_true_never_claims_data_credential() {
+        let mode = health_execution_mode(false, true);
+        let line = health_execution_line(mode, false, true);
+        assert!(
+            !line.contains("Data API credential"),
+            "no-key line falsely claimed a Data API credential"
+        );
+    }
+
+    // (B5.4) key present + force TRUE => LOCAL, and here the credential claim is
+    //        legitimate because a key actually exists.
+    #[test]
+    fn test_health_execution_line_key_force_true_reports_local() {
+        let mode = health_execution_mode(true, true);
+        let line = health_execution_line(mode, true, true);
+        assert!(line.contains("LOCAL MODE"));
+        assert!(line.contains("force_local_api"));
+        assert!(line.contains("Data API credential configured"));
+        assert!(!line.contains("LIGHTNING"));
+    }
+
+    // (B5.5) key present + no force => LIGHTNING.
+    #[test]
+    fn test_health_execution_line_key_no_force_reports_lightning() {
+        let mode = health_execution_mode(true, false);
+        let line = health_execution_line(mode, true, false);
+        assert!(line.contains("LIGHTNING MODE"));
+        assert!(!line.contains("LOCAL"));
+    }
+
+    // (B6) output policy: health() emits exactly ONE data-capability semantic line.
+    //      After AUDIT-003 B3 the older redundant "PumpPortal data capability..."
+    //      print was removed, leaving a single authoritative Data line printed via
+    //      `health_data_capability_line`. Enforce that by scanning this module's
+    //      own source for capability print sites so the duplicate cannot silently
+    //      return.
+    #[test]
+    fn test_health_has_single_data_capability_semantic_line() {
+        let src = include_str!("commands.rs");
+        // The removed helper must not be reintroduced (check for its definition
+        // and any call, split so this literal does not match the token in nearby
+        // comments).
+        let helper = concat!("pumpportal_", "capability_line(");
+        assert!(
+            !src.contains(helper),
+            "the removed duplicate capability helper reappeared"
+        );
+        // Exactly one health() print site feeds the authoritative Data line. Count
+        // the distinctive output prefix (broken across two string fragments so this
+        // assertion does not count itself).
+        let prefix = concat!("PumpPortal Data ", "API... {}");
+        let data_line_prints = src.matches(prefix).count();
+        assert_eq!(
+            data_line_prints, 1,
+            "expected exactly one health data-capability print site, found {}",
+            data_line_prints
+        );
     }
 
     // (6b) masked config display (Agent B hardened) exposes neither the
