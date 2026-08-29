@@ -71,10 +71,17 @@ pub enum KillSwitchUrgency {
 /// Kill-switch alert types
 #[derive(Debug, Clone)]
 pub enum KillSwitchType {
-    /// Deployer/creator sold tokens
+    /// Deployer/creator sold tokens.
+    ///
+    /// `amount_tokens_raw` / `amount_pct` are `Some(..)` ONLY when the sell was
+    /// observed through the canonical raw-amount source (`evaluate_sell`), which
+    /// provides a true raw token quantity. When the sell is observed through the
+    /// provider identity-only path (`evaluate_provider_sell_identity`), both are
+    /// `None`: PumpPortal reports a provider UI token quantity that must never be
+    /// treated as a raw token amount (INV-EVT-009 / INV-EVT-015).
     DeployerSell {
-        amount_tokens: u64,
-        amount_pct: f64,
+        amount_tokens_raw: Option<u64>,
+        amount_pct: Option<f64>,
     },
     /// Top holder selling (from holder_watcher)
     TopHolderSell {
@@ -211,8 +218,9 @@ impl KillSwitchEvaluator {
             );
             return KillSwitchDecision::Exit(KillSwitchAlert {
                 alert_type: KillSwitchType::DeployerSell {
-                    amount_tokens: token_amount,
-                    amount_pct: 0.0, // TODO: Calculate from total supply
+                    // Canonical raw-amount source: this is a true raw token quantity.
+                    amount_tokens_raw: Some(token_amount),
+                    amount_pct: None, // TODO: Calculate from total supply
                 },
                 mint: mint.to_string(),
                 urgency: KillSwitchUrgency::Immediate,
@@ -258,6 +266,66 @@ impl KillSwitchEvaluator {
 
         // TODO: Check 3: Bundled wallets selling together
         // TODO: Check 4: Sniper exit before graduation
+
+        KillSwitchDecision::Continue
+    }
+
+    /// Evaluate a sell for kill-switch conditions using PROVIDER IDENTITY ONLY.
+    ///
+    /// This is the safe entry point for provider streams (e.g. PumpPortal) whose
+    /// trade messages carry a *provider UI* token quantity, NOT a canonical raw
+    /// token amount. It intentionally does NOT take a token amount and MUST NOT
+    /// fabricate a raw quantity.
+    ///
+    /// Only the deployer-identity kill-switch is evaluated here: if
+    /// `deployer_sell_any` is set and `trader` is the recorded deployer/creator,
+    /// we trigger an Immediate exit. Top-holder raw-quantity evaluation is
+    /// deliberately unavailable from this path (INV-EVT-015): it requires a
+    /// canonical raw amount that the provider UI quantity cannot supply, so we do
+    /// NOT call `holder_watcher.process_sell(...)`.
+    ///
+    /// The canonical raw-amount API `evaluate_sell` is preserved separately for a
+    /// future source that can provide a true raw token quantity.
+    pub fn evaluate_provider_sell_identity(
+        &self,
+        mint: &str,
+        trader: &str,
+        signature: &str,
+    ) -> KillSwitchDecision {
+        if !self.config.enabled {
+            return KillSwitchDecision::Continue;
+        }
+
+        // Deployer selling? This is a pure-identity check — no token amount is
+        // consulted or invented.
+        if self.config.deployer_sell_any && self.deployer_tracker.is_deployer(mint, trader) {
+            warn!(
+                mint = %mint,
+                trader = %trader,
+                signature = %signature,
+                "KILL-SWITCH: DEPLOYER SELLING (provider identity) - EXIT NOW"
+            );
+            return KillSwitchDecision::Exit(KillSwitchAlert {
+                alert_type: KillSwitchType::DeployerSell {
+                    // Provider identity path: no raw quantity is available and none
+                    // may be fabricated from the provider UI amount.
+                    amount_tokens_raw: None,
+                    amount_pct: None,
+                },
+                mint: mint.to_string(),
+                urgency: KillSwitchUrgency::Immediate,
+                reason: format!(
+                    "Deployer {} emitted sell transaction {}",
+                    trader, signature
+                ),
+                auto_exit: true,
+            });
+        }
+
+        // Top-holder raw-quantity evaluation is intentionally NOT performed here:
+        // the provider UI token amount is not a canonical raw quantity, so
+        // holder_watcher.process_sell(...) is never called from this path
+        // (INV-EVT-015).
 
         KillSwitchDecision::Continue
     }
@@ -351,6 +419,117 @@ mod tests {
                 assert_eq!(alert.urgency, KillSwitchUrgency::Immediate);
                 assert!(alert.auto_exit);
             }
+            KillSwitchDecision::Continue => panic!("Should trigger exit"),
+        }
+    }
+
+    // ---- Provider identity-only path (C4) ----
+
+    #[test]
+    fn test_provider_identity_deployer_sell_triggers() {
+        let config = KillSwitchConfig::default();
+        let evaluator = KillSwitchEvaluator::new(config, HolderWatcherConfig::default());
+
+        evaluator.deployer_tracker.track("token1", "deployer1");
+
+        match evaluator.evaluate_provider_sell_identity("token1", "deployer1", "sigABC") {
+            KillSwitchDecision::Exit(alert) => {
+                assert_eq!(alert.urgency, KillSwitchUrgency::Immediate);
+                assert!(alert.auto_exit);
+                // Exact reason string: wallet + signature, no fabricated amount.
+                assert_eq!(
+                    alert.reason,
+                    "Deployer deployer1 emitted sell transaction sigABC"
+                );
+                // Provider identity path must NOT fabricate a raw quantity.
+                match alert.alert_type {
+                    KillSwitchType::DeployerSell {
+                        amount_tokens_raw,
+                        amount_pct,
+                    } => {
+                        assert!(amount_tokens_raw.is_none(), "must not invent raw amount");
+                        assert!(amount_pct.is_none(), "must not invent pct");
+                    }
+                    other => panic!("expected DeployerSell, got {:?}", other),
+                }
+            }
+            KillSwitchDecision::Continue => panic!("Should trigger exit"),
+        }
+    }
+
+    #[test]
+    fn test_provider_identity_non_deployer_continues() {
+        let config = KillSwitchConfig::default();
+        let evaluator = KillSwitchEvaluator::new(config, HolderWatcherConfig::default());
+
+        evaluator.deployer_tracker.track("token1", "deployer1");
+
+        match evaluator.evaluate_provider_sell_identity("token1", "someone_else", "sig1") {
+            KillSwitchDecision::Continue => (),
+            KillSwitchDecision::Exit(_) => panic!("Non-deployer must not trigger exit"),
+        }
+    }
+
+    #[test]
+    fn test_provider_identity_disabled_continues() {
+        let config = KillSwitchConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let evaluator = KillSwitchEvaluator::new(config, HolderWatcherConfig::default());
+
+        evaluator.deployer_tracker.track("token1", "deployer1");
+
+        match evaluator.evaluate_provider_sell_identity("token1", "deployer1", "sig1") {
+            KillSwitchDecision::Continue => (),
+            KillSwitchDecision::Exit(_) => panic!("Disabled evaluator must not trigger"),
+        }
+    }
+
+    #[test]
+    fn test_provider_identity_never_fabricates_raw_amount() {
+        // Even on trigger, the emitted alert type carries no raw token quantity,
+        // proving the provider UI amount was never cast/floored into raw units
+        // and holder-quantity evaluation stayed unavailable (INV-EVT-015).
+        let config = KillSwitchConfig::default();
+        let evaluator = KillSwitchEvaluator::new(config, HolderWatcherConfig::default());
+
+        evaluator.deployer_tracker.track("token1", "deployer1");
+
+        if let KillSwitchDecision::Exit(alert) =
+            evaluator.evaluate_provider_sell_identity("token1", "deployer1", "sig1")
+        {
+            match alert.alert_type {
+                KillSwitchType::DeployerSell {
+                    amount_tokens_raw,
+                    amount_pct,
+                } => {
+                    assert!(amount_tokens_raw.is_none());
+                    assert!(amount_pct.is_none());
+                }
+                other => panic!("expected DeployerSell, got {:?}", other),
+            }
+        } else {
+            panic!("Should trigger exit");
+        }
+    }
+
+    #[test]
+    fn test_canonical_evaluate_sell_supplies_raw_amount() {
+        // Confirms the canonical raw API remains intact and carries Some(raw).
+        let config = KillSwitchConfig::default();
+        let evaluator = KillSwitchEvaluator::new(config, HolderWatcherConfig::default());
+
+        evaluator.deployer_tracker.track("token1", "deployer1");
+
+        match evaluator.evaluate_sell("token1", "deployer1", 1234, 1.0, "sig1") {
+            KillSwitchDecision::Exit(alert) => match alert.alert_type {
+                KillSwitchType::DeployerSell {
+                    amount_tokens_raw,
+                    ..
+                } => assert_eq!(amount_tokens_raw, Some(1234)),
+                other => panic!("expected DeployerSell, got {:?}", other),
+            },
             KillSwitchDecision::Continue => panic!("Should trigger exit"),
         }
     }
