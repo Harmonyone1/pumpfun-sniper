@@ -73,6 +73,9 @@ pub enum Error {
     #[error("Unsupported quote mint: {0}")]
     UnsupportedQuoteMint(String),
 
+    #[error("Runtime lock error: {0}")]
+    RuntimeLock(String),
+
     #[error("Slippage exceeded: expected {expected}, got {actual}")]
     SlippageExceeded { expected: u64, actual: u64 },
 
