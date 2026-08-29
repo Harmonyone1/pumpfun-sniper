@@ -8,6 +8,7 @@ pub mod dexscreener;
 pub mod error;
 pub mod filter;
 pub mod market;
+pub mod observation;
 pub mod position;
 pub mod pump;
 pub mod runtime;
