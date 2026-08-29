@@ -3377,6 +3377,10 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             new_entries_halted.store(true, Ordering::SeqCst);
                         }
                     }
+                    PumpPortalEvent::DecodeError(_) => {
+                        // Local provider-message decode/schema loss: a dropped candidate, NOT a hard provider/transport failure. Log-only; do NOT set data_stream_ready=false and do NOT halt new entries (unlike Error).
+                        tracing::warn!("PumpPortal decode/schema loss (message dropped)");
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
