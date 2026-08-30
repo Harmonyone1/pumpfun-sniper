@@ -177,7 +177,9 @@ fn validate(records: &[ObservationEnvelope]) -> crate::Result<u32> {
 mod tests {
     use super::*;
     use crate::observation::schema::{
-        CandidateObservedRecord, RunCompletion, RunFinishedRecord, RunStartedRecord,
+        CandidateObservedRecord, InitialMarketRecord, MarketDataFailureKind,
+        ObservationFailureCode, OutcomeSampleRecord, RunCompletion, RunFinishedRecord,
+        RunStartedRecord,
     };
     use std::io::Write;
 
@@ -466,5 +468,114 @@ mod tests {
         assert_eq!(a[0].seq, 1);
         assert_eq!(a[1].seq, 3);
         assert_eq!(timelines["B"].len(), 1);
+    }
+
+    // == P1-OBSERVATION-MARKET-DATA-TRUTH-001 replay (§13) ===================
+
+    fn initial_market_with_kinds(buy_kind: Option<MarketDataFailureKind>) -> ObservationPayload {
+        ObservationPayload::InitialMarket(InitialMarketRecord {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            candidate_received_at: chrono::Utc::now(),
+            snapshot: None,
+            snapshot_failure: Some(ObservationFailureCode::MarketUnavailable),
+            buy_quote: None,
+            buy_quote_failure: Some(ObservationFailureCode::MarketUnavailable),
+            initial_observation_attempts: 4,
+            initial_snapshot_rpc_gate_wait_ms_total: Some(0),
+            initial_snapshot_rpc_call_duration_ms_total: Some(120),
+            initial_buy_rpc_gate_wait_ms_total: Some(0),
+            initial_buy_rpc_call_duration_ms_total: Some(200),
+            snapshot_market_data_kind: Some(MarketDataFailureKind::AccountMissing),
+            buy_quote_market_data_kind: buy_kind,
+        })
+    }
+
+    fn outcome_sample_with_kind() -> ObservationPayload {
+        ObservationPayload::OutcomeSample(OutcomeSampleRecord {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            horizon_secs: 15,
+            due_at: chrono::Utc::now(),
+            sampled_at: chrono::Utc::now(),
+            sample_lag_ms: 42,
+            sell_quote: None,
+            sell_quote_failure: Some(ObservationFailureCode::MarketUnavailable),
+            snapshot: None,
+            snapshot_failure: None,
+            protocol_net_ex_network_return_bps: None,
+            sell_rpc_gate_wait_ms: Some(0),
+            sell_rpc_call_duration_ms: Some(63),
+            snapshot_rpc_gate_wait_ms: Some(0),
+            snapshot_rpc_call_duration_ms: Some(90),
+            sell_market_data_kind: Some(MarketDataFailureKind::QuoteMathUnexecutable),
+            snapshot_market_data_kind: None,
+        })
+    }
+
+    /// A v2 run carrying the new market-data subtype fields round-trips through the
+    /// strict replay reader.
+    #[test]
+    fn test_replay_v2_market_data_kind_round_trip() {
+        let l0 = line(&envelope(0, "r", run_started_payload()));
+        let l1 = line(&envelope(
+            1,
+            "r",
+            initial_market_with_kinds(Some(MarketDataFailureKind::LiquidityOrReserveUnavailable)),
+        ));
+        let l2 = line(&envelope(2, "r", outcome_sample_with_kind()));
+        let f = write_lines(&[l0, l1, l2], true);
+        let run = read_observation_run(f.path()).unwrap();
+        assert_eq!(run.schema_version, 2);
+
+        let im = run.records.iter().find_map(|e| match &e.payload {
+            ObservationPayload::InitialMarket(r) => Some(r),
+            _ => None,
+        });
+        let im = im.expect("InitialMarket present");
+        assert_eq!(
+            im.snapshot_market_data_kind,
+            Some(MarketDataFailureKind::AccountMissing)
+        );
+        assert_eq!(
+            im.buy_quote_market_data_kind,
+            Some(MarketDataFailureKind::LiquidityOrReserveUnavailable)
+        );
+
+        let os = run.records.iter().find_map(|e| match &e.payload {
+            ObservationPayload::OutcomeSample(r) => Some(r),
+            _ => None,
+        });
+        let os = os.expect("OutcomeSample present");
+        assert_eq!(
+            os.sell_market_data_kind,
+            Some(MarketDataFailureKind::QuoteMathUnexecutable)
+        );
+        assert_eq!(os.snapshot_market_data_kind, None);
+    }
+
+    /// A pre-field v2 InitialMarket / OutcomeSample line (no *_market_data_kind keys)
+    /// still replays, with the new fields defaulting to None.
+    #[test]
+    fn test_replay_v2_pre_field_market_data_kind_none() {
+        let im = r#"{"schema_version":2,"run_id":"r","seq":1,"recorded_at":"2026-08-30T00:00:00Z","payload":{"kind":"initial_market","data":{"candidate_id":"sig","mint":"mint","candidate_received_at":"2026-08-30T00:00:00Z","snapshot":null,"snapshot_failure":"market_unavailable","buy_quote":null,"buy_quote_failure":"market_unavailable","initial_observation_attempts":4}}}"#;
+        let os = r#"{"schema_version":2,"run_id":"r","seq":2,"recorded_at":"2026-08-30T00:00:00Z","payload":{"kind":"outcome_sample","data":{"candidate_id":"sig","mint":"mint","horizon_secs":15,"due_at":"2026-08-30T00:00:00Z","sampled_at":"2026-08-30T00:00:01Z","sample_lag_ms":1000,"sell_quote":null,"sell_quote_failure":"market_unavailable","snapshot":null,"snapshot_failure":null,"protocol_net_ex_network_return_bps":null}}}"#;
+        let l0 = line(&envelope(0, "r", run_started_payload()));
+        let f = write_lines(&[l0, im.to_string(), os.to_string()], true);
+        let run = read_observation_run(f.path()).unwrap();
+        assert_eq!(run.schema_version, 2);
+        for e in &run.records {
+            match &e.payload {
+                ObservationPayload::InitialMarket(r) => {
+                    assert_eq!(r.snapshot_market_data_kind, None);
+                    assert_eq!(r.buy_quote_market_data_kind, None);
+                }
+                ObservationPayload::OutcomeSample(r) => {
+                    assert_eq!(r.sell_market_data_kind, None);
+                    assert_eq!(r.snapshot_market_data_kind, None);
+                }
+                _ => {}
+            }
+        }
     }
 }

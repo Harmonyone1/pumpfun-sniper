@@ -34,12 +34,12 @@ use tokio::task::JoinSet;
 use pumpfun_sniper::market::types::{ExecutableQuote, MarketSnapshot};
 use pumpfun_sniper::market::PumpMarketOracle;
 use pumpfun_sniper::observation::schema::{
-    classify_observation_error, protocol_net_ex_network_return_bps, sanitize_persist_text,
-    CandidateObservedRecord, ExecutableQuoteRecord, InitialMarketRecord, MarketSnapshotRecord,
-    MigrationObservedRecord, ObservationFailureCode, ObservationPayload, OutcomeSampleRecord,
-    ProviderCreateShape, RunCompletion, RunFinishedRecord, RunStartedRecord, StreamStateKind,
-    StreamStateRecord, TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord,
-    ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
+    classify_observation_error_full, protocol_net_ex_network_return_bps, sanitize_persist_text,
+    CandidateObservedRecord, ExecutableQuoteRecord, InitialMarketRecord, MarketDataFailureKind,
+    MarketSnapshotRecord, MigrationObservedRecord, ObservationFailureCode, ObservationPayload,
+    OutcomeSampleRecord, ProviderCreateShape, RunCompletion, RunFinishedRecord, RunStartedRecord,
+    StreamStateKind, StreamStateRecord, TrackingFinishStatus, TrackingFinishedRecord,
+    TrackingSkippedRecord, ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
 };
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::runtime::RuntimeLease;
@@ -1480,8 +1480,12 @@ async fn track_candidate(
     let backoffs = [0u64, 250, 500, 1000];
     let mut last_snapshot: Option<MarketSnapshotRecord> = None;
     let mut last_snapshot_failure: Option<ObservationFailureCode> = None;
+    // MARKET-DATA-TRUTH §9: safe subtype tracked alongside the FINAL retained
+    // snapshot/buy failure. Some IFF the paired failure code is MarketUnavailable.
+    let mut last_snapshot_market_data_kind: Option<MarketDataFailureKind> = None;
     let mut buy_quote_record: Option<ExecutableQuoteRecord> = None;
     let mut buy_quote_failure: Option<ObservationFailureCode> = None;
+    let mut buy_quote_market_data_kind: Option<MarketDataFailureKind> = None;
     let mut initial_base_amount_raw: Option<u64> = None;
     let mut entry_wall_time: Option<DateTime<Utc>> = None;
     // §15: totals of RPC gate wait + oracle call duration across ALL initial retry
@@ -1512,10 +1516,13 @@ async fn track_candidate(
             Ok(snap) => {
                 last_snapshot = Some(MarketSnapshotRecord::from(&snap));
                 last_snapshot_failure = None;
+                last_snapshot_market_data_kind = None;
             }
             Err(e) => {
+                let c = classify_observation_error_full(&e);
                 last_snapshot = None;
-                last_snapshot_failure = Some(classify_observation_error(&e));
+                last_snapshot_failure = Some(c.code);
+                last_snapshot_market_data_kind = c.market_data_kind;
             }
         }
 
@@ -1539,12 +1546,15 @@ async fn track_candidate(
                 entry_wall_time = Some(entry_wall);
                 buy_quote_record = Some(rec);
                 buy_quote_failure = None;
+                buy_quote_market_data_kind = None;
                 // Success criterion for tracking is a valid SOL buy quote.
                 break;
             }
             Err(e) => {
+                let c = classify_observation_error_full(&e);
                 buy_quote_record = None;
-                buy_quote_failure = Some(classify_observation_error(&e));
+                buy_quote_failure = Some(c.code);
+                buy_quote_market_data_kind = c.market_data_kind;
             }
         }
     }
@@ -1553,9 +1563,12 @@ async fn track_candidate(
     // Ensure the XOR invariants hold: if neither present, mark a failure.
     if last_snapshot.is_none() && last_snapshot_failure.is_none() {
         last_snapshot_failure = Some(ObservationFailureCode::Other);
+        // Synthetic non-MarketData code => no market-data subtype (§11 invariant).
+        last_snapshot_market_data_kind = None;
     }
     if buy_quote_record.is_none() && buy_quote_failure.is_none() {
         buy_quote_failure = Some(ObservationFailureCode::Other);
+        buy_quote_market_data_kind = None;
     }
 
     // AUDIT-001 §4.2: required task write. On failure, stop the task, produce no
@@ -1575,6 +1588,8 @@ async fn track_candidate(
             initial_snapshot_rpc_call_duration_ms_total: Some(initial_snapshot_call_total),
             initial_buy_rpc_gate_wait_ms_total: Some(initial_buy_gate_wait_total),
             initial_buy_rpc_call_duration_ms_total: Some(initial_buy_call_total),
+            snapshot_market_data_kind: last_snapshot_market_data_kind,
+            buy_quote_market_data_kind,
         }))
         .await
         .is_err()
@@ -1637,22 +1652,27 @@ async fn track_candidate(
         let sell_call = gated_quote_sell_raw(&rpc_gate, &oracle, &mint, base_amount_raw).await;
         let sell_rpc_gate_wait_ms = Some(sell_call.gate_wait_ms);
         let sell_rpc_call_duration_ms = Some(sell_call.call_duration_ms);
-        let (sell_quote, sell_quote_failure, return_bps, sampled_at) = match sell_call.result {
-            Ok(q) => {
-                let rec = ExecutableQuoteRecord::from(&q);
-                let ret =
-                    protocol_net_ex_network_return_bps(ENTRY_QUOTE_LAMPORTS, rec.quote_amount_raw);
-                // Sell success: sampled_at is the quote's canonical timestamp.
-                let sampled_at = outcome_sampled_at(Some(rec.quoted_at), Utc::now());
-                (Some(rec), None, ret, sampled_at)
-            }
-            Err(e) => {
-                // Sell failure: sampled_at is the failure-completion time,
-                // stamped AFTER the failed await returned.
-                let sampled_at = outcome_sampled_at(None, Utc::now());
-                (None, Some(classify_observation_error(&e)), None, sampled_at)
-            }
-        };
+        let (sell_quote, sell_quote_failure, sell_market_data_kind, return_bps, sampled_at) =
+            match sell_call.result {
+                Ok(q) => {
+                    let rec = ExecutableQuoteRecord::from(&q);
+                    let ret = protocol_net_ex_network_return_bps(
+                        ENTRY_QUOTE_LAMPORTS,
+                        rec.quote_amount_raw,
+                    );
+                    // Sell success: sampled_at is the quote's canonical timestamp.
+                    let sampled_at = outcome_sampled_at(Some(rec.quoted_at), Utc::now());
+                    (Some(rec), None, None, ret, sampled_at)
+                }
+                Err(e) => {
+                    // Sell failure: sampled_at is the failure-completion time,
+                    // stamped AFTER the failed await returned. §9-11: also record the
+                    // safe market-data subtype (Some IFF code == MarketUnavailable).
+                    let c = classify_observation_error_full(&e);
+                    let sampled_at = outcome_sampled_at(None, Utc::now());
+                    (None, Some(c.code), c.market_data_kind, None, sampled_at)
+                }
+            };
 
         let lag_ms = sample_lag_ms(due_at, sampled_at);
 
@@ -1666,23 +1686,32 @@ async fn track_candidate(
         // The snapshot keeps its own independent observed_at; it never overwrites
         // the outcome sampled_at above (AUDIT-001 §6). §14: at key horizons the
         // gated snapshot's timing is recorded; at non-key horizons it stays None.
-        let (snapshot, snapshot_failure, snapshot_rpc_gate_wait_ms, snapshot_rpc_call_duration_ms) =
-            if should_snapshot_at(horizon) {
-                let snap_call = gated_snapshot(&rpc_gate, &oracle, &mint).await;
-                let (snapshot, snapshot_failure) = match snap_call.result {
-                    Ok(snap) => (Some(MarketSnapshotRecord::from(&snap)), None),
-                    Err(e) => (None, Some(classify_observation_error(&e))),
-                };
-                (
-                    snapshot,
-                    snapshot_failure,
-                    Some(snap_call.gate_wait_ms),
-                    Some(snap_call.call_duration_ms),
-                )
-            } else {
-                // Absent != failure at non-key horizons; and no snapshot timing.
-                (None, None, None, None)
+        let (
+            snapshot,
+            snapshot_failure,
+            snapshot_market_data_kind,
+            snapshot_rpc_gate_wait_ms,
+            snapshot_rpc_call_duration_ms,
+        ) = if should_snapshot_at(horizon) {
+            let snap_call = gated_snapshot(&rpc_gate, &oracle, &mint).await;
+            let (snapshot, snapshot_failure, snapshot_kind) = match snap_call.result {
+                Ok(snap) => (Some(MarketSnapshotRecord::from(&snap)), None, None),
+                Err(e) => {
+                    let c = classify_observation_error_full(&e);
+                    (None, Some(c.code), c.market_data_kind)
+                }
             };
+            (
+                snapshot,
+                snapshot_failure,
+                snapshot_kind,
+                Some(snap_call.gate_wait_ms),
+                Some(snap_call.call_duration_ms),
+            )
+        } else {
+            // Absent != failure at non-key horizons; and no snapshot timing/subtype.
+            (None, None, None, None, None)
+        };
 
         // AUDIT-001 §4.2: required OutcomeSample write. On failure, stop the task
         // and surface RecorderWrite (no later samples produced).
@@ -1703,6 +1732,8 @@ async fn track_candidate(
                 sell_rpc_call_duration_ms,
                 snapshot_rpc_gate_wait_ms,
                 snapshot_rpc_call_duration_ms,
+                sell_market_data_kind,
+                snapshot_market_data_kind,
             }))
             .await
             .is_err()
@@ -2261,10 +2292,21 @@ mod tests {
         // classify_observation_error drops the inner (endpoint-bearing) string; the
         // serialized failure code is a fixed snake_case token only.
         let err = pumpfun_sniper::Error::Rpc("https://secret-endpoint/key123".into());
-        let code = classify_observation_error(&err);
+        let code = pumpfun_sniper::observation::schema::classify_observation_error(&err);
         let json = serde_json::to_string(&code).unwrap();
         assert!(!json.contains("secret"), "leaked inner string: {json}");
         assert_eq!(json, "\"rpc_unavailable\"");
+
+        // MARKET-DATA-TRUTH: a MarketData error carrying an address/endpoint still
+        // classifies to a fixed value-free subtype with no leaked payload.
+        let mderr = pumpfun_sniper::Error::MarketData(
+            "BondingCurve: wrong owner So1111 at https://secret-endpoint/key123".into(),
+        );
+        let c = classify_observation_error_full(&mderr);
+        assert_eq!(c.code, ObservationFailureCode::MarketUnavailable);
+        let kjson = serde_json::to_string(&c.market_data_kind.unwrap()).unwrap();
+        assert!(!kjson.contains("secret"), "leaked: {kjson}");
+        assert_eq!(kjson, "\"account_identity_or_owner\"");
     }
 
     #[test]
