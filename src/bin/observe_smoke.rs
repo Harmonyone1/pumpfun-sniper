@@ -177,6 +177,9 @@ fn terminal_kind_of(event: &PumpPortalEvent) -> TerminalKind {
         PumpPortalEvent::Trade(_) => TerminalKind::Trade,
         PumpPortalEvent::Migration(_) => TerminalKind::Migration,
         PumpPortalEvent::NewToken(_) => TerminalKind::NewToken,
+        // §19: a drained partial is still a new-token observation, never a decode
+        // loss. In the terminal drain (window closed) it only bumps the counter.
+        PumpPortalEvent::PartialNewToken(_) => TerminalKind::NewToken,
     }
 }
 
@@ -425,6 +428,25 @@ async fn main() -> Result<()> {
                     anyhow!("NewToken mint failed re-validation (stream contract violated)")
                 })?;
                 println!("NewToken #{n} mint={mint} symbol={symbol}");
+
+                observe_mint(&oracle, &mint, &mut counters).await;
+            }
+            PumpPortalEvent::PartialNewToken(ev) => {
+                // P1-OBSERVATION-SCHEMA-V2 §19: an incomplete provider create is a
+                // valid discovery identity, NOT a decode error. Treat it exactly like
+                // a NewToken for the smoke's canonical snapshot + hypothetical quote:
+                // the mint was already validated by the stream. A partial that
+                // resolves to a SOL market may count toward candidate success; a
+                // partial that resolves unsupported simply does not increment the
+                // hypothetical-quote success counter (observe_mint handles that). A
+                // partial ALONE is never a decode error.
+                counters.new_token_events += 1;
+                let n = counters.new_token_events;
+                let symbol = sanitize_short_text(&ev.symbol, 32);
+                let mint = Pubkey::from_str(&ev.mint).map_err(|_| {
+                    anyhow!("PartialNewToken mint failed re-validation (stream contract violated)")
+                })?;
+                println!("PartialNewToken #{n} mint={mint} symbol={symbol}");
 
                 observe_mint(&oracle, &mint, &mut counters).await;
             }
@@ -822,5 +844,78 @@ mod tests {
             !src.contains(bind_e) && !src.contains(bind_cat),
             "smoke must not bind/expose the decode payload"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-OBSERVATION-SCHEMA-V2 §24 — partial-create smoke handling.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_partial_new_token_has_explicit_handler() {
+        // The main loop must have an explicit PartialNewToken arm that observes the
+        // mint through the oracle (snapshot + hypothetical quote), NOT a decode arm.
+        let src = include_str!("observe_smoke.rs");
+        let arm = concat!("PumpPortalEvent::", "PartialNewToken(ev) =>");
+        assert!(
+            src.contains(arm),
+            "explicit PartialNewToken handler required"
+        );
+        // The terminal drain classifier must also handle it (exhaustive match).
+        let drain_arm = concat!("PumpPortalEvent::", "PartialNewToken(_) =>");
+        assert!(
+            src.contains(drain_arm),
+            "PartialNewToken must be classified in the terminal drain"
+        );
+    }
+
+    #[test]
+    fn test_partial_new_token_is_not_a_decode_error() {
+        // A partial create maps to the NewToken terminal kind, so applying it never
+        // touches decode_errors. Prove via the pure classifier/applier.
+        let mut counters = data_criteria_met();
+        counters.decode_errors = 0;
+        counters.new_token_events = 0;
+        let mut stream_connected = true;
+        apply_terminal_kind(TerminalKind::NewToken, &mut stream_connected, &mut counters);
+        assert_eq!(
+            counters.decode_errors, 0,
+            "partial must not be a decode loss"
+        );
+        assert_eq!(counters.new_token_events, 1);
+    }
+
+    #[test]
+    fn test_partial_with_unsupported_quote_does_not_count_candidate_success() {
+        // The smoke's candidate-success counters are market_snapshot_successes and
+        // hypothetical_quote_successes; observe_mint only bumps the hypothetical-quote
+        // success for a SOL-quoted market and returns early on unsupported. Model the
+        // counting predicate: a partial whose canonical snapshot resolved but whose
+        // quote asset is unsupported yields a snapshot success but NO hypothetical
+        // quote success, which alone does not satisfy the data PASS criteria.
+        let mut counters = Counters::default();
+        // Snapshot resolved (unsupported quote asset => no quote attempt).
+        counters.new_token_events = 1;
+        counters.market_snapshot_successes = 1;
+        counters.hypothetical_quote_successes = 0;
+        // Without a hypothetical quote success the run cannot PASS.
+        assert!(
+            !smoke_passes(true, 42, true, &counters),
+            "unsupported-quote partial must not satisfy candidate success alone"
+        );
+        // A partial that DID resolve to a SOL quote (quote success present) may PASS.
+        counters.hypothetical_quote_successes = 1;
+        counters.connected_events = 1;
+        assert!(smoke_passes(true, 42, true, &counters));
+    }
+
+    #[test]
+    fn test_true_decode_error_still_blocks_pass_with_partials_present() {
+        // Even with partial-driven new-token/snapshot/quote successes, a genuine
+        // DecodeError still blocks PASS (unchanged §19 contract).
+        let mut counters = data_criteria_met();
+        let mut stream_connected = true;
+        apply_terminal_kind(TerminalKind::Decode, &mut stream_connected, &mut counters);
+        assert_eq!(counters.decode_errors, 1);
+        assert!(!smoke_passes(true, 42, stream_connected, &counters));
     }
 }

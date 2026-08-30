@@ -7,14 +7,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::observation::schema::{
-    ObservationEnvelope, ObservationPayload, OBSERVATION_SCHEMA_VERSION,
-};
+use crate::observation::schema::{ObservationEnvelope, ObservationPayload};
 
 /// A fully validated observation run.
 pub struct ReplayRun {
     pub run_id: String,
     pub records: Vec<ObservationEnvelope>,
+    /// The single schema version used by every line in the run (1 or 2). A run
+    /// file must use exactly one version; mixed versions are rejected.
+    pub schema_version: u32,
     /// True when a single unterminated trailing fragment failed to parse and
     /// was ignored (crash recovery).
     pub trailing_partial_ignored: bool,
@@ -42,7 +43,8 @@ fn err<T>(msg: &str) -> crate::Result<T> {
 ///
 /// Fail-closed rules:
 /// - any interior (newline-terminated) malformed line => Err;
-/// - schema_version != 1 => Err;
+/// - schema_version not in {1, 2} => Err (version 0 or >2 rejected);
+/// - mixed schema versions within one run => Err (all lines must match);
 /// - more than one distinct run_id => Err;
 /// - seq must be exactly 0,1,2,... contiguous => Err on any gap;
 /// - the first complete record must be a RunStarted payload => Err otherwise;
@@ -100,7 +102,7 @@ pub fn read_observation_run(path: impl AsRef<Path>) -> crate::Result<ReplayRun> 
         }
     }
 
-    validate(&records)?;
+    let schema_version = validate(&records)?;
 
     let run_id = records
         .first()
@@ -110,20 +112,27 @@ pub fn read_observation_run(path: impl AsRef<Path>) -> crate::Result<ReplayRun> 
     Ok(ReplayRun {
         run_id,
         records,
+        schema_version,
         trailing_partial_ignored,
     })
 }
 
-fn validate(records: &[ObservationEnvelope]) -> crate::Result<()> {
+fn validate(records: &[ObservationEnvelope]) -> crate::Result<u32> {
     if records.is_empty() {
         return err("empty run");
     }
 
-    // schema version, single run_id, contiguous seq.
+    // schema version, single run_id, contiguous seq. The run's version is taken
+    // from the first line; it must be a supported version (1 or 2) and every
+    // subsequent line must match it exactly (no mixed v1/v2 runs).
+    let schema_version = records[0].schema_version;
+    if schema_version != 1 && schema_version != 2 {
+        return err("unsupported schema version");
+    }
     let run_id = &records[0].run_id;
     for (expected_seq, env) in records.iter().enumerate() {
-        if env.schema_version != OBSERVATION_SCHEMA_VERSION {
-            return err("schema version mismatch");
+        if env.schema_version != schema_version {
+            return err("schema version mismatch within run");
         }
         if &env.run_id != run_id {
             return err("run_id changed within run");
@@ -157,7 +166,7 @@ fn validate(records: &[ObservationEnvelope]) -> crate::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(schema_version)
 }
 
 // ---------------------------------------------------------------------------
@@ -173,8 +182,17 @@ mod tests {
     use std::io::Write;
 
     fn envelope(seq: u64, run_id: &str, payload: ObservationPayload) -> ObservationEnvelope {
+        envelope_v(2, seq, run_id, payload)
+    }
+
+    fn envelope_v(
+        schema_version: u32,
+        seq: u64,
+        run_id: &str,
+        payload: ObservationPayload,
+    ) -> ObservationEnvelope {
         ObservationEnvelope {
-            schema_version: 1,
+            schema_version,
             run_id: run_id.to_string(),
             seq,
             recorded_at: chrono::Utc::now(),
@@ -198,16 +216,19 @@ mod tests {
             signature: id.into(),
             mint: "mint".into(),
             creator: "creator".into(),
-            bonding_curve: "bc".into(),
+            bonding_curve: Some("bc".into()),
             tx_type: "create".into(),
-            provider_initial_buy: 0.0,
-            provider_v_tokens_in_bonding_curve: 0.0,
-            provider_v_sol_in_bonding_curve_sol: 0.0,
-            provider_market_cap_sol: 0.0,
+            provider_initial_buy: Some(0.0),
+            provider_v_tokens_in_bonding_curve: Some(0.0),
+            provider_v_sol_in_bonding_curve_sol: Some(0.0),
+            provider_market_cap_sol: Some(0.0),
             name: "n".into(),
             symbol: "s".into(),
             uri: "u".into(),
             duplicate: false,
+            provider_create_shape: Some(
+                crate::observation::schema::ProviderCreateShape::Full,
+            ),
         })
     }
 
@@ -247,11 +268,88 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_rejects_schema_mismatch() {
-        let mut env = envelope(0, "r", run_started_payload());
-        env.schema_version = 2;
-        let f = write_lines(&[line(&env)], true);
+    fn test_replay_v2_supported() {
+        let l0 = line(&envelope(0, "r", run_started_payload()));
+        let l1 = line(&envelope(1, "r", candidate("c1")));
+        let f = write_lines(&[l0, l1], true);
+        let run = read_observation_run(f.path()).unwrap();
+        assert_eq!(run.schema_version, 2);
+    }
+
+    #[test]
+    fn test_replay_rejects_mixed_versions() {
+        // First line v2, second line v1 => mixed run rejected.
+        let l0 = line(&envelope_v(2, 0, "r", run_started_payload()));
+        let l1 = line(&envelope_v(1, 1, "r", candidate("c1")));
+        let f = write_lines(&[l0, l1], true);
         assert!(read_observation_run(f.path()).is_err());
+    }
+
+    #[test]
+    fn test_replay_rejects_unsupported_version_high() {
+        let l0 = line(&envelope_v(3, 0, "r", run_started_payload()));
+        let f = write_lines(&[l0], true);
+        assert!(read_observation_run(f.path()).is_err());
+    }
+
+    #[test]
+    fn test_replay_rejects_unsupported_version_zero() {
+        let l0 = line(&envelope_v(0, 0, "r", run_started_payload()));
+        let f = write_lines(&[l0], true);
+        assert!(read_observation_run(f.path()).is_err());
+    }
+
+    /// HARD AUDIT REQUIREMENT (packet section 15): a literal, hand-authored v1
+    /// JSONL run — NOT serialized from the v2 structs — must replay as v1 with
+    /// concrete provider values landing in `Some(...)` and no create shape.
+    #[test]
+    fn test_literal_v1_fixture_replays_as_some_none_shape() {
+        let run_started = r#"{"schema_version":1,"run_id":"legacy","seq":0,"recorded_at":"2024-01-01T00:00:00Z","payload":{"kind":"run_started","data":{"source_revision":"abc123","working_tree_clean":true,"binary_version":"0.1.0","network":"solana-mainnet","entry_quote_lamports":1000000,"outcome_horizons_secs":[2,4],"snapshot_horizons_secs":[15,30],"return_model":"protocol_net_ex_network_v1","intake_seconds":900,"max_active_candidates":64}}}"#;
+        let candidate = r#"{"schema_version":1,"run_id":"legacy","seq":1,"recorded_at":"2024-01-01T00:00:01Z","payload":{"kind":"candidate_observed","data":{"candidate_id":"sigA","signature":"sigA","mint":"MintA","creator":"CreatorA","bonding_curve":"BondingA","tx_type":"create","provider_initial_buy":1.25,"provider_v_tokens_in_bonding_curve":1000000.0,"provider_v_sol_in_bonding_curve_sol":30.0,"provider_market_cap_sol":42.0,"name":"Tok","symbol":"TK","uri":"ipfs://x","duplicate":false}}}"#;
+        let run_finished = r#"{"schema_version":1,"run_id":"legacy","seq":2,"recorded_at":"2024-01-01T00:00:02Z","payload":{"kind":"run_finished","data":{"completion":"complete","candidates_seen":1,"unique_candidates":1,"duplicate_candidate_events":0,"tracking_started":1,"tracking_skipped":0,"tracking_completed":1,"stream_connected_events":1,"stream_disconnect_events":0,"provider_errors":0,"unexpected_trade_events":0,"migrations_seen":0}}}"#;
+
+        let lines = vec![
+            run_started.to_string(),
+            candidate.to_string(),
+            run_finished.to_string(),
+        ];
+        let f = write_lines(&lines, true);
+        let run = read_observation_run(f.path()).unwrap();
+
+        assert_eq!(run.schema_version, 1);
+
+        // Find the candidate record and assert v1 backward-compat mapping.
+        let cand = run
+            .records
+            .iter()
+            .find_map(|e| match &e.payload {
+                ObservationPayload::CandidateObserved(c) => Some(c),
+                _ => None,
+            })
+            .expect("candidate record present");
+
+        assert_eq!(cand.bonding_curve.as_deref(), Some("BondingA"));
+        assert_eq!(cand.provider_initial_buy, Some(1.25));
+        assert_eq!(cand.provider_v_tokens_in_bonding_curve, Some(1_000_000.0));
+        assert_eq!(cand.provider_v_sol_in_bonding_curve_sol, Some(30.0));
+        assert_eq!(cand.provider_market_cap_sol, Some(42.0));
+        // v2-only fields absent in v1 => defaults.
+        assert_eq!(cand.provider_create_shape, None);
+
+        // RunStarted v1 line lacks the v2 universe fields => None via default.
+        if let ObservationPayload::RunStarted(rs) = &run.records[0].payload {
+            assert_eq!(rs.discovery_universe, None);
+            assert_eq!(rs.outcome_universe, None);
+        } else {
+            panic!("first record should be RunStarted");
+        }
+
+        // RunFinished v1 line lacks partial counter => 0 via default.
+        if let ObservationPayload::RunFinished(rf) = &run.records[2].payload {
+            assert_eq!(rf.partial_new_token_events, 0);
+        } else {
+            panic!("last record should be RunFinished");
+        }
     }
 
     #[test]
@@ -285,6 +383,7 @@ mod tests {
             provider_errors: 0,
             unexpected_trade_events: 0,
             migrations_seen: 0,
+            partial_new_token_events: 0,
         });
         let l0 = line(&envelope(0, "r", run_started_payload()));
         let l1 = line(&envelope(1, "r", finished));

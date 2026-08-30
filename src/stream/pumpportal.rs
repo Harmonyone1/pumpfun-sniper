@@ -533,6 +533,91 @@ impl NewTokenEvent {
     }
 }
 
+/// Partial new-token event from PumpPortal (P1-OBSERVATION-SCHEMA-V2-PARTIAL-CREATE-001
+/// §4-6).
+///
+/// A `txType=create` message with valid DISCOVERY IDENTITY (signature, mint,
+/// traderPublicKey, txType) but one or more OPTIONAL provider-observational fields
+/// ABSENT. Emitted ONLY as a fallback after the FULL `NewTokenEvent` parse/validation
+/// failed (§7): metadata-only absence still lands as a FULL `NewToken` because the
+/// full parser's name/symbol/uri carry serde defaults.
+///
+/// The provider observational fields (`initial_buy`, `bonding_curve_key`,
+/// `v_tokens_in_bonding_curve`, `v_sol_in_bonding_curve`, `market_cap_sol`) are
+/// `Option`: ONLY ABSENCE maps to `None`. A present-but-invalid optional field is a
+/// true decode/validation loss, NOT `None` (§6) — validated in
+/// [`validate_partial_new_token`] AFTER deserialization. These are NOT canonical
+/// market reserves; the canonical on-chain oracle resolves real market truth from the
+/// retained mint.
+///
+/// Metadata (`name`/`symbol`/`uri`) reuses the PR#11 absence behavior: an ABSENT key
+/// defaults to the empty String; a present-but-wrong-type value (null/number/bool/
+/// array/object) fails String deserialization => DecodeError.
+/// AUDIT-001 §4: "missing-only" deserializer. Combined with `#[serde(default)]`,
+/// an ABSENT key uses the field default (`None`), but a PRESENT key must
+/// deserialize the inner `T` — so an explicit JSON `null` (or wrong type) FAILS
+/// instead of collapsing to `None`. This enforces the contract "only absence =>
+/// None; present null/invalid => DecodeError".
+fn deserialize_present_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialNewTokenEvent {
+    pub signature: String,
+    pub mint: String,
+    pub trader_public_key: String,
+    pub tx_type: String,
+    /// Provider observational initial buy amount. ABSENT => `None`; present =>
+    /// validated finite && non-negative (§6).
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub initial_buy: Option<f64>,
+    /// Provider bonding-curve key. ABSENT => `None`; present => validated Solana
+    /// Pubkey (§6).
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub bonding_curve_key: Option<String>,
+    /// Provider observational token reserve figure. ABSENT => `None`; present =>
+    /// validated finite && non-negative (§6).
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub v_tokens_in_bonding_curve: Option<f64>,
+    /// Provider observational SOL reserve figure. ABSENT => `None`; present =>
+    /// validated finite && non-negative (§6).
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub v_sol_in_bonding_curve: Option<f64>,
+    /// Provider observational market cap. ABSENT => `None`; present => validated
+    /// finite && non-negative (§6).
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub market_cap_sol: Option<f64>,
+    /// Provider presentation metadata (same PR#11 absence behavior as
+    /// `NewTokenEvent`): ABSENT => empty String, present-wrong-type => reject.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(default)]
+    pub uri: String,
+}
+
+impl PartialNewTokenEvent {
+    /// Pure availability check for provider presentation metadata, mirroring
+    /// [`NewTokenEvent::has_complete_metadata`]. Returns true iff name/symbol/uri are
+    /// all present and non-blank after trimming. Pure inspection of decoded strings —
+    /// no fetch/validation/download. The live consumer (Agent C) may use this to skip
+    /// metadata-less candidates per-candidate.
+    pub fn has_complete_metadata(&self) -> bool {
+        !self.name.trim().is_empty()
+            && !self.symbol.trim().is_empty()
+            && !self.uri.trim().is_empty()
+    }
+}
+
 /// Trade event from PumpPortal.
 ///
 /// UNIT NOTES (INV-EVT-009):
@@ -579,6 +664,16 @@ pub enum PumpPortalDecodeKind {
     NewTokenDeserialize,
     /// A `NewTokenEvent` deserialized but failed identity/numeric validation.
     NewTokenValidation,
+    /// A `txType=create` message that FAILED the full `NewTokenEvent` path also
+    /// failed strict `PartialNewTokenEvent` deserialization (P1-OBSERVATION-SCHEMA-V2
+    /// §7): even the reduced partial shape (required identity + typed optionals) did
+    /// not parse.
+    PartialNewTokenDeserialize,
+    /// A `PartialNewTokenEvent` deserialized but failed required-identity or
+    /// present-optional validation (§4-6): e.g. bad mint/creator/signature, a present
+    /// bonding-curve that is not a valid Pubkey, or a present numeric that is not
+    /// finite && non-negative.
+    PartialNewTokenValidation,
     /// A migration message failed structural parse.
     MigrationParse,
     /// A `txType=buy|sell` message failed strict `TradeEvent` deserialization.
@@ -599,8 +694,15 @@ pub struct PumpPortalDecodeError {
 /// Event from PumpPortal WebSocket.
 #[derive(Debug, Clone)]
 pub enum PumpPortalEvent {
-    /// New token created.
+    /// New token created (FULL provider shape: all observational provider fields
+    /// present and valid). Unchanged from prior schema.
     NewToken(NewTokenEvent),
+    /// New token created with valid discovery IDENTITY but one or more OPTIONAL
+    /// provider-observational fields absent (P1-OBSERVATION-SCHEMA-V2 §3-7). Only
+    /// reached when the FULL `NewToken` parse/validation failed; required identity
+    /// and any PRESENT optional field are still fully validated. Retained for
+    /// research discovery — the canonical on-chain oracle classifies the market.
+    PartialNewToken(PartialNewTokenEvent),
     /// Trade occurred (buy or sell).
     Trade(TradeEvent),
     /// Token migrated to a pool.
@@ -1310,6 +1412,105 @@ fn diagnose_new_token_shape(value: &serde_json::Value) -> String {
     out
 }
 
+/// REQUIRED (discovery-identity) STRING fields of `PartialNewTokenEvent`, in fixed
+/// declaration order (AUDIT-001 §7). Absence of any of these is a structural
+/// `missing=` token; presence with a non-string JSON type is a `wrong_type=` token.
+const PARTIAL_NEW_TOKEN_REQUIRED_STRING_FIELDS: &[&str] =
+    &["signature", "mint", "traderPublicKey", "txType"];
+
+/// OPTIONAL observational STRING fields of `PartialNewTokenEvent`, in fixed
+/// declaration order (AUDIT-001 §7). ABSENCE is permitted (mapped to `None`) and is
+/// therefore NEVER mentioned; a PRESENT value (including `null`) of a non-string JSON
+/// type is a `wrong_type=` token.
+const PARTIAL_NEW_TOKEN_OPTIONAL_STRING_FIELDS: &[&str] =
+    &["bondingCurveKey", "name", "symbol", "uri"];
+
+/// OPTIONAL observational NUMBER fields of `PartialNewTokenEvent`, in fixed
+/// declaration order (AUDIT-001 §7). ABSENCE is permitted (mapped to `None`) and is
+/// therefore NEVER mentioned; a PRESENT value (including `null`) of a non-number JSON
+/// type is a `wrong_type=` token.
+const PARTIAL_NEW_TOKEN_OPTIONAL_NUMBER_FIELDS: &[&str] = &[
+    "initialBuy",
+    "vTokensInBondingCurve",
+    "vSolInBondingCurve",
+    "marketCapSol",
+];
+
+/// AUDIT-001 §7: pure, secret-safe structural diagnostic for a `txType=create`
+/// message that FAILED strict `PartialNewTokenEvent` deserialization.
+///
+/// Distinct from [`diagnose_new_token_shape`] because the partial shape treats the
+/// observational provider fields as OPTIONAL: their ABSENCE is a valid retained shape
+/// and must NEVER appear as `missing=`. Only the discovery-identity fields
+/// (signature/mint/traderPublicKey/txType) can be `missing=`. Any PRESENT field of the
+/// wrong JSON type — required or optional, including a present `null` optional — is a
+/// `wrong_type=field:jsontype` token. Output base is `partial_new_token_deserialize`; a
+/// non-object value yields `partial_new_token_deserialize|shape=unknown`. NO unknown
+/// field names, NO raw JSON, NO provider values, ASCII-only, bounded to <=256 bytes by
+/// dropping later fixed tokens (never mid-token byte-slicing).
+fn diagnose_partial_new_token_shape(value: &serde_json::Value) -> String {
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return "partial_new_token_deserialize|shape=unknown".to_string(),
+    };
+
+    let mut missing: Vec<&'static str> = Vec::new();
+    let mut wrong_type: Vec<String> = Vec::new();
+
+    // Required identity strings: absent => missing; present-non-string => wrong_type.
+    for &field in PARTIAL_NEW_TOKEN_REQUIRED_STRING_FIELDS {
+        match obj.get(field) {
+            None => missing.push(field),
+            Some(v) => {
+                if !v.is_string() {
+                    wrong_type.push(format!("{field}:{}", json_type_label(v)));
+                }
+            }
+        }
+    }
+    // Optional strings: absent => IGNORED; present-non-string (incl. null) => wrong_type.
+    for &field in PARTIAL_NEW_TOKEN_OPTIONAL_STRING_FIELDS {
+        if let Some(v) = obj.get(field) {
+            if !v.is_string() {
+                wrong_type.push(format!("{field}:{}", json_type_label(v)));
+            }
+        }
+    }
+    // Optional numbers: absent => IGNORED; present-non-number (incl. null) => wrong_type.
+    for &field in PARTIAL_NEW_TOKEN_OPTIONAL_NUMBER_FIELDS {
+        if let Some(v) = obj.get(field) {
+            if !v.is_number() {
+                wrong_type.push(format!("{field}:{}", json_type_label(v)));
+            }
+        }
+    }
+
+    let base = "partial_new_token_deserialize".to_string();
+    let missing_tok = if missing.is_empty() {
+        None
+    } else {
+        Some(format!("|missing={}", missing.join(",")))
+    };
+    let wrong_tok = if wrong_type.is_empty() {
+        None
+    } else {
+        Some(format!("|wrong_type={}", wrong_type.join(",")))
+    };
+
+    let mut out = base;
+    if let Some(m) = &missing_tok {
+        if out.len() + m.len() <= DECODE_CATEGORY_MAX {
+            out.push_str(m);
+        }
+    }
+    if let Some(w) = &wrong_tok {
+        if out.len() + w.len() <= DECODE_CATEGORY_MAX {
+            out.push_str(w);
+        }
+    }
+    out
+}
+
 /// §5: classify a `txType=create` message into either a `NewToken` event or a
 /// typed `DecodeError`. Pure (no socket): serde failure => `NewTokenDeserialize`
 /// with a structural shape category; serde-ok but validation failure =>
@@ -1332,12 +1533,62 @@ fn classify_new_token(text: &str, value: &serde_json::Value) -> PumpPortalEvent 
             }
         },
         Err(_) => {
+            // Step B (§7): the FULL parse/validate failed. Attempt the partial-create
+            // fallback before declaring a decode loss. The partial path requires valid
+            // discovery identity and validates every PRESENT optional; only field
+            // ABSENCE is permitted (mapped to None). This RETAINS creates that carry a
+            // valid identity but are missing observational provider fields.
+            classify_partial_new_token(text, value)
+        }
+    }
+}
+
+/// §7 Step B: classify a `txType=create` message that FAILED the full `NewTokenEvent`
+/// path into either a `PartialNewToken` event or a typed `DecodeError`. Pure (no
+/// socket).
+///
+/// Ordering:
+///   - strict `serde_json::from_str::<PartialNewTokenEvent>` — a failure here (bad
+///     required-identity type, present-wrong-type metadata, or a present optional of
+///     the wrong JSON type) is a value-free structural `PartialNewTokenDeserialize`
+///     loss diagnosed via [`diagnose_partial_new_token_shape`];
+///   - then [`validate_partial_new_token`] — required identity + EVERY present
+///     optional; a failure is a `PartialNewTokenValidation` loss with the fixed
+///     category `partial_new_token_validation`.
+///
+/// NEVER emits both `PartialNewToken` and `DecodeError`. All logs are value-free
+/// (fixed strings / structural category only); the serde/validation error Display is
+/// NEVER interpolated (AUDIT-001).
+fn classify_partial_new_token(text: &str, value: &serde_json::Value) -> PumpPortalEvent {
+    match serde_json::from_str::<PartialNewTokenEvent>(text) {
+        Ok(ev) => match validate_partial_new_token(&ev) {
+            Ok(()) => {
+                // Value-free: field COUNT/identity mint only would be provider data;
+                // log a fixed string with no provider values.
+                debug!("PumpPortal PartialNewToken retained (incomplete provider shape)");
+                PumpPortalEvent::PartialNewToken(ev)
+            }
+            Err(_) => {
+                // AUDIT-001: never interpolate the validation error Display — it can
+                // carry rejected provider values (invalid mint/pubkey/signature or a
+                // present-but-invalid optional).
+                warn!("PumpPortal PartialNewToken validation loss");
+                PumpPortalEvent::DecodeError(PumpPortalDecodeError {
+                    kind: PumpPortalDecodeKind::PartialNewTokenValidation,
+                    category: "partial_new_token_validation".to_string(),
+                })
+            }
+        },
+        Err(_) => {
             // The structural category is value-free (§6); safe to log. Never log the
             // serde error Display, which may render offending provider field values.
-            let category = diagnose_new_token_shape(value);
-            warn!("PumpPortal NewToken decode/schema loss: {}", category);
+            let category = diagnose_partial_new_token_shape(value);
+            warn!(
+                "PumpPortal PartialNewToken decode/schema loss: {}",
+                category
+            );
             PumpPortalEvent::DecodeError(PumpPortalDecodeError {
-                kind: PumpPortalDecodeKind::NewTokenDeserialize,
+                kind: PumpPortalDecodeKind::PartialNewTokenDeserialize,
                 category,
             })
         }
@@ -1454,6 +1705,46 @@ fn validate_new_token(ev: &NewTokenEvent) -> Result<()> {
     validate_nonneg_finite("v_tokens_in_bonding_curve", ev.v_tokens_in_bonding_curve)?;
     validate_nonneg_finite("v_sol_in_bonding_curve", ev.v_sol_in_bonding_curve)?;
     validate_nonneg_finite("market_cap_sol", ev.market_cap_sol)?;
+    Ok(())
+}
+
+/// Validate a `PartialNewTokenEvent`'s REQUIRED discovery identity and EVERY PRESENT
+/// optional provider field before emission (P1-OBSERVATION-SCHEMA-V2 §4-6).
+///
+/// Required identity: `txType == "create"`, mint + trader_public_key parse as Solana
+/// Pubkeys, signature valid under [`validate_signature`]. OPTIONAL != unvalidated: a
+/// present `bonding_curve_key` must be a valid Pubkey, and every present numeric
+/// optional must be finite && non-negative (reusing the existing validators). ONLY
+/// ABSENCE (`None`) skips validation. A present-but-invalid optional is an `Err` here
+/// => DecodeError, never silently coerced to `None`.
+fn validate_partial_new_token(ev: &PartialNewTokenEvent) -> Result<()> {
+    // Required discovery identity.
+    if ev.tx_type != "create" {
+        return Err(Error::Deserialization(format!(
+            "unexpected new-token txType: {}",
+            ev.tx_type
+        )));
+    }
+    validate_pubkey_field("mint", &ev.mint)?;
+    validate_pubkey_field("creator", &ev.trader_public_key)?;
+    validate_signature(&ev.signature)?;
+
+    // Present optionals: validate; absence (None) is allowed.
+    if let Some(curve) = &ev.bonding_curve_key {
+        validate_pubkey_field("bonding_curve", curve)?;
+    }
+    if let Some(v) = ev.initial_buy {
+        validate_nonneg_finite("initial_buy", v)?;
+    }
+    if let Some(v) = ev.v_tokens_in_bonding_curve {
+        validate_nonneg_finite("v_tokens_in_bonding_curve", v)?;
+    }
+    if let Some(v) = ev.v_sol_in_bonding_curve {
+        validate_nonneg_finite("v_sol_in_bonding_curve", v)?;
+    }
+    if let Some(v) = ev.market_cap_sol {
+        validate_nonneg_finite("market_cap_sol", v)?;
+    }
     Ok(())
 }
 
@@ -2405,16 +2696,39 @@ mod tests {
 
     #[test]
     fn test_new_token_deserialize_emits_decode_error_not_hard_error() {
-        // Missing a required numeric field => strict serde fails => DecodeError with
-        // NewTokenDeserialize, never a hard Error.
+        // A wrong-typed core numeric fails BOTH the full and the partial parser =>
+        // DecodeError (value-safe structural category), never a hard Error. (Under
+        // schema v2 a *missing* optional like marketCapSol is now a PartialNewToken,
+        // so we use a genuinely-undecodable input to preserve this test's intent.)
         let mut v = full_new_token_json();
-        v.as_object_mut().unwrap().remove("marketCapSol");
+        v["initialBuy"] = serde_json::json!("not_a_number");
         let text = serde_json::to_string(&v).unwrap();
         match classify_new_token(&text, &v) {
             PumpPortalEvent::DecodeError(e) => {
-                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
-                assert!(e.category.starts_with("new_token_deserialize"));
-                assert!(e.category.contains("missing=marketCapSol"));
+                assert!(
+                    matches!(
+                        e.kind,
+                        PumpPortalDecodeKind::NewTokenDeserialize
+                            | PumpPortalDecodeKind::PartialNewTokenDeserialize
+                    ),
+                    "kind={:?}",
+                    e.kind
+                );
+                // Category prefix tracks the kind: the full path yields
+                // `new_token_deserialize`, the partial fallback (valid identity, one
+                // wrong-typed optional) yields `partial_new_token_deserialize`.
+                let expected_prefix = match e.kind {
+                    PumpPortalDecodeKind::PartialNewTokenDeserialize => {
+                        "partial_new_token_deserialize"
+                    }
+                    _ => "new_token_deserialize",
+                };
+                assert!(
+                    e.category.starts_with(expected_prefix),
+                    "cat={}",
+                    e.category
+                );
+                assert!(e.category.contains("wrong_type=initialBuy"));
             }
             other => panic!("expected DecodeError, got {other:?}"),
         }
@@ -2486,15 +2800,18 @@ mod tests {
     }
 
     #[test]
-    fn test_new_token_missing_required_market_cap_still_decode_error() {
+    fn test_new_token_missing_market_cap_is_partial_v2() {
+        // Schema v2: marketCapSol is optional-on-partial. A create with valid identity
+        // but a missing provider observational field is now RETAINED as a
+        // PartialNewToken (not dropped as DecodeError), with the field as None.
         let mut v = full_new_token_json();
         v.as_object_mut().unwrap().remove("marketCapSol");
         let text = serde_json::to_string(&v).unwrap();
         match classify_new_token(&text, &v) {
-            PumpPortalEvent::DecodeError(e) => {
-                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
+            PumpPortalEvent::PartialNewToken(ev) => {
+                assert!(ev.market_cap_sol.is_none());
             }
-            other => panic!("expected DecodeError, got {other:?}"),
+            other => panic!("expected PartialNewToken, got {other:?}"),
         }
     }
 
@@ -2504,8 +2821,19 @@ mod tests {
         v.as_object_mut().unwrap().remove("mint");
         let text = serde_json::to_string(&v).unwrap();
         match classify_new_token(&text, &v) {
+            // Missing mint fails BOTH the full and the partial parser (partial also
+            // requires a valid mint) => still a fail-closed DecodeError. Under v2 the
+            // final failure is reported via the partial-fallback deserialize kind.
             PumpPortalEvent::DecodeError(e) => {
-                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
+                assert!(
+                    matches!(
+                        e.kind,
+                        PumpPortalDecodeKind::NewTokenDeserialize
+                            | PumpPortalDecodeKind::PartialNewTokenDeserialize
+                    ),
+                    "kind={:?}",
+                    e.kind
+                );
             }
             other => panic!("expected DecodeError, got {other:?}"),
         }
@@ -2513,14 +2841,22 @@ mod tests {
 
     #[test]
     fn test_new_token_null_metadata_still_decode_error() {
-        // Present-but-null is a WRONG TYPE, not absence => serde String fails =>
-        // NewTokenDeserialize (serde(default) fills ABSENT keys only).
+        // Present-but-null is a WRONG TYPE, not absence => serde String fails in BOTH
+        // parsers => DecodeError (serde(default) fills ABSENT keys only).
         let mut v = full_new_token_json();
         v["name"] = serde_json::Value::Null;
         let text = serde_json::to_string(&v).unwrap();
         match classify_new_token(&text, &v) {
             PumpPortalEvent::DecodeError(e) => {
-                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
+                assert!(
+                    matches!(
+                        e.kind,
+                        PumpPortalDecodeKind::NewTokenDeserialize
+                            | PumpPortalDecodeKind::PartialNewTokenDeserialize
+                    ),
+                    "kind={:?}",
+                    e.kind
+                );
             }
             other => panic!("expected DecodeError, got {other:?}"),
         }
@@ -2528,13 +2864,22 @@ mod tests {
 
     #[test]
     fn test_new_token_wrong_type_metadata_still_decode_error() {
-        // A number for a metadata String field is a wrong type => DecodeError.
+        // A number for a metadata String field is a wrong type => DecodeError in BOTH
+        // parsers.
         let mut v = full_new_token_json();
         v["symbol"] = serde_json::json!(123);
         let text = serde_json::to_string(&v).unwrap();
         match classify_new_token(&text, &v) {
             PumpPortalEvent::DecodeError(e) => {
-                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
+                assert!(
+                    matches!(
+                        e.kind,
+                        PumpPortalDecodeKind::NewTokenDeserialize
+                            | PumpPortalDecodeKind::PartialNewTokenDeserialize
+                    ),
+                    "kind={:?}",
+                    e.kind
+                );
             }
             other => panic!("expected DecodeError, got {other:?}"),
         }
@@ -2583,5 +2928,376 @@ mod tests {
             }
             other => panic!("expected DecodeError, got {other:?}"),
         }
+    }
+
+    // === P1-OBSERVATION-SCHEMA-V2-PARTIAL-CREATE-001 §21 — partial create =======
+
+    /// A create message body carrying only the REQUIRED discovery identity plus valid
+    /// metadata (all provider observational optionals ABSENT). Callers insert specific
+    /// optionals to exercise the present-optional validation paths.
+    fn identity_only_create_json() -> serde_json::Value {
+        serde_json::json!({
+            "signature": valid_sig(),
+            "mint": VALID_PK_2,
+            "traderPublicKey": VALID_PK_1,
+            "txType": "create",
+            "name": "Test Token",
+            "symbol": "TEST",
+            "uri": "https://example.com"
+        })
+    }
+
+    /// §21.1 — Valid identity + valid remaining provider fields, missing EXACTLY
+    /// bondingCurveKey + vTokensInBondingCurve + vSolInBondingCurve. The full parser
+    /// fails (those are required there) => partial fallback retains it as
+    /// PartialNewToken. This is the exact Run #3 loss shape.
+    #[test]
+    fn test_missing_curve_and_reserves_emits_partial_new_token() {
+        let mut v = full_new_token_json();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("bondingCurveKey");
+        obj.remove("vTokensInBondingCurve");
+        obj.remove("vSolInBondingCurve");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::PartialNewToken(ev) => {
+                assert_eq!(ev.mint, VALID_PK_2);
+                assert_eq!(ev.trader_public_key, VALID_PK_1);
+                assert_eq!(ev.tx_type, "create");
+                // The absent optionals are None...
+                assert!(ev.bonding_curve_key.is_none());
+                assert!(ev.v_tokens_in_bonding_curve.is_none());
+                assert!(ev.v_sol_in_bonding_curve.is_none());
+                // ...the still-present optionals are Some.
+                assert_eq!(ev.initial_buy, Some(1000000.5));
+                assert_eq!(ev.market_cap_sol, Some(30.0));
+                assert!(ev.has_complete_metadata());
+            }
+            other => panic!("expected PartialNewToken, got {other:?}"),
+        }
+    }
+
+    /// §21.2 — All provider observational optionals absent => all None.
+    #[test]
+    fn test_partial_new_token_missing_optional_values_are_none() {
+        let v = identity_only_create_json();
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::PartialNewToken(ev) => {
+                assert!(ev.initial_buy.is_none());
+                assert!(ev.bonding_curve_key.is_none());
+                assert!(ev.v_tokens_in_bonding_curve.is_none());
+                assert!(ev.v_sol_in_bonding_curve.is_none());
+                assert!(ev.market_cap_sol.is_none());
+            }
+            other => panic!("expected PartialNewToken, got {other:?}"),
+        }
+    }
+
+    /// §21.3 — Present valid optionals are retained as Some (still partial because
+    /// bondingCurveKey is absent, so the FULL parser fails).
+    #[test]
+    fn test_partial_new_token_present_optional_values_are_some() {
+        let mut v = identity_only_create_json();
+        v["initialBuy"] = serde_json::json!(2.5);
+        v["vTokensInBondingCurve"] = serde_json::json!(1000.0);
+        v["vSolInBondingCurve"] = serde_json::json!(30.5);
+        v["marketCapSol"] = serde_json::json!(30.0);
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::PartialNewToken(ev) => {
+                assert_eq!(ev.initial_buy, Some(2.5));
+                assert_eq!(ev.v_tokens_in_bonding_curve, Some(1000.0));
+                assert_eq!(ev.v_sol_in_bonding_curve, Some(30.5));
+                assert_eq!(ev.market_cap_sol, Some(30.0));
+                // bondingCurveKey absent keeps this partial.
+                assert!(ev.bonding_curve_key.is_none());
+            }
+            other => panic!("expected PartialNewToken, got {other:?}"),
+        }
+    }
+
+    /// §21.4 — Missing required mint => DecodeError, never PartialNewToken.
+    #[test]
+    fn test_partial_new_token_missing_mint_is_decode_error() {
+        let mut v = identity_only_create_json();
+        v.as_object_mut().unwrap().remove("mint");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                // Absent required string => partial serde fails (deserialize kind).
+                assert_eq!(e.kind, PumpPortalDecodeKind::PartialNewTokenDeserialize);
+                assert!(e.category.contains("missing=mint"));
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    /// §21.5 — Missing required signature => DecodeError.
+    #[test]
+    fn test_partial_new_token_missing_signature_is_decode_error() {
+        let mut v = identity_only_create_json();
+        v.as_object_mut().unwrap().remove("signature");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::PartialNewTokenDeserialize);
+                assert!(e.category.contains("missing=signature"));
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    /// §21.6 — Missing required creator (traderPublicKey) => DecodeError.
+    #[test]
+    fn test_partial_new_token_missing_creator_is_decode_error() {
+        let mut v = identity_only_create_json();
+        v.as_object_mut().unwrap().remove("traderPublicKey");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::PartialNewTokenDeserialize);
+                assert!(e.category.contains("missing=traderPublicKey"));
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    /// §21.7 — A PRESENT bondingCurveKey that is not a valid Pubkey => DecodeError
+    /// (validation kind), never coerced to None.
+    #[test]
+    fn test_partial_new_token_invalid_present_bonding_curve_is_decode_error() {
+        // Missing reserves keep it out of the full path; bad present curve fails the
+        // partial present-optional validation.
+        let mut v = identity_only_create_json();
+        v["bondingCurveKey"] = serde_json::json!("not_a_pubkey");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::PartialNewTokenValidation);
+                assert_eq!(e.category, "partial_new_token_validation");
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    /// §21.8 — A PRESENT negative numeric optional => DecodeError (validation),
+    /// never coerced to None.
+    #[test]
+    fn test_partial_new_token_negative_present_numeric_is_decode_error() {
+        let mut v = identity_only_create_json();
+        v["marketCapSol"] = serde_json::json!(-1.0);
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::PartialNewTokenValidation);
+                assert_eq!(e.category, "partial_new_token_validation");
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    /// §21.9 — A PRESENT wrong-type numeric optional (string) => DecodeError. Serde
+    /// fails to deserialize `Option<f64>` from a string => deserialize kind (a
+    /// present value is NOT absence, so it is NOT silently None).
+    #[test]
+    fn test_partial_new_token_wrong_type_present_numeric_is_decode_error() {
+        let mut v = identity_only_create_json();
+        v["marketCapSol"] = serde_json::json!("30.0");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::PartialNewTokenDeserialize);
+                // Value-free structural category: names the field + json type only.
+                assert!(
+                    e.category.contains("marketCapSol:string"),
+                    "cat={}",
+                    e.category
+                );
+                assert!(!e.category.contains("30.0"), "leaked value: {}", e.category);
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    /// §21.10 — A full legacy create (every provider field present + valid) still
+    /// emits FULL NewToken. No behavior change on the full path.
+    #[test]
+    fn test_full_legacy_create_still_emits_new_token() {
+        let v = full_new_token_json();
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::NewToken(ev) => {
+                assert_eq!(ev.mint, VALID_PK_2);
+                assert_eq!(ev.bonding_curve_key, VALID_PK_3);
+                assert!(ev.has_complete_metadata());
+            }
+            other => panic!("expected NewToken, got {other:?}"),
+        }
+    }
+
+    /// §21.11 — Metadata-only absence (missing ONLY name/symbol/uri) stays FULL
+    /// NewToken, NOT Partial: the full parser succeeds because those fields carry
+    /// serde defaults, so Step B is never reached.
+    #[test]
+    fn test_metadata_only_absence_remains_full_new_token() {
+        let mut v = full_new_token_json();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("name");
+        obj.remove("symbol");
+        obj.remove("uri");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::NewToken(ev) => {
+                assert_eq!(ev.name, "");
+                assert_eq!(ev.symbol, "");
+                assert_eq!(ev.uri, "");
+                assert!(!ev.has_complete_metadata());
+            }
+            other => panic!("expected full NewToken (not Partial), got {other:?}"),
+        }
+    }
+
+    /// §21 — the partial classifier's logs/categories remain value-free: a partial
+    /// deserialize loss must never echo raw provider field values.
+    #[test]
+    fn test_partial_new_token_decode_category_is_value_free() {
+        let mut v = identity_only_create_json();
+        // Present-but-wrong-type numeric with a distinctive value that must not leak.
+        v["initialBuy"] = serde_json::json!("SECRET_VALUE_9999");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert!(
+                    !e.category.contains("SECRET_VALUE_9999"),
+                    "leaked: {}",
+                    e.category
+                );
+                assert!(e.category.is_ascii());
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    // === AUDIT-001 §5 — present-null optional is a DecodeError, never None =========
+
+    /// A present JSON `null` for an optional provider field is NOT absence: the
+    /// missing-only deserializer must fail (deserialize kind), never collapse to
+    /// `None`. Covers all five optional provider fields.
+    fn assert_present_null_optional_is_decode_error(field: &str) {
+        let mut v = identity_only_create_json();
+        v[field] = serde_json::Value::Null;
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(
+                    e.kind,
+                    PumpPortalDecodeKind::PartialNewTokenDeserialize,
+                    "field {field}"
+                );
+                assert!(
+                    e.category.contains(&format!("{field}:null")),
+                    "field {field} cat={}",
+                    e.category
+                );
+            }
+            other => panic!("expected DecodeError for null {field}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_partial_new_token_null_initial_buy_is_decode_error() {
+        assert_present_null_optional_is_decode_error("initialBuy");
+    }
+
+    #[test]
+    fn test_partial_new_token_null_bonding_curve_is_decode_error() {
+        assert_present_null_optional_is_decode_error("bondingCurveKey");
+    }
+
+    #[test]
+    fn test_partial_new_token_null_v_tokens_is_decode_error() {
+        assert_present_null_optional_is_decode_error("vTokensInBondingCurve");
+    }
+
+    #[test]
+    fn test_partial_new_token_null_v_sol_is_decode_error() {
+        assert_present_null_optional_is_decode_error("vSolInBondingCurve");
+    }
+
+    #[test]
+    fn test_partial_new_token_null_market_cap_is_decode_error() {
+        assert_present_null_optional_is_decode_error("marketCapSol");
+    }
+
+    // === AUDIT-001 §8 — partial-shape diagnostic ==================================
+
+    /// Valid identity with ALL provider optionals ABSENT diagnoses to the bare base:
+    /// no `missing=` (identity present) and no `wrong_type=` (nothing present-wrong).
+    #[test]
+    fn test_diagnose_partial_shape_absent_optionals_is_bare_base() {
+        let v = identity_only_create_json();
+        let cat = diagnose_partial_new_token_shape(&v);
+        assert_eq!(cat, "partial_new_token_deserialize");
+    }
+
+    /// An absent OPTIONAL is never reported as missing (unlike the full diagnostic,
+    /// which treats these as required). Only identity gaps appear in `missing=`.
+    #[test]
+    fn test_diagnose_partial_shape_missing_identity_only() {
+        let mut v = identity_only_create_json();
+        v.as_object_mut().unwrap().remove("mint");
+        let cat = diagnose_partial_new_token_shape(&v);
+        assert!(cat.contains("missing=mint"), "cat={cat}");
+        // The absent optionals must NOT appear.
+        assert!(!cat.contains("initialBuy"), "cat={cat}");
+        assert!(!cat.contains("bondingCurveKey"), "cat={cat}");
+        assert!(!cat.contains("vSolInBondingCurve"), "cat={cat}");
+    }
+
+    /// A present-null optional is a `wrong_type=field:null` token (present, not absent).
+    #[test]
+    fn test_diagnose_partial_shape_present_null_optional_is_wrong_type() {
+        let mut v = identity_only_create_json();
+        v["marketCapSol"] = serde_json::Value::Null;
+        let cat = diagnose_partial_new_token_shape(&v);
+        assert!(cat.contains("wrong_type=marketCapSol:null"), "cat={cat}");
+        assert!(!cat.contains("missing="), "cat={cat}");
+    }
+
+    /// A present wrong-type optional (string for a number) is a `wrong_type=` token
+    /// naming only the field and json type — never the value.
+    #[test]
+    fn test_diagnose_partial_shape_present_wrong_type_optional() {
+        let mut v = identity_only_create_json();
+        v["vTokensInBondingCurve"] = serde_json::json!("SECRET_1234");
+        let cat = diagnose_partial_new_token_shape(&v);
+        assert!(
+            cat.contains("wrong_type=vTokensInBondingCurve:string"),
+            "cat={cat}"
+        );
+        assert!(!cat.contains("SECRET_1234"), "leaked: {cat}");
+    }
+
+    /// A present wrong-type REQUIRED identity field is a `wrong_type=` token, not a
+    /// `missing=` token.
+    #[test]
+    fn test_diagnose_partial_shape_present_wrong_type_identity() {
+        let mut v = identity_only_create_json();
+        v["mint"] = serde_json::json!(12345);
+        let cat = diagnose_partial_new_token_shape(&v);
+        assert!(cat.contains("wrong_type=mint:number"), "cat={cat}");
+        assert!(!cat.contains("missing="), "cat={cat}");
+    }
+
+    /// A non-object value diagnoses to the fixed `shape=unknown` form, and every
+    /// output stays ASCII and within the 256-byte cap.
+    #[test]
+    fn test_diagnose_partial_shape_non_object_is_shape_unknown() {
+        let arr = serde_json::json!([1, 2, 3]);
+        let cat = diagnose_partial_new_token_shape(&arr);
+        assert_eq!(cat, "partial_new_token_deserialize|shape=unknown");
+        assert!(cat.is_ascii());
+        assert!(cat.len() <= DECODE_CATEGORY_MAX);
     }
 }
