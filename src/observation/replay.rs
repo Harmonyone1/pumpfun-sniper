@@ -207,6 +207,7 @@ mod tests {
             "t".into(),
             900,
             64,
+            None,
         ))
     }
 
@@ -226,9 +227,7 @@ mod tests {
             symbol: "s".into(),
             uri: "u".into(),
             duplicate: false,
-            provider_create_shape: Some(
-                crate::observation::schema::ProviderCreateShape::Full,
-            ),
+            provider_create_shape: Some(crate::observation::schema::ProviderCreateShape::Full),
         })
     }
 
@@ -337,16 +336,73 @@ mod tests {
         assert_eq!(cand.provider_create_shape, None);
 
         // RunStarted v1 line lacks the v2 universe fields => None via default.
+        // It also lacks the RPC-gate limit (§13) => None.
         if let ObservationPayload::RunStarted(rs) = &run.records[0].payload {
             assert_eq!(rs.discovery_universe, None);
             assert_eq!(rs.outcome_universe, None);
+            assert_eq!(rs.observation_rpc_concurrency_limit, None);
         } else {
             panic!("first record should be RunStarted");
         }
 
-        // RunFinished v1 line lacks partial counter => 0 via default.
+        // RunFinished v1 line lacks partial counter => 0, and lacks the RPC-gate
+        // stats (§16) => None, all via serde default.
         if let ObservationPayload::RunFinished(rf) = &run.records[2].payload {
             assert_eq!(rf.partial_new_token_events, 0);
+            assert_eq!(rf.rpc_gate_peak_in_flight, None);
+            assert_eq!(rf.rpc_gate_acquisitions, None);
+            assert_eq!(rf.rpc_gate_wait_ms_total, None);
+            assert_eq!(rf.rpc_gate_wait_ms_max, None);
+        } else {
+            panic!("last record should be RunFinished");
+        }
+    }
+
+    /// §35: a gated schema-v2 fixture (RunStarted carrying the RPC-gate limit,
+    /// RunFinished carrying gate stats) replays cleanly, and the new telemetry
+    /// round-trips through the replay reader.
+    #[test]
+    fn test_literal_v2_gated_fixture_replays() {
+        let run_started = r#"{"schema_version":2,"run_id":"gated","seq":0,"recorded_at":"2026-08-30T00:00:00Z","payload":{"kind":"run_started","data":{"source_revision":"abc","working_tree_clean":true,"binary_version":"0.1.0","network":"solana-mainnet","entry_quote_lamports":1000000,"outcome_horizons_secs":[2,4],"snapshot_horizons_secs":[15,30],"return_model":"protocol_net_ex_network_v1","intake_seconds":600,"max_active_candidates":256,"discovery_universe":"pumpportal_create_identity_v2","outcome_universe":"canonical_sol_quote_exact_0_001_sol_v1","observation_rpc_concurrency_limit":24}}}"#;
+        let run_finished = r#"{"schema_version":2,"run_id":"gated","seq":1,"recorded_at":"2026-08-30T00:00:02Z","payload":{"kind":"run_finished","data":{"completion":"complete","candidates_seen":1,"unique_candidates":1,"duplicate_candidate_events":0,"tracking_started":1,"tracking_skipped":0,"tracking_completed":1,"stream_connected_events":1,"stream_disconnect_events":0,"provider_errors":0,"unexpected_trade_events":0,"migrations_seen":0,"partial_new_token_events":0,"rpc_gate_peak_in_flight":24,"rpc_gate_acquisitions":500,"rpc_gate_wait_ms_total":1234,"rpc_gate_wait_ms_max":99}}}"#;
+        let f = write_lines(&[run_started.to_string(), run_finished.to_string()], true);
+        let run = read_observation_run(f.path()).unwrap();
+        assert_eq!(run.schema_version, 2);
+
+        if let ObservationPayload::RunStarted(rs) = &run.records[0].payload {
+            assert_eq!(rs.observation_rpc_concurrency_limit, Some(24));
+        } else {
+            panic!("first record should be RunStarted");
+        }
+        if let ObservationPayload::RunFinished(rf) = &run.records[1].payload {
+            assert_eq!(rf.rpc_gate_peak_in_flight, Some(24));
+            assert_eq!(rf.rpc_gate_acquisitions, Some(500));
+            assert_eq!(rf.rpc_gate_wait_ms_total, Some(1234));
+            assert_eq!(rf.rpc_gate_wait_ms_max, Some(99));
+            // Invariant: peak in flight never exceeds the configured limit.
+            assert!(rf.rpc_gate_peak_in_flight.unwrap() <= 24);
+        } else {
+            panic!("last record should be RunFinished");
+        }
+    }
+
+    /// §35: a pre-gate schema-v2 fixture (v2 records that predate this PR, so they
+    /// carry NO gate telemetry keys) still replays, with the new fields => None.
+    #[test]
+    fn test_literal_v2_pre_gate_fixture_replays_none() {
+        let run_started = r#"{"schema_version":2,"run_id":"pregate","seq":0,"recorded_at":"2026-08-30T00:00:00Z","payload":{"kind":"run_started","data":{"source_revision":"abc","working_tree_clean":true,"binary_version":"0.1.0","network":"solana-mainnet","entry_quote_lamports":1000000,"outcome_horizons_secs":[2,4],"snapshot_horizons_secs":[15,30],"return_model":"protocol_net_ex_network_v1","intake_seconds":600,"max_active_candidates":128,"discovery_universe":"pumpportal_create_identity_v2","outcome_universe":"canonical_sol_quote_exact_0_001_sol_v1"}}}"#;
+        let run_finished = r#"{"schema_version":2,"run_id":"pregate","seq":1,"recorded_at":"2026-08-30T00:00:02Z","payload":{"kind":"run_finished","data":{"completion":"complete","candidates_seen":0,"unique_candidates":0,"duplicate_candidate_events":0,"tracking_started":0,"tracking_skipped":0,"tracking_completed":0,"stream_connected_events":1,"stream_disconnect_events":0,"provider_errors":0,"unexpected_trade_events":0,"migrations_seen":0,"partial_new_token_events":0}}}"#;
+        let f = write_lines(&[run_started.to_string(), run_finished.to_string()], true);
+        let run = read_observation_run(f.path()).unwrap();
+        assert_eq!(run.schema_version, 2);
+        if let ObservationPayload::RunStarted(rs) = &run.records[0].payload {
+            assert_eq!(rs.observation_rpc_concurrency_limit, None);
+        } else {
+            panic!("first record should be RunStarted");
+        }
+        if let ObservationPayload::RunFinished(rf) = &run.records[1].payload {
+            assert_eq!(rf.rpc_gate_peak_in_flight, None);
+            assert_eq!(rf.rpc_gate_acquisitions, None);
         } else {
             panic!("last record should be RunFinished");
         }
@@ -384,6 +440,10 @@ mod tests {
             unexpected_trade_events: 0,
             migrations_seen: 0,
             partial_new_token_events: 0,
+            rpc_gate_peak_in_flight: None,
+            rpc_gate_acquisitions: None,
+            rpc_gate_wait_ms_total: None,
+            rpc_gate_wait_ms_max: None,
         });
         let l0 = line(&envelope(0, "r", run_started_payload()));
         let l1 = line(&envelope(1, "r", finished));

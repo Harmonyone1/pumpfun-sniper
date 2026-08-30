@@ -114,17 +114,29 @@ pub struct RunStartedRecord {
     pub discovery_universe: Option<String>,
     #[serde(default)]
     pub outcome_universe: Option<String>,
+
+    /// P1-OBSERVATION-RPC-CONCURRENCY-001 §13: the configured observation RPC
+    /// concurrency gate limit for this run. Observation-process metadata only.
+    /// Absent (=> None) in v1 and pre-gate v2 records; a gated recorder run writes
+    /// `Some(limit)`. Never carries RPC URL / provider / API key.
+    #[serde(default)]
+    pub observation_rpc_concurrency_limit: Option<usize>,
 }
 
 impl RunStartedRecord {
     /// Construct a RunStarted record with the fixed v1 schedule/constants and
     /// the mandated `return_model`/`network` string literals baked in.
+    ///
+    /// `observation_rpc_concurrency_limit` is the observation RPC gate bound for
+    /// this run (`None` for generic/legacy construction; the gated recorder passes
+    /// `Some(limit)`).
     pub fn new(
         source_revision: String,
         working_tree_clean: Option<bool>,
         binary_version: String,
         intake_seconds: u64,
         max_active_candidates: usize,
+        observation_rpc_concurrency_limit: Option<usize>,
     ) -> Self {
         Self {
             source_revision,
@@ -139,6 +151,7 @@ impl RunStartedRecord {
             max_active_candidates,
             discovery_universe: Some("pumpportal_create_identity_v2".to_string()),
             outcome_universe: Some("canonical_sol_quote_exact_0_001_sol_v1".to_string()),
+            observation_rpc_concurrency_limit,
         }
     }
 }
@@ -421,6 +434,19 @@ pub struct InitialMarketRecord {
     pub buy_quote_failure: Option<ObservationFailureCode>,
 
     pub initial_observation_attempts: u8,
+
+    /// P1-OBSERVATION-RPC-CONCURRENCY-001 §15: totals (across ALL initial retry
+    /// attempts) of observation RPC gate wait and oracle call duration, split by
+    /// snapshot vs buy-quote. Observation-process metadata only. Absent (=> None)
+    /// in v1 and pre-gate v2 records; a gated recorder run writes `Some(total)`.
+    #[serde(default)]
+    pub initial_snapshot_rpc_gate_wait_ms_total: Option<u64>,
+    #[serde(default)]
+    pub initial_snapshot_rpc_call_duration_ms_total: Option<u64>,
+    #[serde(default)]
+    pub initial_buy_rpc_gate_wait_ms_total: Option<u64>,
+    #[serde(default)]
+    pub initial_buy_rpc_call_duration_ms_total: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +476,23 @@ pub struct OutcomeSampleRecord {
     pub snapshot_failure: Option<ObservationFailureCode>,
 
     pub protocol_net_ex_network_return_bps: Option<i64>,
+
+    /// P1-OBSERVATION-RPC-CONCURRENCY-001 §14: observation RPC gate wait and oracle
+    /// call duration for THIS sample's sell quote. A gated run writes `Some(...)`
+    /// regardless of sell success/failure. Measured directly from monotonic time,
+    /// NEVER derived from `sample_lag_ms`. Absent (=> None) in v1/pre-gate records.
+    #[serde(default)]
+    pub sell_rpc_gate_wait_ms: Option<u64>,
+    #[serde(default)]
+    pub sell_rpc_call_duration_ms: Option<u64>,
+
+    /// Same, for the key-horizon snapshot. `Some(...)` only at snapshot horizons
+    /// (15/30/60/120) in a gated run, regardless of snapshot success/failure;
+    /// `None` at non-snapshot horizons and in v1/pre-gate records.
+    #[serde(default)]
+    pub snapshot_rpc_gate_wait_ms: Option<u64>,
+    #[serde(default)]
+    pub snapshot_rpc_call_duration_ms: Option<u64>,
 }
 
 /// Protocol-net-ex-network return in basis points (10_000 bps = 100%).
@@ -566,6 +609,20 @@ pub struct RunFinishedRecord {
     /// replay defaults to 0.
     #[serde(default)]
     pub partial_new_token_events: u64,
+
+    /// P1-OBSERVATION-RPC-CONCURRENCY-001 §16: aggregate observation RPC gate
+    /// statistics for the run. Observation-process metadata only. A gated recorder
+    /// run writes all four as `Some(...)`; v1 and pre-gate v2 replay => `None`.
+    /// Invariant when present: `rpc_gate_peak_in_flight <=
+    /// RunStarted.observation_rpc_concurrency_limit`.
+    #[serde(default)]
+    pub rpc_gate_peak_in_flight: Option<usize>,
+    #[serde(default)]
+    pub rpc_gate_acquisitions: Option<u64>,
+    #[serde(default)]
+    pub rpc_gate_wait_ms_total: Option<u64>,
+    #[serde(default)]
+    pub rpc_gate_wait_ms_max: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +807,7 @@ mod tests {
 
     #[test]
     fn test_run_started_writes_exact_universe_strings() {
-        let rec = RunStartedRecord::new("rev".into(), None, "bin".into(), 900, 64);
+        let rec = RunStartedRecord::new("rev".into(), None, "bin".into(), 900, 64, None);
         assert_eq!(
             rec.discovery_universe.as_deref(),
             Some("pumpportal_create_identity_v2")
@@ -779,10 +836,173 @@ mod tests {
             unexpected_trade_events: 0,
             migrations_seen: 0,
             partial_new_token_events: 7,
+            rpc_gate_peak_in_flight: None,
+            rpc_gate_acquisitions: None,
+            rpc_gate_wait_ms_total: None,
+            rpc_gate_wait_ms_max: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"partial_new_token_events\":7"), "{json}");
         let back: RunFinishedRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.partial_new_token_events, 7);
+    }
+
+    // -- RPC concurrency gate telemetry (packet §34) ------------------------
+
+    #[test]
+    fn test_schema_version_still_2_with_gate_fields() {
+        // Gate telemetry is backward-compatible v2 metadata; NOT a v3 bump.
+        assert_eq!(OBSERVATION_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn test_run_started_rpc_concurrency_limit_round_trip() {
+        let rec = RunStartedRecord::new("rev".into(), None, "bin".into(), 600, 256, Some(24));
+        assert_eq!(rec.observation_rpc_concurrency_limit, Some(24));
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            json.contains("\"observation_rpc_concurrency_limit\":24"),
+            "{json}"
+        );
+        let back: RunStartedRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.observation_rpc_concurrency_limit, Some(24));
+    }
+
+    #[test]
+    fn test_run_started_missing_rpc_limit_deserializes_none() {
+        // A pre-gate v2 (or v1) RunStarted line has no gate-limit key => None.
+        let line = r#"{"source_revision":"rev","working_tree_clean":null,"binary_version":"bin","network":"solana-mainnet","entry_quote_lamports":1000000,"outcome_horizons_secs":[15],"snapshot_horizons_secs":[15],"return_model":"protocol_net_ex_network_v1","intake_seconds":600,"max_active_candidates":128}"#;
+        let back: RunStartedRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(back.observation_rpc_concurrency_limit, None);
+        assert_eq!(back.discovery_universe, None);
+    }
+
+    fn sample_with_gate(horizon: u64, snapshot_gate: Option<(u64, u64)>) -> OutcomeSampleRecord {
+        OutcomeSampleRecord {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            horizon_secs: horizon,
+            due_at: Utc::now(),
+            sampled_at: Utc::now(),
+            sample_lag_ms: 42,
+            sell_quote: None,
+            sell_quote_failure: Some(ObservationFailureCode::RpcUnavailable),
+            snapshot: None,
+            snapshot_failure: None,
+            protocol_net_ex_network_return_bps: None,
+            sell_rpc_gate_wait_ms: Some(11),
+            sell_rpc_call_duration_ms: Some(22),
+            snapshot_rpc_gate_wait_ms: snapshot_gate.map(|(w, _)| w),
+            snapshot_rpc_call_duration_ms: snapshot_gate.map(|(_, d)| d),
+        }
+    }
+
+    #[test]
+    fn test_outcome_sample_sell_gate_timing_round_trip() {
+        let rec = sample_with_gate(15, Some((5, 7)));
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"sell_rpc_gate_wait_ms\":11"), "{json}");
+        assert!(json.contains("\"sell_rpc_call_duration_ms\":22"), "{json}");
+        let back: OutcomeSampleRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sell_rpc_gate_wait_ms, Some(11));
+        assert_eq!(back.sell_rpc_call_duration_ms, Some(22));
+        assert_eq!(back.snapshot_rpc_gate_wait_ms, Some(5));
+        assert_eq!(back.snapshot_rpc_call_duration_ms, Some(7));
+    }
+
+    #[test]
+    fn test_outcome_sample_non_key_horizon_snapshot_timing_none() {
+        // Sell timing present; snapshot timing None at a non-key horizon.
+        let rec = sample_with_gate(20, None);
+        let back: OutcomeSampleRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(back.sell_rpc_gate_wait_ms, Some(11));
+        assert_eq!(back.snapshot_rpc_gate_wait_ms, None);
+        assert_eq!(back.snapshot_rpc_call_duration_ms, None);
+    }
+
+    #[test]
+    fn test_outcome_sample_missing_gate_timing_deserializes_none() {
+        // A historical/pre-gate OutcomeSample line has none of the new keys => None.
+        let line = r#"{"candidate_id":"sig","mint":"mint","horizon_secs":15,"due_at":"2026-08-30T00:00:00Z","sampled_at":"2026-08-30T00:00:01Z","sample_lag_ms":1000,"sell_quote":null,"sell_quote_failure":"rpc_unavailable","snapshot":null,"snapshot_failure":null,"protocol_net_ex_network_return_bps":null}"#;
+        let back: OutcomeSampleRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(back.sell_rpc_gate_wait_ms, None);
+        assert_eq!(back.sell_rpc_call_duration_ms, None);
+        assert_eq!(back.snapshot_rpc_gate_wait_ms, None);
+        assert_eq!(back.snapshot_rpc_call_duration_ms, None);
+    }
+
+    #[test]
+    fn test_initial_market_gate_totals_round_trip() {
+        let rec = InitialMarketRecord {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            candidate_received_at: Utc::now(),
+            snapshot: None,
+            snapshot_failure: Some(ObservationFailureCode::RpcUnavailable),
+            buy_quote: None,
+            buy_quote_failure: Some(ObservationFailureCode::RpcUnavailable),
+            initial_observation_attempts: 4,
+            initial_snapshot_rpc_gate_wait_ms_total: Some(10),
+            initial_snapshot_rpc_call_duration_ms_total: Some(20),
+            initial_buy_rpc_gate_wait_ms_total: Some(30),
+            initial_buy_rpc_call_duration_ms_total: Some(40),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: InitialMarketRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.initial_snapshot_rpc_gate_wait_ms_total, Some(10));
+        assert_eq!(back.initial_snapshot_rpc_call_duration_ms_total, Some(20));
+        assert_eq!(back.initial_buy_rpc_gate_wait_ms_total, Some(30));
+        assert_eq!(back.initial_buy_rpc_call_duration_ms_total, Some(40));
+        // Attempt count is unchanged in meaning.
+        assert_eq!(back.initial_observation_attempts, 4);
+    }
+
+    #[test]
+    fn test_initial_market_missing_gate_totals_deserializes_none() {
+        let line = r#"{"candidate_id":"sig","mint":"mint","candidate_received_at":"2026-08-30T00:00:00Z","snapshot":null,"snapshot_failure":"rpc_unavailable","buy_quote":null,"buy_quote_failure":"rpc_unavailable","initial_observation_attempts":4}"#;
+        let back: InitialMarketRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(back.initial_snapshot_rpc_gate_wait_ms_total, None);
+        assert_eq!(back.initial_buy_rpc_call_duration_ms_total, None);
+    }
+
+    #[test]
+    fn test_run_finished_gate_stats_round_trip() {
+        let rec = RunFinishedRecord {
+            completion: RunCompletion::Complete,
+            candidates_seen: 3,
+            unique_candidates: 3,
+            duplicate_candidate_events: 0,
+            tracking_started: 3,
+            tracking_skipped: 0,
+            tracking_completed: 3,
+            stream_connected_events: 1,
+            stream_disconnect_events: 0,
+            provider_errors: 0,
+            unexpected_trade_events: 0,
+            migrations_seen: 0,
+            partial_new_token_events: 0,
+            rpc_gate_peak_in_flight: Some(24),
+            rpc_gate_acquisitions: Some(500),
+            rpc_gate_wait_ms_total: Some(1234),
+            rpc_gate_wait_ms_max: Some(99),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: RunFinishedRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rpc_gate_peak_in_flight, Some(24));
+        assert_eq!(back.rpc_gate_acquisitions, Some(500));
+        assert_eq!(back.rpc_gate_wait_ms_total, Some(1234));
+        assert_eq!(back.rpc_gate_wait_ms_max, Some(99));
+    }
+
+    #[test]
+    fn test_run_finished_missing_gate_stats_deserializes_none() {
+        let line = r#"{"completion":"complete","candidates_seen":3,"unique_candidates":3,"duplicate_candidate_events":0,"tracking_started":3,"tracking_skipped":0,"tracking_completed":3,"stream_connected_events":1,"stream_disconnect_events":0,"provider_errors":0,"unexpected_trade_events":0,"migrations_seen":0}"#;
+        let back: RunFinishedRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(back.partial_new_token_events, 0);
+        assert_eq!(back.rpc_gate_peak_in_flight, None);
+        assert_eq!(back.rpc_gate_acquisitions, None);
+        assert_eq!(back.rpc_gate_wait_ms_total, None);
+        assert_eq!(back.rpc_gate_wait_ms_max, None);
     }
 }
