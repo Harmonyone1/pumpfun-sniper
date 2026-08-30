@@ -248,6 +248,7 @@ mod tests {
             provider_errors: 0,
             unexpected_trade_events: 0,
             migrations_seen: 0,
+            partial_new_token_events: 0,
         }))
         .await
         .unwrap();

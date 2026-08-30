@@ -16,7 +16,7 @@ use crate::market::types::{ExecutableQuote, MarketSide, MarketSnapshot, MarketVe
 
 /// Schema version for the observation dataset. Bumped only on incompatible
 /// changes; no silent incompatible changes are permitted.
-pub const OBSERVATION_SCHEMA_VERSION: u32 = 1;
+pub const OBSERVATION_SCHEMA_VERSION: u32 = 2;
 
 /// Fixed hypothetical entry size = 0.001 SOL. Not configurable in v1.
 pub const ENTRY_QUOTE_LAMPORTS: u64 = 1_000_000;
@@ -108,6 +108,12 @@ pub struct RunStartedRecord {
     pub return_model: String,
     pub intake_seconds: u64,
     pub max_active_candidates: usize,
+
+    /// Schema-v2 research universe descriptors. Absent (=> None) in v1 records.
+    #[serde(default)]
+    pub discovery_universe: Option<String>,
+    #[serde(default)]
+    pub outcome_universe: Option<String>,
 }
 
 impl RunStartedRecord {
@@ -131,6 +137,8 @@ impl RunStartedRecord {
             return_model: "protocol_net_ex_network_v1".to_string(),
             intake_seconds,
             max_active_candidates,
+            discovery_universe: Some("pumpportal_create_identity_v2".to_string()),
+            outcome_universe: Some("canonical_sol_quote_exact_0_001_sol_v1".to_string()),
         }
     }
 }
@@ -161,10 +169,27 @@ pub struct StreamStateRecord {
 // Section 11 — CandidateObserved
 // ---------------------------------------------------------------------------
 
+/// Explicit provenance shape of a retained provider create event.
+///
+/// `Full` = the legacy strict NewToken shape (all provider observational fields
+/// present). `Partial` = a create with valid required identity but one or more
+/// absent provider observational fields (schema-v2 retention). Historical v1
+/// records carry no shape and deserialize to `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCreateShape {
+    Full,
+    Partial,
+}
+
 /// One record for EVERY provider NewToken event received (including duplicates).
 ///
 /// Provider numeric fields are observational only: never treated as canonical
 /// reserves, never cast to integer, never divided by 1e9.
+///
+/// Schema v2: the provider observational fields are `Option`. Absence maps to
+/// `None` (never a numeric or empty-string sentinel). Historical v1 lines carry
+/// concrete numbers/strings and deserialize into `Some(value)` automatically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateObservedRecord {
     /// candidate_id == provider NewToken signature (no second identity).
@@ -173,13 +198,18 @@ pub struct CandidateObservedRecord {
     pub mint: String,
     /// creator == provider `trader_public_key`.
     pub creator: String,
-    pub bonding_curve: String,
+    #[serde(default)]
+    pub bonding_curve: Option<String>,
     pub tx_type: String,
 
-    pub provider_initial_buy: f64,
-    pub provider_v_tokens_in_bonding_curve: f64,
-    pub provider_v_sol_in_bonding_curve_sol: f64,
-    pub provider_market_cap_sol: f64,
+    #[serde(default)]
+    pub provider_initial_buy: Option<f64>,
+    #[serde(default)]
+    pub provider_v_tokens_in_bonding_curve: Option<f64>,
+    #[serde(default)]
+    pub provider_v_sol_in_bonding_curve_sol: Option<f64>,
+    #[serde(default)]
+    pub provider_market_cap_sol: Option<f64>,
 
     pub name: String,
     pub symbol: String,
@@ -187,6 +217,10 @@ pub struct CandidateObservedRecord {
 
     /// true for signatures previously seen in this run.
     pub duplicate: bool,
+
+    /// Schema-v2 explicit provider shape. `None` for historical v1 records.
+    #[serde(default)]
+    pub provider_create_shape: Option<ProviderCreateShape>,
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +560,12 @@ pub struct RunFinishedRecord {
     pub unexpected_trade_events: u64,
 
     pub migrations_seen: u64,
+
+    /// Schema-v2 informational counter: number of retained PartialNewToken
+    /// create events. Does NOT overlap provider_errors/decode counters. v1
+    /// replay defaults to 0.
+    #[serde(default)]
+    pub partial_new_token_events: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -628,5 +668,121 @@ mod tests {
         assert_eq!(sanitize_persist_text(dirty, 256), "abcdef");
         let long: String = "x".repeat(1000);
         assert_eq!(sanitize_persist_text(&long, 64).chars().count(), 64);
+    }
+
+    // -- Schema v2 (packet section 22) --------------------------------------
+
+    fn full_candidate() -> CandidateObservedRecord {
+        CandidateObservedRecord {
+            candidate_id: "sig".into(),
+            signature: "sig".into(),
+            mint: "mint".into(),
+            creator: "creator".into(),
+            bonding_curve: Some("bc".into()),
+            tx_type: "create".into(),
+            provider_initial_buy: Some(1.5),
+            provider_v_tokens_in_bonding_curve: Some(2.5),
+            provider_v_sol_in_bonding_curve_sol: Some(3.5),
+            provider_market_cap_sol: Some(4.5),
+            name: "n".into(),
+            symbol: "s".into(),
+            uri: "u".into(),
+            duplicate: false,
+            provider_create_shape: Some(ProviderCreateShape::Full),
+        }
+    }
+
+    #[test]
+    fn test_schema_version_is_2() {
+        assert_eq!(OBSERVATION_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn test_full_candidate_serializes_some_provider_values() {
+        let json = serde_json::to_string(&full_candidate()).unwrap();
+        assert!(json.contains("\"provider_initial_buy\":1.5"), "{json}");
+        assert!(
+            json.contains("\"provider_v_tokens_in_bonding_curve\":2.5"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"provider_v_sol_in_bonding_curve_sol\":3.5"),
+            "{json}"
+        );
+        assert!(json.contains("\"provider_market_cap_sol\":4.5"), "{json}");
+        assert!(json.contains("\"bonding_curve\":\"bc\""), "{json}");
+    }
+
+    #[test]
+    fn test_partial_candidate_none_provider_values_round_trip() {
+        let mut rec = full_candidate();
+        rec.bonding_curve = None;
+        rec.provider_initial_buy = None;
+        rec.provider_v_tokens_in_bonding_curve = None;
+        rec.provider_v_sol_in_bonding_curve_sol = None;
+        rec.provider_market_cap_sol = None;
+        rec.provider_create_shape = Some(ProviderCreateShape::Partial);
+
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: CandidateObservedRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.bonding_curve, None);
+        assert_eq!(back.provider_initial_buy, None);
+        assert_eq!(back.provider_v_tokens_in_bonding_curve, None);
+        assert_eq!(back.provider_v_sol_in_bonding_curve_sol, None);
+        assert_eq!(back.provider_market_cap_sol, None);
+    }
+
+    #[test]
+    fn test_provider_create_shape_round_trip() {
+        assert_eq!(
+            serde_json::to_string(&ProviderCreateShape::Full).unwrap(),
+            "\"full\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProviderCreateShape::Partial).unwrap(),
+            "\"partial\""
+        );
+        let full: ProviderCreateShape = serde_json::from_str("\"full\"").unwrap();
+        let partial: ProviderCreateShape = serde_json::from_str("\"partial\"").unwrap();
+        assert_eq!(full, ProviderCreateShape::Full);
+        assert_eq!(partial, ProviderCreateShape::Partial);
+    }
+
+    #[test]
+    fn test_run_started_writes_exact_universe_strings() {
+        let rec = RunStartedRecord::new("rev".into(), None, "bin".into(), 900, 64);
+        assert_eq!(
+            rec.discovery_universe.as_deref(),
+            Some("pumpportal_create_identity_v2")
+        );
+        assert_eq!(
+            rec.outcome_universe.as_deref(),
+            Some("canonical_sol_quote_exact_0_001_sol_v1")
+        );
+        // Return model is unchanged.
+        assert_eq!(rec.return_model, "protocol_net_ex_network_v1");
+    }
+
+    #[test]
+    fn test_run_finished_partial_counter_round_trip() {
+        let rec = RunFinishedRecord {
+            completion: RunCompletion::Complete,
+            candidates_seen: 3,
+            unique_candidates: 3,
+            duplicate_candidate_events: 0,
+            tracking_started: 3,
+            tracking_skipped: 0,
+            tracking_completed: 3,
+            stream_connected_events: 1,
+            stream_disconnect_events: 0,
+            provider_errors: 0,
+            unexpected_trade_events: 0,
+            migrations_seen: 0,
+            partial_new_token_events: 7,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"partial_new_token_events\":7"), "{json}");
+        let back: RunFinishedRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.partial_new_token_events, 7);
     }
 }
