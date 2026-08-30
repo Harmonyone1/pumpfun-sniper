@@ -123,7 +123,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn run_started() -> RunStartedRecord {
-        RunStartedRecord::new("unknown".into(), None, "test-0.0.0".into(), 900, 64)
+        RunStartedRecord::new("unknown".into(), None, "test-0.0.0".into(), 900, 64, None)
     }
 
     fn stream(kind: StreamStateKind) -> ObservationPayload {
@@ -249,6 +249,10 @@ mod tests {
             unexpected_trade_events: 0,
             migrations_seen: 0,
             partial_new_token_events: 0,
+            rpc_gate_peak_in_flight: None,
+            rpc_gate_acquisitions: None,
+            rpc_gate_wait_ms_total: None,
+            rpc_gate_wait_ms_max: None,
         }))
         .await
         .unwrap();
