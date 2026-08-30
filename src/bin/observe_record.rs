@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ use solana_sdk::pubkey::Pubkey;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
+use pumpfun_sniper::market::types::{ExecutableQuote, MarketSnapshot};
 use pumpfun_sniper::market::PumpMarketOracle;
 use pumpfun_sniper::observation::schema::{
     classify_observation_error, protocol_net_ex_network_return_bps, sanitize_persist_text,
@@ -65,6 +67,16 @@ const INTAKE_SECONDS_MAX: u64 = 21_600;
 /// Bounds for `--max-active-candidates` (packet section 30).
 const MAX_ACTIVE_MIN: usize = 1;
 const MAX_ACTIVE_MAX: usize = 256;
+
+/// Bounds + default for `--rpc-concurrency` (P1-OBSERVATION-RPC-CONCURRENCY-001
+/// §2). 24 is the FIRST EXPERIMENTAL bound (not a claimed optimum): Run #3's
+/// ~20-29 active-tracker band stayed in the lowest observed RPC-failure regime,
+/// while degradation accelerated above ~40 active trackers. Active trackers are
+/// NOT the same as simultaneous RPC calls, so this is a starting point Run #4 will
+/// test.
+const RPC_CONCURRENCY_MIN: usize = 1;
+const RPC_CONCURRENCY_MAX: usize = 64;
+const RPC_CONCURRENCY_DEFAULT: usize = 24;
 
 /// Bounded grace (ms) after `client.stop()` before the post-stop tail drain, to
 /// let the worker deliver any final already-queued events (packet §10.3).
@@ -120,6 +132,185 @@ async fn append_required(
         .map_err(|_| CollectorRecordError)
 }
 
+// ---------------------------------------------------------------------------
+// P1-OBSERVATION-RPC-CONCURRENCY-001 §5-9/§12 — observation-only bounded RPC gate.
+// PRIVATE to this recorder binary. It is NEVER added to PumpMarketOracle, the
+// RpcClient, the market module, or any live/trading path.
+// ---------------------------------------------------------------------------
+
+/// Bounded observation RPC concurrency gate. Backed by a tokio `Semaphore`; permits
+/// are taken with ASYNC WAITING (`acquire_owned().await`, §6) so an already-admitted
+/// candidate task NEVER drops because the gate is busy — it queues. There is no
+/// `try_acquire` and no acquisition timeout here.
+///
+/// This is deliberately distinct from the candidate-task capacity semaphore
+/// (`max_active_candidates`), which MAY skip (`TrackingCapacity`). The RPC gate
+/// never skips: it only bounds how many high-level oracle calls run at once.
+struct ObservationRpcGate {
+    semaphore: Arc<Semaphore>,
+    limit: usize,
+    /// Currently-held permits (for the peak-in-flight high-water mark).
+    in_flight: AtomicUsize,
+    /// Maximum simultaneously-held permits observed (§12). `<= limit`.
+    peak_in_flight: AtomicUsize,
+    /// Total successful permit acquisitions (§12).
+    acquisitions: AtomicU64,
+    gate_wait_ms_total: AtomicU64,
+    gate_wait_ms_max: AtomicU64,
+}
+
+/// Aggregate gate statistics captured for RunFinished (§16).
+struct RpcGateStats {
+    limit: usize,
+    peak_in_flight: usize,
+    acquisitions: u64,
+    gate_wait_ms_total: u64,
+    gate_wait_ms_max: u64,
+}
+
+impl ObservationRpcGate {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+            limit,
+            in_flight: AtomicUsize::new(0),
+            peak_in_flight: AtomicUsize::new(0),
+            acquisitions: AtomicU64::new(0),
+            gate_wait_ms_total: AtomicU64::new(0),
+            gate_wait_ms_max: AtomicU64::new(0),
+        })
+    }
+
+    /// Acquire ONE permit, waiting asynchronously if the gate is full (§6). Returns
+    /// an RAII guard plus the measured gate wait in ms. NEVER `try_acquire`, never
+    /// times out, never drops. On success bumps `acquisitions`, the wait
+    /// accumulators, and the peak-in-flight high-water mark.
+    async fn acquire(self: &Arc<Self>) -> (ObservationRpcPermit, u64) {
+        let wait_start = tokio::time::Instant::now();
+        // The gate semaphore is owned by the gate for the whole run and never
+        // closed, so `acquire_owned` only returns after a permit is granted.
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("observation RPC gate semaphore closed unexpectedly");
+        let gate_wait_ms = wait_start.elapsed().as_millis() as u64;
+
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.gate_wait_ms_total
+            .fetch_add(gate_wait_ms, Ordering::Relaxed);
+        self.gate_wait_ms_max
+            .fetch_max(gate_wait_ms, Ordering::Relaxed);
+
+        let now_in_flight = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_in_flight
+            .fetch_max(now_in_flight, Ordering::Relaxed);
+
+        (
+            ObservationRpcPermit {
+                gate: self.clone(),
+                _permit: permit,
+            },
+            gate_wait_ms,
+        )
+    }
+
+    /// Snapshot the aggregate stats for RunFinished. Invariant: `peak_in_flight <=
+    /// limit` (the semaphore bounds concurrency to `limit`).
+    fn stats(&self) -> RpcGateStats {
+        RpcGateStats {
+            limit: self.limit,
+            peak_in_flight: self.peak_in_flight.load(Ordering::Relaxed),
+            acquisitions: self.acquisitions.load(Ordering::Relaxed),
+            gate_wait_ms_total: self.gate_wait_ms_total.load(Ordering::Relaxed),
+            gate_wait_ms_max: self.gate_wait_ms_max.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// RAII permit guard. Dropping it decrements the in-flight counter and releases the
+/// underlying semaphore permit (via `OwnedSemaphorePermit`'s own Drop). There is no
+/// leak on either a successful or a failed oracle result (§12).
+struct ObservationRpcPermit {
+    gate: Arc<ObservationRpcGate>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for ObservationRpcPermit {
+    fn drop(&mut self) {
+        self.gate.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// One gated oracle call's outcome: the oracle `result` plus the measured
+/// `gate_wait_ms` (before the permit was granted) and `call_duration_ms` (from
+/// permit granted until the single oracle await returned) (§9). Durations are the
+/// only new data — no provider/RPC error strings are added.
+struct TimedOracleCall<T> {
+    result: pumpfun_sniper::Result<T>,
+    gate_wait_ms: u64,
+    call_duration_ms: u64,
+}
+
+/// Gate + time EXACTLY ONE `oracle.snapshot` call (§7-8). The permit is released
+/// immediately after the single await returns — never held across sleeps, recorder
+/// appends, or another oracle call.
+async fn gated_snapshot(
+    gate: &Arc<ObservationRpcGate>,
+    oracle: &PumpMarketOracle,
+    mint: &Pubkey,
+) -> TimedOracleCall<MarketSnapshot> {
+    let (permit, gate_wait_ms) = gate.acquire().await;
+    let call_start = tokio::time::Instant::now();
+    let result = oracle.snapshot(mint).await;
+    let call_duration_ms = call_start.elapsed().as_millis() as u64;
+    drop(permit);
+    TimedOracleCall {
+        result,
+        gate_wait_ms,
+        call_duration_ms,
+    }
+}
+
+/// Gate + time EXACTLY ONE `oracle.quote_buy_sol` call (§7-8).
+async fn gated_quote_buy_sol(
+    gate: &Arc<ObservationRpcGate>,
+    oracle: &PumpMarketOracle,
+    mint: &Pubkey,
+    lamports: u64,
+) -> TimedOracleCall<ExecutableQuote> {
+    let (permit, gate_wait_ms) = gate.acquire().await;
+    let call_start = tokio::time::Instant::now();
+    let result = oracle.quote_buy_sol(mint, lamports).await;
+    let call_duration_ms = call_start.elapsed().as_millis() as u64;
+    drop(permit);
+    TimedOracleCall {
+        result,
+        gate_wait_ms,
+        call_duration_ms,
+    }
+}
+
+/// Gate + time EXACTLY ONE `oracle.quote_sell_raw` call (§7-8).
+async fn gated_quote_sell_raw(
+    gate: &Arc<ObservationRpcGate>,
+    oracle: &PumpMarketOracle,
+    mint: &Pubkey,
+    base_raw: u64,
+) -> TimedOracleCall<ExecutableQuote> {
+    let (permit, gate_wait_ms) = gate.acquire().await;
+    let call_start = tokio::time::Instant::now();
+    let result = oracle.quote_sell_raw(mint, base_raw).await;
+    let call_duration_ms = call_start.elapsed().as_millis() as u64;
+    drop(permit);
+    TimedOracleCall {
+        result,
+        gate_wait_ms,
+        call_duration_ms,
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "observe-record")]
 struct Args {
@@ -138,6 +329,12 @@ struct Args {
     /// Maximum concurrently tracked candidates (outcome sampling capacity).
     #[arg(long, default_value_t = 64)]
     max_active_candidates: usize,
+
+    /// Maximum simultaneous observation-oracle RPC calls (§2). Independent of
+    /// candidate-task capacity: a busy gate makes an admitted candidate WAIT for a
+    /// permit, it is NEVER dropped. Bounds 1..=64.
+    #[arg(long, default_value_t = RPC_CONCURRENCY_DEFAULT)]
+    rpc_concurrency: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +361,17 @@ fn validate_max_active(max_active: usize) -> Result<usize> {
         ));
     }
     Ok(max_active)
+}
+
+/// Validate `--rpc-concurrency` is within [RPC_CONCURRENCY_MIN, RPC_CONCURRENCY_MAX] (§2).
+fn validate_rpc_concurrency(limit: usize) -> Result<usize> {
+    if !(RPC_CONCURRENCY_MIN..=RPC_CONCURRENCY_MAX).contains(&limit) {
+        return Err(anyhow!(
+            "--rpc-concurrency must be between {RPC_CONCURRENCY_MIN} and {RPC_CONCURRENCY_MAX} \
+             (got {limit})"
+        ));
+    }
+    Ok(limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +675,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let intake_seconds = validate_intake_seconds(args.intake_seconds)?;
     let max_active_candidates = validate_max_active(args.max_active_candidates)?;
+    let rpc_concurrency = validate_rpc_concurrency(args.rpc_concurrency)?;
 
     let config = Config::load(&args.config).context("failed to load configuration")?;
 
@@ -526,6 +735,7 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION").to_string(),
         intake_seconds,
         max_active_candidates,
+        Some(rpc_concurrency),
     );
     let recorder = ObservationRecorder::create(&args.output_dir, run_started)
         .await
@@ -552,6 +762,8 @@ async fn main() -> Result<()> {
 
     let oracle = Arc::new(PumpMarketOracle::new(rpc.clone()));
     let semaphore = Arc::new(Semaphore::new(max_active_candidates));
+    // §5: observation-only RPC concurrency gate, shared across all tracking tasks.
+    let rpc_gate = ObservationRpcGate::new(rpc_concurrency);
 
     let mut counters = RunCounters::default();
     let mut seen_signatures: HashSet<String> = HashSet::new();
@@ -593,6 +805,7 @@ async fn main() -> Result<()> {
                     &recorder,
                     &oracle,
                     &semaphore,
+                    &rpc_gate,
                     &mut seen_signatures,
                     &mut counters,
                     &mut tasks,
@@ -659,6 +872,9 @@ async fn main() -> Result<()> {
     drain_outcome_tasks(&mut tasks, &recorder, &mut counters).await;
 
     // --- Section 22/43: append authoritative RunFinished, then sync. ---
+    // §16: aggregate observation RPC gate stats (read after the outcome drain so
+    // every in-flight permit has been released).
+    let gate_stats = rpc_gate.stats();
     let completion = run_completion(&counters, ever_connected, stream_connected_at_intake_end);
     let run_finished = RunFinishedRecord {
         completion: completion.clone(),
@@ -674,6 +890,10 @@ async fn main() -> Result<()> {
         unexpected_trade_events: counters.unexpected_trade_events,
         migrations_seen: counters.migrations_seen,
         partial_new_token_events: counters.partial_new_token_events,
+        rpc_gate_peak_in_flight: Some(gate_stats.peak_in_flight),
+        rpc_gate_acquisitions: Some(gate_stats.acquisitions),
+        rpc_gate_wait_ms_total: Some(gate_stats.gate_wait_ms_total),
+        rpc_gate_wait_ms_max: Some(gate_stats.gate_wait_ms_max),
     };
     append_required(&recorder, ObservationPayload::RunFinished(run_finished))
         .await
@@ -720,6 +940,7 @@ async fn handle_intake_event(
     recorder: &ObservationRecorder,
     oracle: &Arc<PumpMarketOracle>,
     semaphore: &Arc<Semaphore>,
+    rpc_gate: &Arc<ObservationRpcGate>,
     seen_signatures: &mut HashSet<String>,
     counters: &mut RunCounters,
     tasks: &mut JoinSet<CandidateTaskOutcome>,
@@ -793,6 +1014,7 @@ async fn handle_intake_event(
                 recorder,
                 oracle,
                 semaphore,
+                rpc_gate,
                 seen_signatures,
                 counters,
                 tasks,
@@ -812,6 +1034,7 @@ async fn handle_intake_event(
                 recorder,
                 oracle,
                 semaphore,
+                rpc_gate,
                 seen_signatures,
                 counters,
                 tasks,
@@ -926,11 +1149,13 @@ fn ev_partial_shape() -> ProviderCreateShape {
 /// fail-closed contract), dedupe by signature, bump the unique counter, admit via
 /// the capacity semaphore, then spawn canonical tracking by mint. Ordering is
 /// identical to the previous inlined NewToken handler.
+#[allow(clippy::too_many_arguments)]
 async fn discover_candidate(
     candidate: NormalizedCandidate,
     recorder: &ObservationRecorder,
     oracle: &Arc<PumpMarketOracle>,
     semaphore: &Arc<Semaphore>,
+    rpc_gate: &Arc<ObservationRpcGate>,
     seen_signatures: &mut HashSet<String>,
     counters: &mut RunCounters,
     tasks: &mut JoinSet<CandidateTaskOutcome>,
@@ -983,12 +1208,14 @@ async fn discover_candidate(
             counters.tracking_started += 1;
             let oracle = oracle.clone();
             let recorder = recorder.clone();
+            let rpc_gate = rpc_gate.clone();
             tasks.spawn(track_candidate(
                 permit,
                 candidate_id,
                 mint,
                 candidate_received_at,
                 oracle,
+                rpc_gate,
                 recorder,
             ));
         }
@@ -1244,6 +1471,7 @@ async fn track_candidate(
     mint: Pubkey,
     candidate_received_at: DateTime<Utc>,
     oracle: Arc<PumpMarketOracle>,
+    rpc_gate: Arc<ObservationRpcGate>,
     recorder: ObservationRecorder,
 ) -> CandidateTaskOutcome {
     let mint_str = mint.to_string();
@@ -1256,6 +1484,12 @@ async fn track_candidate(
     let mut buy_quote_failure: Option<ObservationFailureCode> = None;
     let mut initial_base_amount_raw: Option<u64> = None;
     let mut entry_wall_time: Option<DateTime<Utc>> = None;
+    // §15: totals of RPC gate wait + oracle call duration across ALL initial retry
+    // attempts, split by snapshot vs buy quote (saturating; never derived from lag).
+    let mut initial_snapshot_gate_wait_total: u64 = 0;
+    let mut initial_snapshot_call_total: u64 = 0;
+    let mut initial_buy_gate_wait_total: u64 = 0;
+    let mut initial_buy_call_total: u64 = 0;
     // AUDIT-001 §7: the monotonic horizon anchor is captured in the SAME buy-quote
     // success branch that accepts the initial quote (below), before any recorder
     // await or further async. It is never reconstructed after InitialMarket.
@@ -1268,7 +1502,13 @@ async fn track_candidate(
         }
         attempts = (i + 1) as u8;
 
-        match oracle.snapshot(&mint).await {
+        // §8: gate every initial snapshot attempt; accumulate its gate/call time.
+        let snap_call = gated_snapshot(&rpc_gate, &oracle, &mint).await;
+        initial_snapshot_gate_wait_total =
+            initial_snapshot_gate_wait_total.saturating_add(snap_call.gate_wait_ms);
+        initial_snapshot_call_total =
+            initial_snapshot_call_total.saturating_add(snap_call.call_duration_ms);
+        match snap_call.result {
             Ok(snap) => {
                 last_snapshot = Some(MarketSnapshotRecord::from(&snap));
                 last_snapshot_failure = None;
@@ -1279,7 +1519,12 @@ async fn track_candidate(
             }
         }
 
-        match oracle.quote_buy_sol(&mint, ENTRY_QUOTE_LAMPORTS).await {
+        // §8: gate every initial buy-quote attempt; accumulate its gate/call time.
+        let buy_call = gated_quote_buy_sol(&rpc_gate, &oracle, &mint, ENTRY_QUOTE_LAMPORTS).await;
+        initial_buy_gate_wait_total =
+            initial_buy_gate_wait_total.saturating_add(buy_call.gate_wait_ms);
+        initial_buy_call_total = initial_buy_call_total.saturating_add(buy_call.call_duration_ms);
+        match buy_call.result {
             Ok(q) => {
                 // AUDIT-001 §7: IMMEDIATELY, in this buy-quote success branch,
                 // capture BOTH the wall-clock entry time (the quote's canonical
@@ -1326,6 +1571,10 @@ async fn track_candidate(
             buy_quote: buy_quote_record.clone(),
             buy_quote_failure: buy_quote_failure.clone(),
             initial_observation_attempts: attempts,
+            initial_snapshot_rpc_gate_wait_ms_total: Some(initial_snapshot_gate_wait_total),
+            initial_snapshot_rpc_call_duration_ms_total: Some(initial_snapshot_call_total),
+            initial_buy_rpc_gate_wait_ms_total: Some(initial_buy_gate_wait_total),
+            initial_buy_rpc_call_duration_ms_total: Some(initial_buy_call_total),
         }))
         .await
         .is_err()
@@ -1382,10 +1631,13 @@ async fn track_candidate(
         // the sell-quote observation timestamp when sell succeeds; otherwise the
         // time the sell observation failure returned. sampled_at is therefore
         // defined AFTER the sell await, never before it.
-        let (sell_quote, sell_quote_failure, return_bps, sampled_at) = match oracle
-            .quote_sell_raw(&mint, base_amount_raw)
-            .await
-        {
+        // §8/§14: gate the sell quote; capture its gate wait + call duration for
+        // THIS sample. The gate wait occurs AFTER due_at (§10), so it naturally
+        // contributes to sample_lag_ms — it is NEVER subtracted.
+        let sell_call = gated_quote_sell_raw(&rpc_gate, &oracle, &mint, base_amount_raw).await;
+        let sell_rpc_gate_wait_ms = Some(sell_call.gate_wait_ms);
+        let sell_rpc_call_duration_ms = Some(sell_call.call_duration_ms);
+        let (sell_quote, sell_quote_failure, return_bps, sampled_at) = match sell_call.result {
             Ok(q) => {
                 let rec = ExecutableQuoteRecord::from(&q);
                 let ret =
@@ -1412,16 +1664,25 @@ async fn track_candidate(
 
         // --- Section 39: snapshot only at key horizons, recorded independently.
         // The snapshot keeps its own independent observed_at; it never overwrites
-        // the outcome sampled_at above (AUDIT-001 §6).
-        let (snapshot, snapshot_failure) = if should_snapshot_at(horizon) {
-            match oracle.snapshot(&mint).await {
-                Ok(snap) => (Some(MarketSnapshotRecord::from(&snap)), None),
-                Err(e) => (None, Some(classify_observation_error(&e))),
-            }
-        } else {
-            // Absent != failure at non-key horizons.
-            (None, None)
-        };
+        // the outcome sampled_at above (AUDIT-001 §6). §14: at key horizons the
+        // gated snapshot's timing is recorded; at non-key horizons it stays None.
+        let (snapshot, snapshot_failure, snapshot_rpc_gate_wait_ms, snapshot_rpc_call_duration_ms) =
+            if should_snapshot_at(horizon) {
+                let snap_call = gated_snapshot(&rpc_gate, &oracle, &mint).await;
+                let (snapshot, snapshot_failure) = match snap_call.result {
+                    Ok(snap) => (Some(MarketSnapshotRecord::from(&snap)), None),
+                    Err(e) => (None, Some(classify_observation_error(&e))),
+                };
+                (
+                    snapshot,
+                    snapshot_failure,
+                    Some(snap_call.gate_wait_ms),
+                    Some(snap_call.call_duration_ms),
+                )
+            } else {
+                // Absent != failure at non-key horizons; and no snapshot timing.
+                (None, None, None, None)
+            };
 
         // AUDIT-001 §4.2: required OutcomeSample write. On failure, stop the task
         // and surface RecorderWrite (no later samples produced).
@@ -1438,6 +1699,10 @@ async fn track_candidate(
                 snapshot,
                 snapshot_failure,
                 protocol_net_ex_network_return_bps: return_bps,
+                sell_rpc_gate_wait_ms,
+                sell_rpc_call_duration_ms,
+                snapshot_rpc_gate_wait_ms,
+                snapshot_rpc_call_duration_ms,
             }))
             .await
             .is_err()
@@ -1724,6 +1989,166 @@ mod tests {
         assert!(validate_max_active(256).is_ok());
         assert!(validate_max_active(0).is_err());
         assert!(validate_max_active(257).is_err());
+    }
+
+    // === P1-OBSERVATION-RPC-CONCURRENCY-001 gate tests ======================
+
+    /// §27: CLI bounds — default 24; 1/24/64 accepted; 0 and 65 rejected.
+    #[test]
+    fn test_rpc_concurrency_bounds() {
+        assert_eq!(RPC_CONCURRENCY_DEFAULT, 24);
+        assert_eq!(validate_rpc_concurrency(24).unwrap(), 24);
+        assert!(validate_rpc_concurrency(1).is_ok());
+        assert!(validate_rpc_concurrency(64).is_ok());
+        assert!(validate_rpc_concurrency(0).is_err());
+        assert!(validate_rpc_concurrency(65).is_err());
+    }
+
+    /// §28: the gate bounds simultaneous holders, WAITS (never drops), and every
+    /// task completes. With limit 3 and 20 tasks: observed simultaneous holders
+    /// <= 3, gate peak <= 3, and acquisitions == 20.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_rpc_gate_bounded_and_non_censoring() {
+        let gate = ObservationRpcGate::new(3);
+        let active = Arc::new(AtomicUsize::new(0));
+        let observed_max = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let gate = gate.clone();
+            let active = active.clone();
+            let observed_max = observed_max.clone();
+            let completed = completed.clone();
+            handles.push(tokio::spawn(async move {
+                let (permit, _wait) = gate.acquire().await;
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                observed_max.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                drop(permit);
+                completed.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), 20, "all tasks complete");
+        assert!(
+            observed_max.load(Ordering::SeqCst) <= 3,
+            "simultaneous holders exceeded limit"
+        );
+        let stats = gate.stats();
+        assert!(stats.peak_in_flight <= 3, "gate peak exceeded limit");
+        assert_eq!(stats.acquisitions, 20, "every acquisition counted");
+    }
+
+    /// §29: a permit released after an Err-shaped operation frees the slot for the
+    /// next waiter — no leak. Modeled with limit 1: acquire, drop (as the wrapper
+    /// does on both Ok and Err), then acquire again must succeed.
+    #[tokio::test]
+    async fn test_rpc_gate_permit_released_after_use() {
+        let gate = ObservationRpcGate::new(1);
+        let (permit_a, _wa) = gate.acquire().await;
+        // Simulate the wrapper releasing the permit regardless of oracle Ok/Err.
+        drop(permit_a);
+        // The next acquire must not hang (a leaked permit would deadlock at limit 1).
+        let (_permit_b, _wb) = gate.acquire().await;
+        assert_eq!(gate.stats().acquisitions, 2);
+        assert!(gate.stats().peak_in_flight <= 1);
+    }
+
+    /// §30: a waiter's gate wait is measured (> 0) when the gate is held. Uses a
+    /// deterministic hold to avoid timer flake; exact ms is not asserted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_rpc_gate_wait_is_measured() {
+        let gate = ObservationRpcGate::new(1);
+        let (permit_a, _wa) = gate.acquire().await; // A holds the only permit.
+
+        let gate_b = gate.clone();
+        let waiter = tokio::spawn(async move {
+            let (_permit_b, wait_b) = gate_b.acquire().await;
+            wait_b
+        });
+
+        // Ensure B is queued and waiting before A releases.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(permit_a);
+
+        let wait_b = waiter.await.unwrap();
+        assert!(wait_b > 0, "queued waiter gate wait should be measured > 0");
+    }
+
+    /// §31: aggregate stats are exact/consistent under deliberate contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_rpc_gate_stats_consistent() {
+        let gate = ObservationRpcGate::new(1);
+        let (permit_a, _wa) = gate.acquire().await;
+
+        let gate_b = gate.clone();
+        let waiter = tokio::spawn(async move {
+            let (permit_b, _wait_b) = gate_b.acquire().await;
+            drop(permit_b);
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(permit_a);
+        waiter.await.unwrap();
+
+        let s = gate.stats();
+        assert_eq!(s.limit, 1);
+        assert_eq!(s.acquisitions, 2);
+        assert!(s.peak_in_flight <= s.limit, "peak within limit");
+        assert!(
+            s.gate_wait_ms_total >= s.gate_wait_ms_max,
+            "total wait >= max wait"
+        );
+        assert!(s.gate_wait_ms_max > 0, "contention should produce a wait");
+    }
+
+    /// §32: every candidate-tracking oracle call goes through a gated wrapper. The
+    /// three direct `oracle.<method>(` forms appear EXACTLY ONCE in the source —
+    /// each inside its own wrapper definition — so `track_candidate` cannot call
+    /// the oracle directly. Needles are split so this test never self-matches.
+    #[test]
+    fn test_all_candidate_oracle_calls_are_gated() {
+        let src = include_str!("observe_record.rs");
+        let snapshot_call = concat!("oracle", ".snapshot(");
+        let buy_call = concat!("oracle", ".quote_buy_sol(");
+        let sell_call = concat!("oracle", ".quote_sell_raw(");
+        assert_eq!(
+            src.matches(snapshot_call).count(),
+            1,
+            "oracle.snapshot must be called only inside gated_snapshot"
+        );
+        assert_eq!(
+            src.matches(buy_call).count(),
+            1,
+            "oracle.quote_buy_sol must be called only inside gated_quote_buy_sol"
+        );
+        assert_eq!(
+            src.matches(sell_call).count(),
+            1,
+            "oracle.quote_sell_raw must be called only inside gated_quote_sell_raw"
+        );
+        // And the wrappers are actually used by the tracking path.
+        assert!(src.contains("gated_snapshot(&rpc_gate"));
+        assert!(src.contains("gated_quote_buy_sol(&rpc_gate"));
+        assert!(src.contains("gated_quote_sell_raw(&rpc_gate"));
+    }
+
+    /// §33: gate wait is NOT subtracted from lag — a later `sampled_at` (because a
+    /// queued permit delayed the sell) yields a strictly larger `sample_lag_ms`.
+    #[test]
+    fn test_gate_wait_increases_sample_lag_not_subtracted() {
+        let due_at = "2026-01-01T00:00:30.000Z".parse::<DateTime<Utc>>().unwrap();
+        let prompt = "2026-01-01T00:00:30.100Z".parse::<DateTime<Utc>>().unwrap();
+        let delayed = "2026-01-01T00:00:35.100Z".parse::<DateTime<Utc>>().unwrap();
+        let lag_prompt = sample_lag_ms(due_at, prompt);
+        let lag_delayed = sample_lag_ms(due_at, delayed);
+        assert!(lag_delayed > lag_prompt);
+        // The 5s of extra gate wait lands entirely in the lag (not hidden).
+        assert_eq!(lag_delayed - lag_prompt, 5_000);
     }
 
     #[test]
