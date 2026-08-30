@@ -3378,8 +3378,16 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                         }
                     }
                     PumpPortalEvent::DecodeError(_) => {
-                        // Local provider-message decode/schema loss: a dropped candidate, NOT a hard provider/transport failure. Log-only; do NOT set data_stream_ready=false and do NOT halt new entries (unlike Error).
-                        tracing::warn!("PumpPortal decode/schema loss (message dropped)");
+                        // AUDIT-001 §7: a local provider-message decode/schema loss is a
+                        // dropped candidate, NOT a transport outage — so do NOT falsify
+                        // data_stream_ready. But the live ingestion contract is now
+                        // incomplete (at least one candidate was lost), so do NOT keep
+                        // authorizing fresh capital: halt NEW live entries (sticky, live
+                        // only). Do not clear positions, stop exits, or submit anything.
+                        tracing::warn!("PumpPortal decode/schema loss; halting new live entries");
+                        if !dry_run {
+                            new_entries_halted.store(true, Ordering::SeqCst);
+                        }
                     }
                 }
             }

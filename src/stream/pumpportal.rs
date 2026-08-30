@@ -1299,19 +1299,24 @@ fn classify_new_token(text: &str, value: &serde_json::Value) -> PumpPortalEvent 
                 debug!("New token: {} ({}) - {}", ev.name, ev.symbol, ev.mint);
                 PumpPortalEvent::NewToken(ev)
             }
-            Err(e) => {
-                warn!("Dropped malformed new-token event (validation): {}", e);
+            Err(_) => {
+                // AUDIT-001 §4: never interpolate the validation error Display — it
+                // can carry rejected provider values (invalid mint/pubkey/signature).
+                warn!("PumpPortal NewToken validation loss");
                 PumpPortalEvent::DecodeError(PumpPortalDecodeError {
                     kind: PumpPortalDecodeKind::NewTokenValidation,
                     category: "new_token_validation".to_string(),
                 })
             }
         },
-        Err(e) => {
-            warn!("Failed to deserialize new-token event: {}", e);
+        Err(_) => {
+            // The structural category is value-free (§6); safe to log. Never log the
+            // serde error Display, which may render offending provider field values.
+            let category = diagnose_new_token_shape(value);
+            warn!("PumpPortal NewToken decode/schema loss: {}", category);
             PumpPortalEvent::DecodeError(PumpPortalDecodeError {
                 kind: PumpPortalDecodeKind::NewTokenDeserialize,
-                category: diagnose_new_token_shape(value),
+                category,
             })
         }
     }
@@ -1330,16 +1335,16 @@ fn classify_trade(text: &str) -> PumpPortalEvent {
                 );
                 PumpPortalEvent::Trade(ev)
             }
-            Err(e) => {
-                warn!("Dropped malformed trade event (validation): {}", e);
+            Err(_) => {
+                warn!("PumpPortal trade validation loss");
                 PumpPortalEvent::DecodeError(PumpPortalDecodeError {
                     kind: PumpPortalDecodeKind::TradeValidation,
                     category: "trade_validation".to_string(),
                 })
             }
         },
-        Err(e) => {
-            warn!("Failed to deserialize trade event: {}", e);
+        Err(_) => {
+            warn!("PumpPortal trade deserialize loss");
             PumpPortalEvent::DecodeError(PumpPortalDecodeError {
                 kind: PumpPortalDecodeKind::TradeDeserialize,
                 category: "trade_deserialize".to_string(),
@@ -1354,8 +1359,8 @@ fn classify_trade(text: &str) -> PumpPortalEvent {
 fn classify_migration(value: &serde_json::Value) -> PumpPortalEvent {
     match parse_migration(value) {
         Ok(ev) => PumpPortalEvent::Migration(ev),
-        Err(e) => {
-            warn!("Dropped malformed migration event: {}", e);
+        Err(_) => {
+            warn!("PumpPortal migration parse loss");
             PumpPortalEvent::DecodeError(PumpPortalDecodeError {
                 kind: PumpPortalDecodeKind::MigrationParse,
                 category: "migration_parse".to_string(),
@@ -2312,6 +2317,30 @@ mod tests {
         assert!(!cat.contains("12345"), "leaked provider value: {cat}");
         // The wrong-typed symbol is reported by field NAME + json type only.
         assert!(cat.contains("symbol:number"), "cat={cat}");
+    }
+
+    /// AUDIT-001 §5: the decode classifiers must never interpolate a raw
+    /// serde/validation/parse error Display, because those errors can render
+    /// rejected provider values (invalid mint/pubkey/signature/pool_id). Prove the
+    /// prior unsafe log patterns are gone from THIS source file. Needles are
+    /// assembled from split fragments via concat!() so this test does not itself
+    /// reintroduce the forbidden contiguous string.
+    #[test]
+    fn test_decode_classifiers_do_not_interpolate_raw_error_display() {
+        let src = include_str!("pumpportal.rs");
+        let forbidden: &[&str] = &[
+            concat!("Failed to deserialize new-token ", "event: {}"),
+            concat!("Dropped malformed new-token event ", "(validation): {}"),
+            concat!("Failed to deserialize trade ", "event: {}"),
+            concat!("Dropped malformed trade event ", "(validation): {}"),
+            concat!("Dropped malformed migration ", "event: {}"),
+        ];
+        for needle in forbidden {
+            assert!(
+                !src.contains(needle),
+                "decode classifier still interpolates a raw error Display: {needle}"
+            );
+        }
     }
 
     #[test]
