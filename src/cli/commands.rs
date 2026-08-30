@@ -1984,6 +1984,20 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             token.market_cap_sol
                         );
 
+                        // P1-METADATA-DRAIN-TRUTH-001 §9: candidate-specific metadata
+                        // gate. A metadata-less create is now a supported provider
+                        // variant (empty name/symbol/uri), NOT a DecodeError — but the
+                        // live strategy/filter inputs (filter_name_symbol, SignalContext)
+                        // require provider name/symbol/uri, so an incomplete candidate
+                        // must never flow into filter/scoring/sizing/quote/submission.
+                        // Skip THIS candidate only (fail-closed per-candidate) in BOTH
+                        // dry-run and live. This does NOT touch data_stream_ready or
+                        // new_entries_halted and does not halt the bot or affect exits.
+                        if !token.has_complete_metadata() {
+                            warn!("New token metadata unavailable; skipping candidate");
+                            continue;
+                        }
+
                         // Fail-closed new-entry admission gate (D12). Independent of
                         // daily loss, strategy pause, and filters. A NEW live buy is
                         // admitted only when entries are not halted AND — when the
