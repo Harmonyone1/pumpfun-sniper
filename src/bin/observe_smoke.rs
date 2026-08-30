@@ -108,6 +108,10 @@ struct Counters {
     /// Trade events observed despite requesting a free-only plan (zero token/
     /// account trade subscriptions). Any nonzero count fails the smoke.
     unexpected_trade_events: u64,
+    /// P1-PROVIDER-DECODE-TRUTH-001 §8: local provider-message decode/schema-loss
+    /// events. The smoke tests parser/connectivity correctness, so ANY decode loss
+    /// (nonzero count) fails the smoke PASS.
+    decode_errors: u64,
 }
 
 /// Pure final-PASS policy. A run passes ONLY if the RPC is mainnet, a slot was
@@ -126,6 +130,7 @@ fn smoke_passes(
         && counters.connected_events >= 1
         && counters.provider_errors == 0
         && counters.unexpected_trade_events == 0
+        && counters.decode_errors == 0
         && counters.new_token_events >= 1
         && counters.market_snapshot_successes >= 1
         && counters.hypothetical_quote_successes >= 1
@@ -143,6 +148,7 @@ fn early_success_candidate(
     stream_connected
         && counters.provider_errors == 0
         && counters.unexpected_trade_events == 0
+        && counters.decode_errors == 0
         && counters.new_token_events >= target_new_tokens as u64
         && counters.market_snapshot_successes >= 1
         && counters.hypothetical_quote_successes >= 1
@@ -155,6 +161,7 @@ enum TerminalKind {
     Connected,
     Disconnected,
     Error,
+    Decode,
     Trade,
     Migration,
     NewToken,
@@ -166,6 +173,7 @@ fn terminal_kind_of(event: &PumpPortalEvent) -> TerminalKind {
         PumpPortalEvent::Connected => TerminalKind::Connected,
         PumpPortalEvent::Disconnected => TerminalKind::Disconnected,
         PumpPortalEvent::Error(_) => TerminalKind::Error,
+        PumpPortalEvent::DecodeError(_) => TerminalKind::Decode,
         PumpPortalEvent::Trade(_) => TerminalKind::Trade,
         PumpPortalEvent::Migration(_) => TerminalKind::Migration,
         PumpPortalEvent::NewToken(_) => TerminalKind::NewToken,
@@ -185,6 +193,10 @@ fn apply_terminal_kind(kind: TerminalKind, stream_connected: &mut bool, counters
         }
         TerminalKind::Error => {
             counters.provider_errors += 1;
+        }
+        TerminalKind::Decode => {
+            // P1 §8: any decode/schema loss fails the smoke.
+            counters.decode_errors += 1;
         }
         TerminalKind::Trade => {
             counters.unexpected_trade_events += 1;
@@ -379,6 +391,12 @@ async fn main() -> Result<()> {
                 let safe = sanitize_short_text(&category, 80);
                 eprintln!("WARN PumpPortal provider error: {safe}");
             }
+            PumpPortalEvent::DecodeError(_) => {
+                // P1 §8: local decode/schema loss fails the smoke. Fixed warning
+                // only — never expose the decode category or any provider value.
+                counters.decode_errors += 1;
+                eprintln!("WARN PumpPortal decode/schema loss (message dropped)");
+            }
             PumpPortalEvent::Migration(ev) => {
                 counters.migration_events += 1;
                 // The stream already validated the mint as a Pubkey.
@@ -438,6 +456,7 @@ async fn main() -> Result<()> {
         "unexpected_trade_events: {}",
         counters.unexpected_trade_events
     );
+    println!("decode_errors: {}", counters.decode_errors);
     println!("new_token_events: {}", counters.new_token_events);
     println!("migration_events: {}", counters.migration_events);
     println!(
@@ -661,6 +680,7 @@ mod tests {
             hypothetical_quote_successes: 1,
             market_observation_failures: 0,
             unexpected_trade_events: 0,
+            decode_errors: 0,
         }
     }
 
@@ -763,5 +783,44 @@ mod tests {
         // fail-closed transition explicitly here (the production loop does the same).
         stream_connected = false;
         assert!(!smoke_passes(true, 42, stream_connected, &counters));
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-PROVIDER-DECODE-TRUTH-001 §15 — decode-loss fails smoke.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_error_blocks_smoke_pass() {
+        // Counters that would otherwise PASS, but one decode/schema loss occurred.
+        let mut counters = data_criteria_met();
+        // Apply a decode event via the pure terminal classifier (no fake payload).
+        let mut stream_connected = true;
+        apply_terminal_kind(TerminalKind::Decode, &mut stream_connected, &mut counters);
+        assert_eq!(counters.decode_errors, 1);
+        assert!(
+            !smoke_passes(true, 42, stream_connected, &counters),
+            "any decode/schema loss must block PASS"
+        );
+        // And early success must not fire after a decode loss.
+        assert!(!early_success_candidate(1, stream_connected, &counters));
+    }
+
+    #[test]
+    fn test_decode_error_does_not_expose_payload_values() {
+        // The smoke's decode handling is a fixed warning + a counter bump; it never
+        // carries a decode category or provider value. Prove the source's decode
+        // handling emits only the fixed message and no category interpolation.
+        let src = include_str!("observe_smoke.rs");
+        let fixed = "PumpPortal decode/schema loss (message dropped)";
+        assert!(src.contains(fixed), "fixed decode warning must be present");
+        // The DecodeError arms bind `_` (no payload), so no category can be
+        // printed. Assert we never bind or format a decode payload. Needles are
+        // assembled via concat!() so this assertion never self-triggers.
+        let bind_e = concat!("Decode", "Error(e)");
+        let bind_cat = concat!("Decode", "Error(category)");
+        assert!(
+            !src.contains(bind_e) && !src.contains(bind_cat),
+            "smoke must not bind/expose the decode payload"
+        );
     }
 }
