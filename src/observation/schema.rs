@@ -381,8 +381,11 @@ fn classify_market_data_message(msg: &str) -> MarketDataFailureKind {
         return K::LiquidityOrReserveUnavailable;
     }
 
-    // 6) Identity / owner validation (non-FeeConfig).
+    // 6) Identity / owner validation (non-FeeConfig). `wrong program` covers the
+    //    SPL Token / Token-2022 program-owner check for a token account, which the
+    //    enum documents as a program-owner failure.
     if msg.contains("wrong owner")
+        || msg.contains("wrong program")
         || msg.contains("mismatch")
         || msg.contains("index != 0")
         || msg.contains("!= expected")
@@ -392,10 +395,14 @@ fn classify_market_data_message(msg: &str) -> MarketDataFailureKind {
         return K::AccountIdentityOrOwner;
     }
 
-    // 7) Decode / layout (non-FeeConfig).
+    // 7) Decode / layout (non-FeeConfig). `account too short` covers the base-layout
+    //    minimum-length checks (Mint/TokenAccount); `partially-present` covers a
+    //    field straddling the end of the account buffer (e.g. a partial i128).
     if msg.contains("wrong discriminator")
         || msg.contains("account data shorter")
         || msg.contains("account shorter")
+        || msg.contains("account too short")
+        || msg.contains("partially-present")
         || msg.contains("truncated")
         || msg.contains("invalid bool byte")
     {
@@ -1256,8 +1263,15 @@ mod tests {
         for m in [
             "BondingCurve: wrong discriminator",
             "BondingCurve: account data shorter than discriminator",
+            "BondingCurve: account shorter than mandatory prefix (through complete@48)",
+            "Pool: account shorter than complete prefix (through is_cashback_coin@244)",
             "Pool: truncated pubkey at offset 40",
             "Mint: truncated u64 at offset 36",
+            // AUDIT-001: actual pump_state base-layout minimum-length messages.
+            "Mint: account too short for base layout (12 < 82)",
+            "TokenAccount: account too short for base layout (33 < 165)",
+            // AUDIT-001: actual partial-field message (i128 straddling buffer end).
+            "Pool.virtual_quote_reserves: partially-present i128 (8 of 16 bytes); refusing to interpret",
         ] {
             assert_eq!(
                 kind_of(m),
@@ -1273,6 +1287,8 @@ mod tests {
             "BondingCurve: wrong owner AAA, expected Pump program BBB",
             "Pool: wrong owner AAA, expected PumpSwap program BBB",
             "Mint: wrong owner AAA, expected SPL Token or Token-2022",
+            // AUDIT-001: actual token-account program-owner check ("wrong program").
+            "TokenAccount: wrong program AAA, expected SPL Token or Token-2022",
             "TokenAccount: mint mismatch (got AAA, expected BBB)",
             "TokenAccount: owner mismatch (got AAA, expected BBB)",
             "canonical pool index != 0 (got 3)",
@@ -1346,6 +1362,22 @@ mod tests {
     fn test_classify_unknown_market_data_is_other() {
         assert_eq!(
             kind_of("some brand new unmatched canonical message"),
+            MarketDataFailureKind::Other
+        );
+    }
+
+    #[test]
+    fn test_classify_transport_wrapped_market_data_is_other() {
+        // AUDIT-001: two CURRENT oracle messages wrap a transport/fetch failure in
+        // `Error::MarketData`. They fit none of the account/decode/identity/fee/
+        // liquidity/quote-math/invariant categories, so `Other` is the honest bucket
+        // (there is no §7 RPC/transport subtype). Documented as deliberate.
+        assert_eq!(
+            kind_of("market oracle fetch task join failed: joinerror"),
+            MarketDataFailureKind::Other
+        );
+        assert_eq!(
+            kind_of("market oracle get_multiple_accounts failed: rpc down"),
             MarketDataFailureKind::Other
         );
     }
