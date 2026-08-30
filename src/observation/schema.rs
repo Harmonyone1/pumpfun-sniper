@@ -279,6 +279,180 @@ pub fn classify_observation_error(err: &crate::Error) -> ObservationFailureCode 
 }
 
 // ---------------------------------------------------------------------------
+// P1-OBSERVATION-MARKET-DATA-TRUTH-001 — safe canonical-unavailability subtype.
+//
+// The top-level `MarketUnavailable` code is intentionally coarse: `Error::MarketData`
+// can mean a missing canonical account, a decode/layout failure, an identity/owner
+// mismatch, a fee-config problem, depleted reserves, unexecutable exact-size quote
+// math, or an internal invariant. Run #4 proved these must not be treated as one
+// research label. This subtype is DERIVED purely from the FIXED internal message
+// structure and is VALUE-FREE: no raw message, mint/pubkey, endpoint, or provider
+// string is ever returned or persisted.
+// ---------------------------------------------------------------------------
+
+/// Fixed, value-free subtype of a canonical `Error::MarketData` failure. Carries NO
+/// payload (no raw text, pubkey, endpoint, or provider string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketDataFailureKind {
+    /// A canonical account expected in a successful RPC response was absent
+    /// (bonding curve, base mint, PumpSwap pool/vaults). NOT a FeeConfig miss.
+    AccountMissing,
+    /// A canonical (non-FeeConfig) account failed fixed decode/layout validation
+    /// (wrong discriminator, truncated/short data, invalid layout).
+    AccountDecodeOrLayout,
+    /// A canonical (non-FeeConfig) account failed identity/owner validation (wrong
+    /// program owner, pool index/creator/mint mismatch, vault changed, token-account
+    /// mint/owner mismatch).
+    AccountIdentityOrOwner,
+    /// A required FeeConfig account was missing.
+    FeeConfigUnavailable,
+    /// A FeeConfig account was present but invalid (wrong owner, decode/layout, no
+    /// usable/invalid fee tiers).
+    FeeConfigInvalid,
+    /// Reserves/liquidity were unusable (empty virtual reserves, zero base reserve,
+    /// non-positive/overflowing effective quote reserve).
+    LiquidityOrReserveUnavailable,
+    /// Exact-size quote math was unexecutable (zero/unexecutable base out, sell math
+    /// failed, net quote out zero).
+    QuoteMathUnexecutable,
+    /// A market-cap or numeric-overflow computation failed (market cap computation,
+    /// quote output numeric overflow / exceeds u64).
+    MarketCapOrMath,
+    /// An internal caller invariant that should not arise from this recorder's fixed
+    /// nonzero quote sizes (nonzero SOL/base input required). Treat as code trouble.
+    InternalInvariant,
+    /// Any currently-unmatched `Error::MarketData` message. Never panics.
+    Other,
+}
+
+/// Pure, VALUE-FREE classifier: map an `Error::MarketData` into a fixed
+/// [`MarketDataFailureKind`]. Non-`MarketData` errors return `None`. The internal
+/// message is INSPECTED here but NEVER returned or persisted (only the enum is).
+///
+/// Matching is ordered specific-before-generic (P1-MARKET-DATA-TRUTH §6-7). In
+/// particular: nonzero-input invariants first; FeeConfig-missing before generic
+/// account-missing; any FeeConfig-prefixed message routes to `FeeConfigInvalid`
+/// before the generic decode/identity buckets.
+pub fn classify_market_data_failure_kind(err: &crate::Error) -> Option<MarketDataFailureKind> {
+    let msg = match err {
+        crate::Error::MarketData(m) => m.as_str(),
+        _ => return None,
+    };
+    Some(classify_market_data_message(msg))
+}
+
+/// Inner pure string classifier (separated for direct message-level unit tests). The
+/// argument is a canonical `Error::MarketData` message; the return is the fixed
+/// subtype only.
+fn classify_market_data_message(msg: &str) -> MarketDataFailureKind {
+    use MarketDataFailureKind as K;
+
+    // 1) Internal caller invariants (impossible for this recorder's fixed sizes).
+    if msg.contains("requires nonzero SOL input") || msg.contains("requires nonzero base input") {
+        return K::InternalInvariant;
+    }
+
+    // 2) FeeConfig-missing before any generic account-missing match.
+    if msg.contains("FeeConfig account missing") {
+        return K::FeeConfigUnavailable;
+    }
+
+    // 3) Any FeeConfig-prefixed diagnostic (wrong owner, decode/layout, tier
+    //    structure, no usable tiers) routes to FeeConfigInvalid BEFORE the generic
+    //    decode/identity buckets (§7).
+    if msg.starts_with("FeeConfig") {
+        return K::FeeConfigInvalid;
+    }
+
+    // 4) Canonical account absence (bonding curve, base mint, pool, vaults).
+    if msg.contains("account missing")
+        || msg.contains("vault missing")
+        || msg.contains("pool unavailable")
+    {
+        return K::AccountMissing;
+    }
+
+    // 5) Liquidity / reserve unusable.
+    if msg.contains("empty virtual reserves")
+        || msg.contains("zero base reserve")
+        || msg.contains("effective quote reserve non-positive")
+    {
+        return K::LiquidityOrReserveUnavailable;
+    }
+
+    // 6) Identity / owner validation (non-FeeConfig).
+    if msg.contains("wrong owner")
+        || msg.contains("mismatch")
+        || msg.contains("index != 0")
+        || msg.contains("!= expected")
+        || msg.contains("!= derived")
+        || msg.contains("vault changed between")
+    {
+        return K::AccountIdentityOrOwner;
+    }
+
+    // 7) Decode / layout (non-FeeConfig).
+    if msg.contains("wrong discriminator")
+        || msg.contains("account data shorter")
+        || msg.contains("account shorter")
+        || msg.contains("truncated")
+        || msg.contains("invalid bool byte")
+    {
+        return K::AccountDecodeOrLayout;
+    }
+
+    // 8) Numeric overflow / market-cap math (before generic quote-math so the
+    //    "exceeds u64" overflow forms are captured here).
+    if msg.contains("market cap computation failed")
+        || msg.contains("exceeds u64")
+        || msg.contains("numeric overflow")
+    {
+        return K::MarketCapOrMath;
+    }
+
+    // 9) Exact-size quote math unexecutable.
+    if msg.contains("produced zero/unexecutable base out")
+        || msg.contains("sell math failed")
+        || msg.contains("net quote out is zero")
+    {
+        return K::QuoteMathUnexecutable;
+    }
+
+    // 10) Anything else.
+    K::Other
+}
+
+/// A single classification of a crate error into BOTH the top-level observation
+/// failure code and (when the code is `MarketUnavailable`) its safe market-data
+/// subtype. Using this one helper prevents the two classifiers from disagreeing.
+///
+/// Invariant (P1-MARKET-DATA-TRUTH §11): `market_data_kind.is_some()` IFF
+/// `code == MarketUnavailable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedObservationError {
+    pub code: ObservationFailureCode,
+    pub market_data_kind: Option<MarketDataFailureKind>,
+}
+
+/// Classify a crate error once, deriving the failure code and — only for
+/// `MarketData` — the safe subtype. Enforces the §11 invariant by construction.
+pub fn classify_observation_error_full(err: &crate::Error) -> ClassifiedObservationError {
+    let code = classify_observation_error(err);
+    let market_data_kind = if code == ObservationFailureCode::MarketUnavailable {
+        // MarketUnavailable comes only from Error::MarketData, so the subtype
+        // classifier returns Some; fall back to Other defensively (never None here).
+        Some(classify_market_data_failure_kind(err).unwrap_or(MarketDataFailureKind::Other))
+    } else {
+        None
+    };
+    ClassifiedObservationError {
+        code,
+        market_data_kind,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Section 13 — observed market snapshot
 // ---------------------------------------------------------------------------
 
@@ -447,6 +621,15 @@ pub struct InitialMarketRecord {
     pub initial_buy_rpc_gate_wait_ms_total: Option<u64>,
     #[serde(default)]
     pub initial_buy_rpc_call_duration_ms_total: Option<u64>,
+
+    /// P1-OBSERVATION-MARKET-DATA-TRUTH-001 §9: safe market-data subtype for the
+    /// FINAL retained snapshot / buy-quote results. `Some(kind)` IFF the
+    /// corresponding failure code is `MarketUnavailable`; `None` on success, on a
+    /// non-MarketData failure, and in historical/pre-field records.
+    #[serde(default)]
+    pub snapshot_market_data_kind: Option<MarketDataFailureKind>,
+    #[serde(default)]
+    pub buy_quote_market_data_kind: Option<MarketDataFailureKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +676,16 @@ pub struct OutcomeSampleRecord {
     pub snapshot_rpc_gate_wait_ms: Option<u64>,
     #[serde(default)]
     pub snapshot_rpc_call_duration_ms: Option<u64>,
+
+    /// P1-OBSERVATION-MARKET-DATA-TRUTH-001 §10: safe market-data subtype for this
+    /// sample's sell quote and key-horizon snapshot. `Some(kind)` IFF the matching
+    /// failure code is `MarketUnavailable`. At non-key snapshot horizons the snapshot
+    /// subtype is `None` (as are `snapshot`/`snapshot_failure`). `None` in
+    /// historical/pre-field records.
+    #[serde(default)]
+    pub sell_market_data_kind: Option<MarketDataFailureKind>,
+    #[serde(default)]
+    pub snapshot_market_data_kind: Option<MarketDataFailureKind>,
 }
 
 /// Protocol-net-ex-network return in basis points (10_000 bps = 100%).
@@ -894,6 +1087,8 @@ mod tests {
             sell_rpc_call_duration_ms: Some(22),
             snapshot_rpc_gate_wait_ms: snapshot_gate.map(|(w, _)| w),
             snapshot_rpc_call_duration_ms: snapshot_gate.map(|(_, d)| d),
+            sell_market_data_kind: None,
+            snapshot_market_data_kind: None,
         }
     }
 
@@ -947,6 +1142,8 @@ mod tests {
             initial_snapshot_rpc_call_duration_ms_total: Some(20),
             initial_buy_rpc_gate_wait_ms_total: Some(30),
             initial_buy_rpc_call_duration_ms_total: Some(40),
+            snapshot_market_data_kind: None,
+            buy_quote_market_data_kind: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: InitialMarketRecord = serde_json::from_str(&json).unwrap();
@@ -1004,5 +1201,272 @@ mod tests {
         assert_eq!(back.rpc_gate_acquisitions, None);
         assert_eq!(back.rpc_gate_wait_ms_total, None);
         assert_eq!(back.rpc_gate_wait_ms_max, None);
+    }
+
+    // == P1-OBSERVATION-MARKET-DATA-TRUTH-001 — classifier (§18) ==============
+
+    fn kind_of(msg: &str) -> MarketDataFailureKind {
+        classify_market_data_failure_kind(&crate::Error::MarketData(msg.to_string())).unwrap()
+    }
+
+    #[test]
+    fn test_classify_account_missing() {
+        for m in [
+            "bonding curve account missing: not a supported Pump coin",
+            "base mint account missing",
+            "final base mint account missing",
+            "curve complete but canonical PumpSwap pool unavailable",
+            "final PumpSwap pool account missing",
+            "final PumpSwap base vault missing",
+            "final PumpSwap quote vault missing",
+        ] {
+            assert_eq!(kind_of(m), MarketDataFailureKind::AccountMissing, "{m}");
+        }
+    }
+
+    #[test]
+    fn test_classify_fee_config_unavailable_before_account_missing() {
+        // FeeConfig-missing must NOT be lumped into generic AccountMissing (§7).
+        assert_eq!(
+            kind_of("Pump FeeConfig account missing"),
+            MarketDataFailureKind::FeeConfigUnavailable
+        );
+        assert_eq!(
+            kind_of("final PumpSwap FeeConfig account missing"),
+            MarketDataFailureKind::FeeConfigUnavailable
+        );
+    }
+
+    #[test]
+    fn test_classify_fee_config_invalid() {
+        for m in [
+            "FeeConfig has no usable fee tiers",
+            "FeeConfig: wrong owner So11111111111111111111111111111111111111112, expected fee program X",
+            "FeeConfig: fee_tiers_length overflows byte requirement",
+            "FeeConfig: lp_fee_bps=99999 exceeds 10000 bps",
+            "FeeConfig: wrong discriminator",
+            "FeeConfig: truncated u64 at offset 8",
+        ] {
+            assert_eq!(kind_of(m), MarketDataFailureKind::FeeConfigInvalid, "{m}");
+        }
+    }
+
+    #[test]
+    fn test_classify_account_decode_or_layout() {
+        for m in [
+            "BondingCurve: wrong discriminator",
+            "BondingCurve: account data shorter than discriminator",
+            "Pool: truncated pubkey at offset 40",
+            "Mint: truncated u64 at offset 36",
+        ] {
+            assert_eq!(
+                kind_of(m),
+                MarketDataFailureKind::AccountDecodeOrLayout,
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_account_identity_or_owner() {
+        for m in [
+            "BondingCurve: wrong owner AAA, expected Pump program BBB",
+            "Pool: wrong owner AAA, expected PumpSwap program BBB",
+            "Mint: wrong owner AAA, expected SPL Token or Token-2022",
+            "TokenAccount: mint mismatch (got AAA, expected BBB)",
+            "TokenAccount: owner mismatch (got AAA, expected BBB)",
+            "canonical pool index != 0 (got 3)",
+            "canonical pool creator AAA != derived Pump pool authority BBB",
+            "canonical pool base_mint AAA != expected BBB",
+            "canonical pool quote_mint AAA != expected BBB",
+            "PumpSwap base vault changed between discovery and final (discovered AAA, final pool BBB)",
+        ] {
+            assert_eq!(kind_of(m), MarketDataFailureKind::AccountIdentityOrOwner, "{m}");
+        }
+    }
+
+    #[test]
+    fn test_classify_liquidity_or_reserve() {
+        for m in [
+            "bonding curve has empty virtual reserves",
+            "PumpSwap pool has zero base reserve",
+            "PumpSwap effective quote reserve non-positive / overflow",
+        ] {
+            assert_eq!(
+                kind_of(m),
+                MarketDataFailureKind::LiquidityOrReserveUnavailable,
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_quote_math_unexecutable() {
+        for m in [
+            "Pump buy produced zero/unexecutable base out",
+            "Pump sell math failed (reserves depleted or fees exceed output)",
+            "Pump sell net quote out is zero (unexecutable)",
+            "PumpSwap buy produced zero/unexecutable base out",
+            "PumpSwap sell math failed (reserves depleted or fees exceed output)",
+        ] {
+            assert_eq!(
+                kind_of(m),
+                MarketDataFailureKind::QuoteMathUnexecutable,
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_market_cap_or_math() {
+        for m in [
+            "bonding market cap computation failed",
+            "PumpSwap market cap computation failed",
+            "Pump buy base out exceeds u64",
+            "Pump sell net quote out exceeds u64",
+            "PumpSwap sell net quote out exceeds u64",
+        ] {
+            assert_eq!(kind_of(m), MarketDataFailureKind::MarketCapOrMath, "{m}");
+        }
+    }
+
+    #[test]
+    fn test_classify_internal_invariant() {
+        assert_eq!(
+            kind_of("buy quote requires nonzero SOL input"),
+            MarketDataFailureKind::InternalInvariant
+        );
+        assert_eq!(
+            kind_of("sell quote requires nonzero base input"),
+            MarketDataFailureKind::InternalInvariant
+        );
+    }
+
+    #[test]
+    fn test_classify_unknown_market_data_is_other() {
+        assert_eq!(
+            kind_of("some brand new unmatched canonical message"),
+            MarketDataFailureKind::Other
+        );
+    }
+
+    #[test]
+    fn test_classify_non_market_data_is_none() {
+        assert_eq!(
+            classify_market_data_failure_kind(&crate::Error::Rpc("endpoint down".into())),
+            None
+        );
+        assert_eq!(
+            classify_market_data_failure_kind(&crate::Error::UnsupportedQuoteMint("usdc".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn test_market_data_subtype_is_value_free() {
+        // A message packed with an address/endpoint must not leak into the enum's
+        // serialized form (the enum is a fixed token with no payload).
+        let msg = "BondingCurve: wrong owner So11111111111111111111111111111111111111112, \
+                   expected Pump program at https://secret-endpoint.example/key123";
+        let kind = kind_of(msg);
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"account_identity_or_owner\"");
+        assert!(!json.contains("secret"), "leaked: {json}");
+        assert!(!json.contains("So1111"), "leaked pubkey: {json}");
+    }
+
+    // == P1-OBSERVATION-MARKET-DATA-TRUTH-001 — combined helper (§11/§19) =====
+
+    #[test]
+    fn test_classified_error_invariant_market_data() {
+        let c = classify_observation_error_full(&crate::Error::MarketData(
+            "PumpSwap pool has zero base reserve".into(),
+        ));
+        assert_eq!(c.code, ObservationFailureCode::MarketUnavailable);
+        assert_eq!(
+            c.market_data_kind,
+            Some(MarketDataFailureKind::LiquidityOrReserveUnavailable)
+        );
+    }
+
+    #[test]
+    fn test_classified_error_invariant_rpc_is_none_kind() {
+        let c = classify_observation_error_full(&crate::Error::RpcTimeout(5000));
+        assert_eq!(c.code, ObservationFailureCode::RpcUnavailable);
+        assert_eq!(c.market_data_kind, None);
+    }
+
+    #[test]
+    fn test_classified_error_invariant_unsupported_is_none_kind() {
+        let c = classify_observation_error_full(&crate::Error::UnsupportedQuoteMint("usdc".into()));
+        assert_eq!(c.code, ObservationFailureCode::UnsupportedQuoteAsset);
+        assert_eq!(c.market_data_kind, None);
+    }
+
+    #[test]
+    fn test_classified_error_kind_some_iff_market_unavailable() {
+        // §11 invariant across a representative spread of error variants.
+        let cases: Vec<crate::Error> = vec![
+            crate::Error::MarketData("base mint account missing".into()),
+            crate::Error::Rpc("x".into()),
+            crate::Error::UnsupportedQuoteMint("x".into()),
+            crate::Error::Internal("x".into()),
+        ];
+        for e in cases {
+            let c = classify_observation_error_full(&e);
+            let is_market = c.code == ObservationFailureCode::MarketUnavailable;
+            assert_eq!(
+                c.market_data_kind.is_some(),
+                is_market,
+                "invariant broken for {c:?}"
+            );
+        }
+    }
+
+    // == Schema field round-trip (§9/§10) ====================================
+
+    #[test]
+    fn test_market_data_kind_round_trips_snake_case() {
+        let kind = MarketDataFailureKind::QuoteMathUnexecutable;
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            "\"quote_math_unexecutable\""
+        );
+        let back: MarketDataFailureKind =
+            serde_json::from_str("\"account_identity_or_owner\"").unwrap();
+        assert_eq!(back, MarketDataFailureKind::AccountIdentityOrOwner);
+    }
+
+    #[test]
+    fn test_initial_market_missing_market_data_kind_deserializes_none() {
+        // A pre-field record (no *_market_data_kind keys) => None.
+        let line = r#"{"candidate_id":"sig","mint":"mint","candidate_received_at":"2026-08-30T00:00:00Z","snapshot":null,"snapshot_failure":"market_unavailable","buy_quote":null,"buy_quote_failure":"market_unavailable","initial_observation_attempts":4}"#;
+        let back: InitialMarketRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(back.snapshot_market_data_kind, None);
+        assert_eq!(back.buy_quote_market_data_kind, None);
+    }
+
+    #[test]
+    fn test_outcome_sample_market_data_kind_round_trip_and_missing_none() {
+        // Missing keys => None.
+        let line = r#"{"candidate_id":"sig","mint":"mint","horizon_secs":15,"due_at":"2026-08-30T00:00:00Z","sampled_at":"2026-08-30T00:00:01Z","sample_lag_ms":1000,"sell_quote":null,"sell_quote_failure":"market_unavailable","snapshot":null,"snapshot_failure":null,"protocol_net_ex_network_return_bps":null}"#;
+        let back: OutcomeSampleRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(back.sell_market_data_kind, None);
+        assert_eq!(back.snapshot_market_data_kind, None);
+
+        // Present values round-trip.
+        let mut rec = back;
+        rec.sell_market_data_kind = Some(MarketDataFailureKind::AccountMissing);
+        rec.snapshot_market_data_kind = Some(MarketDataFailureKind::FeeConfigInvalid);
+        let round: OutcomeSampleRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(
+            round.sell_market_data_kind,
+            Some(MarketDataFailureKind::AccountMissing)
+        );
+        assert_eq!(
+            round.snapshot_market_data_kind,
+            Some(MarketDataFailureKind::FeeConfigInvalid)
+        );
     }
 }
