@@ -1476,9 +1476,28 @@ fn stream_state(state: StreamStateKind, category: Option<String>) -> Observation
     ObservationPayload::StreamState(StreamStateRecord { state, category })
 }
 
+/// AUDIT-001 §10: pure predicate — does this decode kind represent the terminal LOSS
+/// of a `txType=create` (a candidate that can NEVER enter the research universe)?
+///
+/// TRUE for all four create-loss kinds: `NewTokenDeserialize`, `NewTokenValidation`,
+/// `PartialNewTokenDeserialize`, `PartialNewTokenValidation`. FALSE for non-create
+/// losses (`MigrationParse`, `TradeDeserialize`, `TradeValidation`), which are still
+/// counted in `provider_errors`/`decode_errors` but must NOT inflate the modeling-census
+/// `new_token_decode_errors` gate.
+fn is_new_token_decode_kind(kind: PumpPortalDecodeKind) -> bool {
+    matches!(
+        kind,
+        PumpPortalDecodeKind::NewTokenDeserialize
+            | PumpPortalDecodeKind::NewTokenValidation
+            | PumpPortalDecodeKind::PartialNewTokenDeserialize
+            | PumpPortalDecodeKind::PartialNewTokenValidation
+    )
+}
+
 /// P1-PROVIDER-DECODE-TRUTH-001 §9: account + persist a single decode/schema-loss
 /// anomaly. Increments the schema-v1 total (`provider_errors`) AND the internal
-/// `decode_errors` subset; NewToken decode kinds also bump `new_token_decode_errors`.
+/// `decode_errors` subset; create-loss decode kinds (full OR partial) also bump
+/// `new_token_decode_errors` per [`is_new_token_decode_kind`].
 /// Persists a `StreamStateKind::ProviderError` record (no new schema variant) whose
 /// category is prefixed `decode:` and bounded to <=256 chars with no raw provider
 /// values (the decode category is already a fixed structural token). NEVER touches
@@ -1490,10 +1509,7 @@ async fn record_decode_error(
 ) -> std::result::Result<(), CollectorRecordError> {
     counters.provider_errors += 1;
     counters.decode_errors += 1;
-    if matches!(
-        e.kind,
-        PumpPortalDecodeKind::NewTokenDeserialize | PumpPortalDecodeKind::NewTokenValidation
-    ) {
+    if is_new_token_decode_kind(e.kind) {
         counters.new_token_decode_errors += 1;
     }
     // Fixed `decode:` prefix + the already-safe fixed category, then re-sanitized
@@ -2073,10 +2089,9 @@ mod tests {
     fn account_decode(counters: &mut RunCounters, kind: PumpPortalDecodeKind) {
         counters.provider_errors += 1;
         counters.decode_errors += 1;
-        if matches!(
-            kind,
-            PumpPortalDecodeKind::NewTokenDeserialize | PumpPortalDecodeKind::NewTokenValidation
-        ) {
+        // AUDIT-001 §10/§11: mirror production exactly by delegating to the same pure
+        // predicate `record_decode_error` uses, so full AND partial create losses count.
+        if is_new_token_decode_kind(kind) {
             counters.new_token_decode_errors += 1;
         }
     }
@@ -2127,12 +2142,44 @@ mod tests {
         let mut c = RunCounters::default();
         account_decode(&mut c, PumpPortalDecodeKind::NewTokenDeserialize);
         account_decode(&mut c, PumpPortalDecodeKind::NewTokenValidation);
-        // Non-NewToken decode kinds do NOT bump the NewToken subset.
+        // AUDIT-001 §11: partial-create losses are ALSO terminal create losses and
+        // MUST count toward the modeling-census subset.
+        account_decode(&mut c, PumpPortalDecodeKind::PartialNewTokenDeserialize);
+        account_decode(&mut c, PumpPortalDecodeKind::PartialNewTokenValidation);
+        // Non-create decode kinds do NOT bump the create subset.
         account_decode(&mut c, PumpPortalDecodeKind::TradeDeserialize);
         account_decode(&mut c, PumpPortalDecodeKind::MigrationParse);
         account_decode(&mut c, PumpPortalDecodeKind::TradeValidation);
-        assert_eq!(c.new_token_decode_errors, 2);
-        assert_eq!(c.decode_errors, 5);
+        assert_eq!(c.new_token_decode_errors, 4);
+        assert_eq!(c.decode_errors, 7);
+    }
+
+    /// AUDIT-001 §11: the pure predicate classifies EVERY create-loss kind (full and
+    /// partial) as a NewToken decode, and NO non-create kind. This is the single
+    /// source of truth `record_decode_error` and `account_decode` both delegate to.
+    #[test]
+    fn test_is_new_token_decode_kind_covers_all_create_losses() {
+        assert!(is_new_token_decode_kind(
+            PumpPortalDecodeKind::NewTokenDeserialize
+        ));
+        assert!(is_new_token_decode_kind(
+            PumpPortalDecodeKind::NewTokenValidation
+        ));
+        assert!(is_new_token_decode_kind(
+            PumpPortalDecodeKind::PartialNewTokenDeserialize
+        ));
+        assert!(is_new_token_decode_kind(
+            PumpPortalDecodeKind::PartialNewTokenValidation
+        ));
+        assert!(!is_new_token_decode_kind(
+            PumpPortalDecodeKind::MigrationParse
+        ));
+        assert!(!is_new_token_decode_kind(
+            PumpPortalDecodeKind::TradeDeserialize
+        ));
+        assert!(!is_new_token_decode_kind(
+            PumpPortalDecodeKind::TradeValidation
+        ));
     }
 
     #[test]
