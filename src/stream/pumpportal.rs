@@ -506,9 +506,31 @@ pub struct NewTokenEvent {
     /// Provider observational SOL reserve figure (NOT canonical reserves).
     pub v_sol_in_bonding_curve: f64,
     pub market_cap_sol: f64,
+    /// Provider presentation metadata (OPTIONAL-ON-WIRE, P1-METADATA-DRAIN-TRUTH-001
+    /// §4): an ABSENT key defaults to the empty String (supported provider variant).
+    /// A present-but-wrong-type value (null/number/bool/array/object) still fails
+    /// String deserialization => NewTokenDeserialize DecodeError. Core identity/
+    /// economic fields above are NOT defaulted and remain strictly required.
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub symbol: String,
+    #[serde(default)]
     pub uri: String,
+}
+
+impl NewTokenEvent {
+    /// Pure availability check for provider presentation metadata (§6).
+    ///
+    /// Returns true iff all three provider metadata strings (name/symbol/uri) are
+    /// present and non-blank after trimming. No URL fetch, no URI validation, no
+    /// download — a pure inspection of the already-decoded strings. Research retains
+    /// metadata-less candidates; the live path uses this to skip them per-candidate.
+    pub fn has_complete_metadata(&self) -> bool {
+        !self.name.trim().is_empty()
+            && !self.symbol.trim().is_empty()
+            && !self.uri.trim().is_empty()
+    }
 }
 
 /// Trade event from PumpPortal.
@@ -2409,6 +2431,110 @@ mod tests {
             PumpPortalEvent::DecodeError(e) => {
                 assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenValidation);
                 assert_eq!(e.category, "new_token_validation");
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    // === P1-METADATA-DRAIN-TRUTH-001 §16 — optional presentation metadata ======
+
+    #[test]
+    fn test_new_token_missing_name_symbol_uri_is_supported() {
+        // A valid create with all core fields but NO name/symbol/uri keys must
+        // deserialize + validate => NewToken with empty metadata strings.
+        let mut v = full_new_token_json();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("name");
+        obj.remove("symbol");
+        obj.remove("uri");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::NewToken(ev) => {
+                assert_eq!(ev.name, "");
+                assert_eq!(ev.symbol, "");
+                assert_eq!(ev.uri, "");
+                assert!(!ev.has_complete_metadata());
+            }
+            other => panic!("expected NewToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_token_complete_metadata_helper_true() {
+        let v = full_new_token_json();
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::NewToken(ev) => {
+                assert!(ev.has_complete_metadata());
+            }
+            other => panic!("expected NewToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_token_blank_metadata_helper_false() {
+        // Whitespace-only metadata is unavailable => helper false.
+        let mut v = full_new_token_json();
+        v["name"] = serde_json::json!("  ");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::NewToken(ev) => {
+                assert!(!ev.has_complete_metadata());
+            }
+            other => panic!("expected NewToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_token_missing_required_market_cap_still_decode_error() {
+        let mut v = full_new_token_json();
+        v.as_object_mut().unwrap().remove("marketCapSol");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_token_missing_required_identity_still_decode_error() {
+        let mut v = full_new_token_json();
+        v.as_object_mut().unwrap().remove("mint");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_token_null_metadata_still_decode_error() {
+        // Present-but-null is a WRONG TYPE, not absence => serde String fails =>
+        // NewTokenDeserialize (serde(default) fills ABSENT keys only).
+        let mut v = full_new_token_json();
+        v["name"] = serde_json::Value::Null;
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_token_wrong_type_metadata_still_decode_error() {
+        // A number for a metadata String field is a wrong type => DecodeError.
+        let mut v = full_new_token_json();
+        v["symbol"] = serde_json::json!(123);
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
             }
             other => panic!("expected DecodeError, got {other:?}"),
         }
