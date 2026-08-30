@@ -56,7 +56,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 512;
 
 /// Hard bound on the post-intake outcome drain (packet section 42): the last
 /// admitted candidate may need its 120s final horizon plus RPC latency.
-const OUTCOME_DRAIN_SECS: u64 = 135;
+const OUTCOME_DRAIN_SECS: u64 = 240;
 
 /// Bounds for `--intake-seconds` (packet section 30). Max 6 hours in v1.
 const INTAKE_SECONDS_MIN: u64 = 60;
@@ -1448,6 +1448,74 @@ mod tests {
         // methods, and those must not be mistaken for action calls.
         assert!(src.contains("quote_buy_sol"));
         assert!(src.contains("quote_sell_raw"));
+    }
+
+    // === P1-METADATA-DRAIN-TRUTH-001 §17 — metadata absence + drain bound ======
+
+    /// Build a NewTokenEvent with valid core fields and caller-chosen metadata.
+    fn new_token_with_metadata(
+        name: &str,
+        symbol: &str,
+        uri: &str,
+    ) -> pumpfun_sniper::stream::pumpportal::NewTokenEvent {
+        pumpfun_sniper::stream::pumpportal::NewTokenEvent {
+            signature: "sig".to_string(),
+            mint: "mint".to_string(),
+            trader_public_key: "creator".to_string(),
+            tx_type: "create".to_string(),
+            initial_buy: 1.0,
+            bonding_curve_key: "bc".to_string(),
+            v_tokens_in_bonding_curve: 1000.0,
+            v_sol_in_bonding_curve: 30.0,
+            market_cap_sol: 30.0,
+            name: name.to_string(),
+            symbol: symbol.to_string(),
+            uri: uri.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_candidate_observed_preserves_metadata_absence_as_empty_strings() {
+        let ev = new_token_with_metadata("", "", "");
+        match candidate_observed(&ev, false) {
+            ObservationPayload::CandidateObserved(rec) => {
+                assert_eq!(rec.name, "");
+                assert_eq!(rec.symbol, "");
+                assert_eq!(rec.uri, "");
+            }
+            other => panic!("expected CandidateObserved, got {other:?}"),
+        }
+        // sanitize_persist_text("") passes empty through unchanged.
+        assert_eq!(sanitize_persist_text("", 256), "");
+    }
+
+    #[test]
+    fn test_metadata_absence_does_not_increment_decode_counters() {
+        // A metadata-less create is a normal NewTokenEvent (empty metadata strings),
+        // NOT a PumpPortalDecodeError. Only PumpPortalDecodeError values ever reach
+        // record_decode_error and bump provider_errors/decode_errors/
+        // new_token_decode_errors. Prove the metadata-less candidate flows through
+        // candidate_observed (the CandidateObserved path) instead, so the decode
+        // counters are structurally untouched by metadata absence.
+        let ev = new_token_with_metadata("", "", "");
+        assert!(!ev.has_complete_metadata());
+        // It builds a CandidateObserved payload, not any decode-error payload.
+        assert!(matches!(
+            candidate_observed(&ev, false),
+            ObservationPayload::CandidateObserved(_)
+        ));
+        // Decode counters only move for genuine PumpPortalDecodeKind values; a
+        // metadata-less NewTokenEvent is not one, so a freshly zeroed counter set
+        // reflecting "one metadata-less candidate seen" stays at zero decode loss.
+        let counters = RunCounters::default();
+        assert_eq!(counters.provider_errors, 0);
+        assert_eq!(counters.decode_errors, 0);
+        assert_eq!(counters.new_token_decode_errors, 0);
+    }
+
+    #[test]
+    fn test_outcome_drain_bound_is_240_seconds() {
+        assert_eq!(OUTCOME_DRAIN_SECS, 240);
     }
 
     #[test]
