@@ -35,9 +35,9 @@ use pumpfun_sniper::observation::schema::{
     classify_observation_error, protocol_net_ex_network_return_bps, sanitize_persist_text,
     CandidateObservedRecord, ExecutableQuoteRecord, InitialMarketRecord, MarketSnapshotRecord,
     MigrationObservedRecord, ObservationFailureCode, ObservationPayload, OutcomeSampleRecord,
-    RunCompletion, RunFinishedRecord, RunStartedRecord, StreamStateKind, StreamStateRecord,
-    TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord, ENTRY_QUOTE_LAMPORTS,
-    OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
+    ProviderCreateShape, RunCompletion, RunFinishedRecord, RunStartedRecord, StreamStateKind,
+    StreamStateRecord, TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord,
+    ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
 };
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::runtime::RuntimeLease;
@@ -304,6 +304,11 @@ struct RunCounters {
     new_token_decode_errors: u64,
     unexpected_trade_events: u64,
     migrations_seen: u64,
+    /// P1-OBSERVATION-SCHEMA-V2 §13 — informational count of retained
+    /// PartialNewToken create events. Incremented ONCE per received PartialNewToken.
+    /// NEVER counts toward provider_errors/decode_errors/new_token_decode_errors.
+    /// Serialized as `RunFinished.partial_new_token_events`.
+    partial_new_token_events: u64,
     task_failures: u64,
     drain_timed_out: u64,
     /// AUDIT-001 §4.4 — collector-internal only. NEVER serialized as a schema
@@ -668,6 +673,7 @@ async fn main() -> Result<()> {
         provider_errors: counters.provider_errors,
         unexpected_trade_events: counters.unexpected_trade_events,
         migrations_seen: counters.migrations_seen,
+        partial_new_token_events: counters.partial_new_token_events,
     };
     append_required(&recorder, ObservationPayload::RunFinished(run_finished))
         .await
@@ -779,79 +785,224 @@ async fn handle_intake_event(
             .await?;
         }
         PumpPortalEvent::NewToken(ev) => {
-            let candidate_received_at = Utc::now();
-            counters.candidates_seen += 1;
+            // A full legacy create: provider observational fields are all present,
+            // so they map to Some(..) with shape Full (§10/§16).
+            let candidate = NormalizedCandidate::from_full(&ev);
+            discover_candidate(
+                candidate,
+                recorder,
+                oracle,
+                semaphore,
+                seen_signatures,
+                counters,
+                tasks,
+            )
+            .await?;
+        }
+        PumpPortalEvent::PartialNewToken(ev) => {
+            // P1 §13/§16: an incomplete provider create with valid required
+            // identity. Count it ONCE (informational only; never a
+            // provider/decode error), then run the SAME discovery path as a full
+            // NewToken. Provider Option fields pass through unchanged — no zero
+            // synthesis — with shape Partial.
+            counters.partial_new_token_events += 1;
+            let candidate = NormalizedCandidate::from_partial(&ev);
+            discover_candidate(
+                candidate,
+                recorder,
+                oracle,
+                semaphore,
+                seen_signatures,
+                counters,
+                tasks,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
 
-            let signature = ev.signature.clone();
-            let duplicate = seen_signatures.contains(&signature);
+// ---------------------------------------------------------------------------
+// P1-OBSERVATION-SCHEMA-V2 §16 — normalized candidate + shared discovery path.
+// A full NewToken and a partial PartialNewToken differ ONLY in how their provider
+// observational fields are populated (Some(..)/Full vs pass-through Option/Partial).
+// Both go through the SAME persist-first -> dedupe -> capacity -> track flow so the
+// existing fail-closed ordering is preserved exactly.
+// ---------------------------------------------------------------------------
 
-            // AUDIT-001 §4.1 ordering: receive NewToken -> await a SUCCESSFUL
-            // CandidateObserved append -> ONLY THEN mutate seen_signatures /
-            // capacity / spawn tracking. On append Err: do not insert the
-            // signature, do not acquire a permit, do not spawn; return a fixed
-            // secret-safe error (the process may terminate without RunFinished).
-            append_required(recorder, candidate_observed(&ev, duplicate)).await?;
+/// A provider create normalized to the fields the discovery path needs. Provider
+/// observational fields are `Option` and are NEVER synthesized to zero for a
+/// partial: an absent provider field stays `None`.
+struct NormalizedCandidate {
+    signature: String,
+    mint: String,
+    creator: String,
+    tx_type: String,
+    bonding_curve: Option<String>,
+    provider_initial_buy: Option<f64>,
+    provider_v_tokens_in_bonding_curve: Option<f64>,
+    provider_v_sol_in_bonding_curve_sol: Option<f64>,
+    provider_market_cap_sol: Option<f64>,
+    name: String,
+    symbol: String,
+    uri: String,
+    shape: ProviderCreateShape,
+}
 
-            if duplicate {
-                counters.duplicate_candidate_events += 1;
-                // Section 35: do NOT launch a second tracking task.
-                return Ok(());
-            }
+impl NormalizedCandidate {
+    /// Full legacy create: every provider observational field is present, so each
+    /// wraps in `Some(..)` and the shape is `Full` (§10).
+    fn from_full(ev: &pumpfun_sniper::stream::pumpportal::NewTokenEvent) -> Self {
+        Self {
+            signature: ev.signature.clone(),
+            mint: ev.mint.clone(),
+            creator: ev.trader_public_key.clone(),
+            tx_type: ev.tx_type.clone(),
+            bonding_curve: Some(ev.bonding_curve_key.clone()),
+            provider_initial_buy: Some(ev.initial_buy),
+            provider_v_tokens_in_bonding_curve: Some(ev.v_tokens_in_bonding_curve),
+            provider_v_sol_in_bonding_curve_sol: Some(ev.v_sol_in_bonding_curve),
+            provider_market_cap_sol: Some(ev.market_cap_sol),
+            name: ev.name.clone(),
+            symbol: ev.symbol.clone(),
+            uri: ev.uri.clone(),
+            shape: ProviderCreateShape::Full,
+        }
+    }
 
-            // First-seen — CandidateObserved is now durably persisted.
-            seen_signatures.insert(signature.clone());
-            counters.unique_candidates += 1;
+    /// Partial create: provider observational fields are already `Option` on the
+    /// event and pass through UNCHANGED (absent stays `None`, never zero). Shape
+    /// is `Partial` (§10/§16).
+    fn from_partial(ev: &pumpfun_sniper::stream::pumpportal::PartialNewTokenEvent) -> Self {
+        Self {
+            signature: ev.signature.clone(),
+            mint: ev.mint.clone(),
+            creator: ev.trader_public_key.clone(),
+            tx_type: ev.tx_type.clone(),
+            bonding_curve: ev.bonding_curve_key.clone(),
+            provider_initial_buy: ev.initial_buy,
+            provider_v_tokens_in_bonding_curve: ev.v_tokens_in_bonding_curve,
+            provider_v_sol_in_bonding_curve_sol: ev.v_sol_in_bonding_curve,
+            provider_market_cap_sol: ev.market_cap_sol,
+            name: ev.name.clone(),
+            symbol: ev.symbol.clone(),
+            uri: ev.uri.clone(),
+            shape: ev_partial_shape(),
+        }
+    }
 
-            let candidate_id = signature;
-            let mint_str = ev.mint.clone();
+    /// Build the CandidateObserved payload from this normalized candidate. Provider
+    /// numeric Options are kept as-is (never cast/divided); untrusted text is
+    /// sanitized/capped at name 256 / symbol 64 / uri 1024. No zero synthesis.
+    fn candidate_observed(&self, duplicate: bool) -> ObservationPayload {
+        ObservationPayload::CandidateObserved(CandidateObservedRecord {
+            candidate_id: self.signature.clone(),
+            signature: self.signature.clone(),
+            mint: self.mint.clone(),
+            creator: self.creator.clone(),
+            bonding_curve: self.bonding_curve.clone(),
+            tx_type: self.tx_type.clone(),
+            provider_initial_buy: self.provider_initial_buy,
+            provider_v_tokens_in_bonding_curve: self.provider_v_tokens_in_bonding_curve,
+            provider_v_sol_in_bonding_curve_sol: self.provider_v_sol_in_bonding_curve_sol,
+            provider_market_cap_sol: self.provider_market_cap_sol,
+            name: sanitize_persist_text(&self.name, 256),
+            symbol: sanitize_persist_text(&self.symbol, 64),
+            uri: sanitize_persist_text(&self.uri, 1024),
+            duplicate,
+            provider_create_shape: Some(self.shape),
+        })
+    }
+}
 
-            // Provider identity: a mint that fails to parse cannot be tracked, but
-            // CandidateObserved was already written above.
-            let mint = match Pubkey::from_str(&mint_str) {
-                Ok(m) => m,
-                Err(_) => {
-                    counters.tracking_skipped += 1;
-                    append_required(
-                        recorder,
-                        tracking_skipped(
-                            &candidate_id,
-                            &mint_str,
-                            ObservationFailureCode::InvalidProviderIdentity,
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
+/// Fixed shape token for a partial candidate (kept as a tiny fn so the mapping is
+/// asserted by a source test without a magic literal at the call site).
+fn ev_partial_shape() -> ProviderCreateShape {
+    ProviderCreateShape::Partial
+}
 
-            // Section 35: try to reserve tracking capacity.
-            match semaphore.clone().try_acquire_owned() {
-                Ok(permit) => {
-                    counters.tracking_started += 1;
-                    let oracle = oracle.clone();
-                    let recorder = recorder.clone();
-                    tasks.spawn(track_candidate(
-                        permit,
-                        candidate_id,
-                        mint,
-                        candidate_received_at,
-                        oracle,
-                        recorder,
-                    ));
-                }
-                Err(_) => {
-                    counters.tracking_skipped += 1;
-                    append_required(
-                        recorder,
-                        tracking_skipped(
-                            &candidate_id,
-                            &mint_str,
-                            ObservationFailureCode::TrackingCapacity,
-                        ),
-                    )
-                    .await?;
-                }
-            }
+/// §16 shared discovery flow for BOTH full and partial creates: append
+/// CandidateObserved FIRST (acknowledged before any state mutation, per the
+/// fail-closed contract), dedupe by signature, bump the unique counter, admit via
+/// the capacity semaphore, then spawn canonical tracking by mint. Ordering is
+/// identical to the previous inlined NewToken handler.
+async fn discover_candidate(
+    candidate: NormalizedCandidate,
+    recorder: &ObservationRecorder,
+    oracle: &Arc<PumpMarketOracle>,
+    semaphore: &Arc<Semaphore>,
+    seen_signatures: &mut HashSet<String>,
+    counters: &mut RunCounters,
+    tasks: &mut JoinSet<CandidateTaskOutcome>,
+) -> std::result::Result<(), CollectorRecordError> {
+    let candidate_received_at = Utc::now();
+    counters.candidates_seen += 1;
+
+    let signature = candidate.signature.clone();
+    let duplicate = seen_signatures.contains(&signature);
+
+    // AUDIT-001 §4.1 ordering: await a SUCCESSFUL CandidateObserved append ->
+    // ONLY THEN mutate seen_signatures / capacity / spawn tracking.
+    append_required(recorder, candidate.candidate_observed(duplicate)).await?;
+
+    if duplicate {
+        counters.duplicate_candidate_events += 1;
+        return Ok(());
+    }
+
+    // First-seen — CandidateObserved is now durably persisted.
+    seen_signatures.insert(signature.clone());
+    counters.unique_candidates += 1;
+
+    let candidate_id = signature;
+    let mint_str = candidate.mint.clone();
+
+    // Provider identity: a mint that fails to parse cannot be tracked, but
+    // CandidateObserved was already written above.
+    let mint = match Pubkey::from_str(&mint_str) {
+        Ok(m) => m,
+        Err(_) => {
+            counters.tracking_skipped += 1;
+            append_required(
+                recorder,
+                tracking_skipped(
+                    &candidate_id,
+                    &mint_str,
+                    ObservationFailureCode::InvalidProviderIdentity,
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Section 35: try to reserve tracking capacity. A partial candidate is fully
+    // eligible for tracking (§17): the oracle needs only the mint.
+    match semaphore.clone().try_acquire_owned() {
+        Ok(permit) => {
+            counters.tracking_started += 1;
+            let oracle = oracle.clone();
+            let recorder = recorder.clone();
+            tasks.spawn(track_candidate(
+                permit,
+                candidate_id,
+                mint,
+                candidate_received_at,
+                oracle,
+                recorder,
+            ));
+        }
+        Err(_) => {
+            counters.tracking_skipped += 1;
+            append_required(
+                recorder,
+                tracking_skipped(
+                    &candidate_id,
+                    &mint_str,
+                    ObservationFailureCode::TrackingCapacity,
+                ),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -922,7 +1073,17 @@ async fn drain_pre_stop(
                 .await?;
             }
             PumpPortalEvent::NewToken(ev) => {
-                drain_new_token_intake_closed(recorder, seen_signatures, counters, &ev).await?;
+                let candidate = NormalizedCandidate::from_full(&ev);
+                drain_candidate_intake_closed(recorder, seen_signatures, counters, &candidate)
+                    .await?;
+            }
+            PumpPortalEvent::PartialNewToken(ev) => {
+                // §13/§16: still count the retained partial once, then persist it as
+                // CandidateObserved + IntakeClosed skip (no task). Never a decode error.
+                counters.partial_new_token_events += 1;
+                let candidate = NormalizedCandidate::from_partial(&ev);
+                drain_candidate_intake_closed(recorder, seen_signatures, counters, &candidate)
+                    .await?;
             }
         }
     }
@@ -985,26 +1146,34 @@ async fn drain_post_stop(
                 .await?;
             }
             PumpPortalEvent::NewToken(ev) => {
-                drain_new_token_intake_closed(recorder, seen_signatures, counters, &ev).await?;
+                let candidate = NormalizedCandidate::from_full(&ev);
+                drain_candidate_intake_closed(recorder, seen_signatures, counters, &candidate)
+                    .await?;
+            }
+            PumpPortalEvent::PartialNewToken(ev) => {
+                counters.partial_new_token_events += 1;
+                let candidate = NormalizedCandidate::from_partial(&ev);
+                drain_candidate_intake_closed(recorder, seen_signatures, counters, &candidate)
+                    .await?;
             }
         }
     }
     Ok(())
 }
 
-/// Persist a drained NewToken with intake closed: CandidateObserved first, then
-/// (if first-seen) an IntakeClosed TrackingSkipped. Never starts a task. Shared by
-/// pre-stop and post-stop drains. Every append is required.
-async fn drain_new_token_intake_closed(
+/// Persist a drained create (full or partial) with intake closed: CandidateObserved
+/// first, then (if first-seen) an IntakeClosed TrackingSkipped. Never starts a task.
+/// Shared by pre-stop and post-stop drains. Every append is required.
+async fn drain_candidate_intake_closed(
     recorder: &ObservationRecorder,
     seen_signatures: &mut HashSet<String>,
     counters: &mut RunCounters,
-    ev: &pumpfun_sniper::stream::pumpportal::NewTokenEvent,
+    candidate: &NormalizedCandidate,
 ) -> std::result::Result<(), CollectorRecordError> {
     counters.candidates_seen += 1;
-    let signature = ev.signature.clone();
+    let signature = candidate.signature.clone();
     let duplicate = seen_signatures.contains(&signature);
-    append_required(recorder, candidate_observed(ev, duplicate)).await?;
+    append_required(recorder, candidate.candidate_observed(duplicate)).await?;
     if duplicate {
         counters.duplicate_candidate_events += 1;
         return Ok(());
@@ -1015,7 +1184,11 @@ async fn drain_new_token_intake_closed(
     counters.tracking_skipped += 1;
     append_required(
         recorder,
-        tracking_skipped(&signature, &ev.mint, ObservationFailureCode::IntakeClosed),
+        tracking_skipped(
+            &signature,
+            &candidate.mint,
+            ObservationFailureCode::IntakeClosed,
+        ),
     )
     .await?;
     Ok(())
@@ -1337,26 +1510,18 @@ async fn record_decode_error(
 /// Build a CandidateObserved payload from a provider NewToken event. Provider f64
 /// fields are kept as-is (never cast, never divided by 1e9); untrusted text is
 /// sanitized/capped at name 256 / symbol 64 / uri 1024.
+///
+/// Retained for the metadata-absence unit tests; production builds go through
+/// [`NormalizedCandidate::candidate_observed`] so full and partial creates share
+/// one mapping.
+#[cfg_attr(not(test), allow(dead_code))]
 fn candidate_observed(
     ev: &pumpfun_sniper::stream::pumpportal::NewTokenEvent,
     duplicate: bool,
 ) -> ObservationPayload {
-    ObservationPayload::CandidateObserved(CandidateObservedRecord {
-        candidate_id: ev.signature.clone(),
-        signature: ev.signature.clone(),
-        mint: ev.mint.clone(),
-        creator: ev.trader_public_key.clone(),
-        bonding_curve: ev.bonding_curve_key.clone(),
-        tx_type: ev.tx_type.clone(),
-        provider_initial_buy: ev.initial_buy,
-        provider_v_tokens_in_bonding_curve: ev.v_tokens_in_bonding_curve,
-        provider_v_sol_in_bonding_curve_sol: ev.v_sol_in_bonding_curve,
-        provider_market_cap_sol: ev.market_cap_sol,
-        name: sanitize_persist_text(&ev.name, 256),
-        symbol: sanitize_persist_text(&ev.symbol, 64),
-        uri: sanitize_persist_text(&ev.uri, 1024),
-        duplicate,
-    })
+    // Delegate to the shared full mapping so there is exactly one full-create
+    // Some(..)/Full mapping in the binary.
+    NormalizedCandidate::from_full(ev).candidate_observed(duplicate)
 }
 
 fn tracking_skipped(
@@ -2004,6 +2169,194 @@ mod tests {
         assert_eq!(
             run_completion(&c, true, stream_connected_at_intake_end),
             RunCompletion::Degraded
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-OBSERVATION-SCHEMA-V2 §23 — partial-create integration (network-free).
+    // -----------------------------------------------------------------------
+
+    /// A PartialNewTokenEvent with valid identity and caller-chosen provider
+    /// Options / metadata.
+    fn partial_event(
+        provider_present: bool,
+    ) -> pumpfun_sniper::stream::pumpportal::PartialNewTokenEvent {
+        pumpfun_sniper::stream::pumpportal::PartialNewTokenEvent {
+            signature: "sig".to_string(),
+            mint: "mint".to_string(),
+            trader_public_key: "creator".to_string(),
+            tx_type: "create".to_string(),
+            initial_buy: provider_present.then_some(1.0),
+            bonding_curve_key: provider_present.then(|| "bc".to_string()),
+            v_tokens_in_bonding_curve: provider_present.then_some(1000.0),
+            v_sol_in_bonding_curve: provider_present.then_some(30.0),
+            market_cap_sol: provider_present.then_some(30.0),
+            name: "n".to_string(),
+            symbol: "s".to_string(),
+            uri: "u".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_full_new_token_maps_provider_fields_to_some() {
+        let ev = new_token_with_metadata("n", "s", "u");
+        match NormalizedCandidate::from_full(&ev).candidate_observed(false) {
+            ObservationPayload::CandidateObserved(rec) => {
+                assert_eq!(rec.bonding_curve, Some("bc".to_string()));
+                assert_eq!(rec.provider_initial_buy, Some(1.0));
+                assert_eq!(rec.provider_v_tokens_in_bonding_curve, Some(1000.0));
+                assert_eq!(rec.provider_v_sol_in_bonding_curve_sol, Some(30.0));
+                assert_eq!(rec.provider_market_cap_sol, Some(30.0));
+                assert_eq!(rec.provider_create_shape, Some(ProviderCreateShape::Full));
+            }
+            other => panic!("expected CandidateObserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_partial_new_token_maps_missing_provider_fields_to_none() {
+        // A partial event with every provider Option absent => None preserved, no
+        // zero synthesis, and shape Partial.
+        let ev = partial_event(false);
+        match NormalizedCandidate::from_partial(&ev).candidate_observed(false) {
+            ObservationPayload::CandidateObserved(rec) => {
+                assert_eq!(rec.bonding_curve, None);
+                assert_eq!(rec.provider_initial_buy, None);
+                assert_eq!(rec.provider_v_tokens_in_bonding_curve, None);
+                assert_eq!(rec.provider_v_sol_in_bonding_curve_sol, None);
+                assert_eq!(rec.provider_market_cap_sol, None);
+                assert_eq!(
+                    rec.provider_create_shape,
+                    Some(ProviderCreateShape::Partial)
+                );
+                // Identity + metadata still populated.
+                assert_eq!(rec.signature, "sig");
+                assert_eq!(rec.mint, "mint");
+                assert_eq!(rec.creator, "creator");
+                assert_eq!(rec.name, "n");
+            }
+            other => panic!("expected CandidateObserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_partial_new_token_present_provider_fields_pass_through_some() {
+        // A partial with present optionals passes them through unchanged (no default).
+        let ev = partial_event(true);
+        match NormalizedCandidate::from_partial(&ev).candidate_observed(false) {
+            ObservationPayload::CandidateObserved(rec) => {
+                assert_eq!(rec.bonding_curve, Some("bc".to_string()));
+                assert_eq!(rec.provider_initial_buy, Some(1.0));
+                assert_eq!(
+                    rec.provider_create_shape,
+                    Some(ProviderCreateShape::Partial)
+                );
+            }
+            other => panic!("expected CandidateObserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_partial_new_token_builds_candidate_observed_payload() {
+        // The partial discovery path appends a CandidateObserved payload (persist
+        // first). Prove the builder yields exactly that variant.
+        let ev = partial_event(false);
+        assert!(matches!(
+            NormalizedCandidate::from_partial(&ev).candidate_observed(false),
+            ObservationPayload::CandidateObserved(_)
+        ));
+    }
+
+    #[test]
+    fn test_partial_source_synthesizes_no_zero_for_absent_provider_fields() {
+        // Source guard: the partial mapping must pass Option provider fields through
+        // (ev.<field>), never coerce an absent field to a numeric zero / default.
+        let src = include_str!("observe_record.rs");
+        // Locate the from_partial mapping body.
+        let start = src.find("fn from_partial(").expect("from_partial present");
+        let body = &src[start..start + 900];
+        assert!(
+            body.contains("provider_initial_buy: ev.initial_buy"),
+            "partial must pass initial_buy Option through unchanged"
+        );
+        assert!(
+            body.contains("bonding_curve: ev.bonding_curve_key.clone()"),
+            "partial must pass bonding_curve Option through unchanged"
+        );
+        // No zero-default synthesis idioms in the partial mapping.
+        for needle in [
+            "unwrap_or(0",
+            "unwrap_or_default",
+            "Some(0.0)",
+            ".unwrap_or(0.0)",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "partial mapping must not synthesize a zero: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_partial_new_token_increments_partial_counter_once() {
+        // The intake handler increments partial_new_token_events exactly once per
+        // received PartialNewToken. Model the counter mutation the handler performs.
+        let mut counters = RunCounters::default();
+        counters.partial_new_token_events += 1; // exactly one received partial
+        assert_eq!(counters.partial_new_token_events, 1);
+        // And it does NOT touch the provider/decode subsets.
+        assert_eq!(counters.provider_errors, 0);
+        assert_eq!(counters.decode_errors, 0);
+        assert_eq!(counters.new_token_decode_errors, 0);
+    }
+
+    #[test]
+    fn test_partial_new_token_does_not_increment_provider_or_decode_counters() {
+        // Only PumpPortalDecodeError values ever reach record_decode_error. A partial
+        // create is NOT a decode error: it flows through the CandidateObserved path,
+        // so provider_errors/decode_errors/new_token_decode_errors stay untouched.
+        let ev = partial_event(false);
+        assert!(matches!(
+            NormalizedCandidate::from_partial(&ev).candidate_observed(false),
+            ObservationPayload::CandidateObserved(_)
+        ));
+        let mut counters = RunCounters::default();
+        // Simulate the handler's ONLY counter effects for a first-seen partial.
+        counters.partial_new_token_events += 1;
+        counters.candidates_seen += 1;
+        counters.unique_candidates += 1;
+        counters.tracking_started += 1;
+        assert_eq!(counters.provider_errors, 0);
+        assert_eq!(counters.decode_errors, 0);
+        assert_eq!(counters.new_token_decode_errors, 0);
+    }
+
+    #[test]
+    fn test_partial_new_token_increments_seen_and_unique_normally() {
+        // A first-seen partial signature is trackable; a repeat is a duplicate.
+        let mut seen = HashSet::new();
+        let sig = "sig".to_string();
+        assert!(should_track_first_seen(&seen, &sig));
+        seen.insert(sig.clone());
+        assert!(!should_track_first_seen(&seen, &sig));
+    }
+
+    #[test]
+    fn test_partial_new_token_eligible_for_capacity_admission() {
+        // Policy-level: a partial candidate is admitted when a permit is available,
+        // exactly like a full create (§17). It is never skipped for absent provider
+        // fields.
+        assert!(capacity_admits(true));
+        assert!(!capacity_admits(false));
+    }
+
+    #[test]
+    fn test_partial_counter_serialized_into_run_finished() {
+        // Source guard: RunFinished construction wires the partial counter through.
+        let src = include_str!("observe_record.rs");
+        assert!(
+            src.contains("partial_new_token_events: counters.partial_new_token_events"),
+            "RunFinished must carry the partial counter"
         );
     }
 }

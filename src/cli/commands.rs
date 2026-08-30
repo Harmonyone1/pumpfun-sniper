@@ -2808,6 +2808,19 @@ pub async fn start(config: &Config, dry_run: bool) -> Result<()> {
                             );
                         }
                     }
+                    PumpPortalEvent::PartialNewToken(_) => {
+                        // P1-OBSERVATION-SCHEMA-V2 §20: an incomplete provider create
+                        // (valid identity, absent provider observational fields) is
+                        // enough for research discovery but NOT for the live
+                        // strategy/filter inputs. Skip THIS candidate only, in both
+                        // dry-run and live. This must NOT set data_stream_ready=false,
+                        // NOT set new_entries_halted=true, NOT enter filter/scoring/
+                        // sizing/quote, NOT submit anything, and NOT touch positions/
+                        // exits. It is a candidate-specific skip BEFORE any economic
+                        // path. A true DecodeError still global-halts live (below).
+                        tracing::warn!("Partial provider create (incomplete fields); skipping candidate for live");
+                        continue;
+                    }
                     PumpPortalEvent::Trade(trade) => {
                         // PumpPortal TradeEvent.sol_amount is ALREADY in SOL (see
                         // stream::pumpportal). Do NOT divide by 1e9.
