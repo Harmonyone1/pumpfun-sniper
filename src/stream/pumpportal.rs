@@ -71,8 +71,9 @@ pub const PUMPPORTAL_WS_URL: &str = "wss://pumpportal.fun/api/data";
 /// All error strings are built from the SANITIZED base only (scheme + host +
 /// path, query stripped) so an accidental secret in the base never leaks.
 pub fn build_connection_url(base_url: &str, api_key: &str) -> Result<url::Url> {
-    let mut url = url::Url::parse(base_url)
-        .map_err(|_| Error::Config("Invalid PumpPortal ws_url (could not parse base)".to_string()))?;
+    let mut url = url::Url::parse(base_url).map_err(|_| {
+        Error::Config("Invalid PumpPortal ws_url (could not parse base)".to_string())
+    })?;
 
     // Sanitized form for any error message: scheme://host/path, no query/fragment,
     // no userinfo. Built via the shared helper so no secret ever leaks.
@@ -546,6 +547,33 @@ pub struct MigrationEvent {
     pub received_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Local provider-message decode/schema-loss class (P1-PROVIDER-DECODE-TRUTH-001
+/// §3). Distinguishes WHICH strict decode path rejected a live message. This is
+/// NOT a provider/transport health failure — it is a dropped candidate whose wire
+/// shape did not match the frozen strict schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpPortalDecodeKind {
+    /// A `txType=create` message failed strict `NewTokenEvent` deserialization.
+    NewTokenDeserialize,
+    /// A `NewTokenEvent` deserialized but failed identity/numeric validation.
+    NewTokenValidation,
+    /// A migration message failed structural parse.
+    MigrationParse,
+    /// A `txType=buy|sell` message failed strict `TradeEvent` deserialization.
+    TradeDeserialize,
+    /// A `TradeEvent` deserialized but failed identity/numeric validation.
+    TradeValidation,
+}
+
+/// A typed, secret-safe decode/schema-loss diagnostic (§3). `category` is a FIXED
+/// structural token (never raw provider JSON, field values, or error text) bounded
+/// to <=256 bytes, ASCII-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpPortalDecodeError {
+    pub kind: PumpPortalDecodeKind,
+    pub category: String,
+}
+
 /// Event from PumpPortal WebSocket.
 #[derive(Debug, Clone)]
 pub enum PumpPortalEvent {
@@ -559,9 +587,15 @@ pub enum PumpPortalEvent {
     Connected,
     /// Disconnected from WebSocket.
     Disconnected,
-    /// Provider/server error (auth, balance, invalid sub, rate/ban) or stream
-    /// parse error. Sanitized; never contains the API key.
+    /// HARD provider/server/stream operational error ONLY (auth, balance, invalid
+    /// sub, rate/ban, max-reconnect, other sanitized operational errors). Sanitized;
+    /// never contains the API key. Local message decode/schema loss is NOT this —
+    /// see [`PumpPortalEvent::DecodeError`] (§3-4).
     Error(String),
+    /// LOCAL provider-message decode/schema-loss (§3/§5): a single dropped
+    /// candidate whose wire shape failed strict decode/validation. NOT a hard
+    /// provider/transport failure.
+    DecodeError(PumpPortalDecodeError),
 }
 
 /// Configuration for PumpPortal client.
@@ -859,9 +893,7 @@ impl PumpPortalClient {
         let (ws_stream, _) = connect_async(url).await.map_err(|_| {
             // NEVER interpolate the tungstenite error: it can reference the full
             // request URL (with the api-key query). Report the sanitized base only.
-            Error::ShredStreamConnection(format!(
-                "PumpPortal connect failed for base {safe_base}"
-            ))
+            Error::ShredStreamConnection(format!("PumpPortal connect failed for base {safe_base}"))
         })?;
 
         info!("Connected to PumpPortal WebSocket");
@@ -1044,74 +1076,25 @@ impl PumpPortalClient {
         // 2. Migration. Either an explicit migrate txType, or a txType-less
         //    message carrying a mint plus pool-ish fields.
         let is_migration = tx_type == "migrate"
-            || (tx_type.is_empty()
-                && value.get("mint").is_some()
-                && looks_like_migration(&value));
+            || (tx_type.is_empty() && value.get("mint").is_some() && looks_like_migration(&value));
         if is_migration {
-            match parse_migration(&value) {
-                Ok(ev) => {
-                    let _ = event_tx.send(PumpPortalEvent::Migration(ev)).await;
-                }
-                Err(e) => {
-                    warn!("Dropped malformed migration event: {}", e);
-                    let _ = event_tx
-                        .send(PumpPortalEvent::Error(format!("migration parse error: {e}")))
-                        .await;
-                }
-            }
+            // §5: a migration parse failure is LOCAL schema loss, not a hard
+            // provider error.
+            let _ = event_tx.send(classify_migration(&value)).await;
             return Ok(());
         }
 
-        // 3. New token.
+        // 3. New token. §5: serde/validation failures are typed DecodeError
+        //    (schema loss), NOT hard provider Error.
         if tx_type == "create" {
-            match serde_json::from_str::<NewTokenEvent>(text) {
-                Ok(ev) => match validate_new_token(&ev) {
-                    Ok(()) => {
-                        debug!("New token: {} ({}) - {}", ev.name, ev.symbol, ev.mint);
-                        let _ = event_tx.send(PumpPortalEvent::NewToken(ev)).await;
-                    }
-                    Err(e) => {
-                        warn!("Dropped malformed new-token event: {}", e);
-                        let _ = event_tx
-                            .send(PumpPortalEvent::Error(format!("new-token parse error: {e}")))
-                            .await;
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to deserialize new-token event: {}", e);
-                    let _ = event_tx
-                        .send(PumpPortalEvent::Error("new-token deserialize error".to_string()))
-                        .await;
-                }
-            }
+            let _ = event_tx.send(classify_new_token(text, &value)).await;
             return Ok(());
         }
 
-        // 4. Trade (buy/sell).
+        // 4. Trade (buy/sell). §5: serde/validation failures are typed
+        //    DecodeError (schema loss), NOT hard provider Error.
         if tx_type == "buy" || tx_type == "sell" {
-            match serde_json::from_str::<TradeEvent>(text) {
-                Ok(ev) => match validate_trade(&ev) {
-                    Ok(()) => {
-                        info!(
-                            "Trade parsed: {} {} (provider UI tokens) {} for {} SOL",
-                            ev.tx_type, ev.token_amount, ev.mint, ev.sol_amount
-                        );
-                        let _ = event_tx.send(PumpPortalEvent::Trade(ev)).await;
-                    }
-                    Err(e) => {
-                        warn!("Dropped malformed trade event: {}", e);
-                        let _ = event_tx
-                            .send(PumpPortalEvent::Error(format!("trade parse error: {e}")))
-                            .await;
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to deserialize trade event: {}", e);
-                    let _ = event_tx
-                        .send(PumpPortalEvent::Error("trade deserialize error".to_string()))
-                        .await;
-                }
-            }
+            let _ = event_tx.send(classify_trade(text)).await;
             return Ok(());
         }
 
@@ -1197,11 +1180,198 @@ fn classify_provider_error(lower: &str) -> &'static str {
     }
 }
 
+/// Maximum byte length of any emitted decode category (§6).
+const DECODE_CATEGORY_MAX: usize = 256;
+
+/// Expected STRING fields of `NewTokenEvent`, in fixed declaration order (§6).
+const NEW_TOKEN_STRING_FIELDS: &[&str] = &[
+    "signature",
+    "mint",
+    "traderPublicKey",
+    "txType",
+    "bondingCurveKey",
+    "name",
+    "symbol",
+    "uri",
+];
+
+/// Expected NUMBER fields of `NewTokenEvent`, in fixed declaration order (§6).
+const NEW_TOKEN_NUMBER_FIELDS: &[&str] = &[
+    "initialBuy",
+    "vTokensInBondingCurve",
+    "vSolInBondingCurve",
+    "marketCapSol",
+];
+
+/// Fixed JSON-type label for a value, from the closed set
+/// {null,bool,number,string,array,object} (§6). Absence is handled by the caller
+/// (which reports `missing`), so this never returns `missing`.
+fn json_type_label(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// §6: pure, secret-safe structural diagnostic for a `txType=create` message that
+/// failed strict `NewTokenEvent` deserialization.
+///
+/// Inspects ONLY presence + JSON type of each EXPECTED (compile-time allowlisted)
+/// field. Output is `new_token_deserialize` plus an optional `|missing=<...>` list
+/// (fixed order) and an optional `|wrong_type=<field:jsontype,...>` list (fixed
+/// order). A non-object value yields `new_token_deserialize|shape=unknown`. NO
+/// unknown/extra field names, NO raw JSON, NO provider values, ASCII-only, and the
+/// result is bounded to <=256 bytes by dropping later fixed tokens (never by
+/// byte-slicing arbitrary UTF-8 — the whole output is ASCII regardless).
+fn diagnose_new_token_shape(value: &serde_json::Value) -> String {
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return "new_token_deserialize|shape=unknown".to_string(),
+    };
+
+    // A field is "missing" if absent; "wrong_type" if present but its JSON type is
+    // not in the expected group (string vs number).
+    let mut missing: Vec<&'static str> = Vec::new();
+    let mut wrong_type: Vec<String> = Vec::new();
+
+    for &field in NEW_TOKEN_STRING_FIELDS {
+        match obj.get(field) {
+            None => missing.push(field),
+            Some(v) => {
+                if !v.is_string() {
+                    wrong_type.push(format!("{field}:{}", json_type_label(v)));
+                }
+            }
+        }
+    }
+    for &field in NEW_TOKEN_NUMBER_FIELDS {
+        match obj.get(field) {
+            None => missing.push(field),
+            Some(v) => {
+                if !v.is_number() {
+                    wrong_type.push(format!("{field}:{}", json_type_label(v)));
+                }
+            }
+        }
+    }
+
+    // Assemble fixed tokens in order: base, then missing, then wrong_type. If the
+    // total would exceed the cap, drop later fixed tokens (wrong_type before
+    // missing) rather than truncate mid-token.
+    let base = "new_token_deserialize".to_string();
+    let missing_tok = if missing.is_empty() {
+        None
+    } else {
+        Some(format!("|missing={}", missing.join(",")))
+    };
+    let wrong_tok = if wrong_type.is_empty() {
+        None
+    } else {
+        Some(format!("|wrong_type={}", wrong_type.join(",")))
+    };
+
+    let mut out = base;
+    if let Some(m) = &missing_tok {
+        if out.len() + m.len() <= DECODE_CATEGORY_MAX {
+            out.push_str(m);
+        }
+    }
+    if let Some(w) = &wrong_tok {
+        if out.len() + w.len() <= DECODE_CATEGORY_MAX {
+            out.push_str(w);
+        }
+    }
+    out
+}
+
+/// §5: classify a `txType=create` message into either a `NewToken` event or a
+/// typed `DecodeError`. Pure (no socket): serde failure => `NewTokenDeserialize`
+/// with a structural shape category; serde-ok but validation failure =>
+/// `NewTokenValidation` with the fixed category `new_token_validation`.
+fn classify_new_token(text: &str, value: &serde_json::Value) -> PumpPortalEvent {
+    match serde_json::from_str::<NewTokenEvent>(text) {
+        Ok(ev) => match validate_new_token(&ev) {
+            Ok(()) => {
+                debug!("New token: {} ({}) - {}", ev.name, ev.symbol, ev.mint);
+                PumpPortalEvent::NewToken(ev)
+            }
+            Err(_) => {
+                // AUDIT-001 §4: never interpolate the validation error Display — it
+                // can carry rejected provider values (invalid mint/pubkey/signature).
+                warn!("PumpPortal NewToken validation loss");
+                PumpPortalEvent::DecodeError(PumpPortalDecodeError {
+                    kind: PumpPortalDecodeKind::NewTokenValidation,
+                    category: "new_token_validation".to_string(),
+                })
+            }
+        },
+        Err(_) => {
+            // The structural category is value-free (§6); safe to log. Never log the
+            // serde error Display, which may render offending provider field values.
+            let category = diagnose_new_token_shape(value);
+            warn!("PumpPortal NewToken decode/schema loss: {}", category);
+            PumpPortalEvent::DecodeError(PumpPortalDecodeError {
+                kind: PumpPortalDecodeKind::NewTokenDeserialize,
+                category,
+            })
+        }
+    }
+}
+
+/// §5: classify a `txType=buy|sell` message into either a `Trade` event or a typed
+/// `DecodeError`. Pure: serde failure => `TradeDeserialize` (`trade_deserialize`);
+/// serde-ok but validation failure => `TradeValidation` (`trade_validation`).
+fn classify_trade(text: &str) -> PumpPortalEvent {
+    match serde_json::from_str::<TradeEvent>(text) {
+        Ok(ev) => match validate_trade(&ev) {
+            Ok(()) => {
+                info!(
+                    "Trade parsed: {} {} (provider UI tokens) {} for {} SOL",
+                    ev.tx_type, ev.token_amount, ev.mint, ev.sol_amount
+                );
+                PumpPortalEvent::Trade(ev)
+            }
+            Err(_) => {
+                warn!("PumpPortal trade validation loss");
+                PumpPortalEvent::DecodeError(PumpPortalDecodeError {
+                    kind: PumpPortalDecodeKind::TradeValidation,
+                    category: "trade_validation".to_string(),
+                })
+            }
+        },
+        Err(_) => {
+            warn!("PumpPortal trade deserialize loss");
+            PumpPortalEvent::DecodeError(PumpPortalDecodeError {
+                kind: PumpPortalDecodeKind::TradeDeserialize,
+                category: "trade_deserialize".to_string(),
+            })
+        }
+    }
+}
+
+/// §5: classify a migration message into either a `Migration` event or a typed
+/// `DecodeError`. Pure: parse failure => `MigrationParse` (`migration_parse`), no
+/// raw parse string.
+fn classify_migration(value: &serde_json::Value) -> PumpPortalEvent {
+    match parse_migration(value) {
+        Ok(ev) => PumpPortalEvent::Migration(ev),
+        Err(_) => {
+            warn!("PumpPortal migration parse loss");
+            PumpPortalEvent::DecodeError(PumpPortalDecodeError {
+                kind: PumpPortalDecodeKind::MigrationParse,
+                category: "migration_parse".to_string(),
+            })
+        }
+    }
+}
+
 /// Heuristic: a message with mint + pool-ish fields but no buy/sell txType.
 fn looks_like_migration(value: &serde_json::Value) -> bool {
-    value.get("pool").is_some()
-        || value.get("poolId").is_some()
-        || value.get("pool_id").is_some()
+    value.get("pool").is_some() || value.get("poolId").is_some() || value.get("pool_id").is_some()
 }
 
 /// Parse a migration message minimally/flexibly.
@@ -1416,14 +1586,10 @@ mod tests {
             token_trades: vec![VALID_PK_1.to_string()],
             account_trades: vec![],
         };
-        let mut reg = SubscriptionRegistry::from_plan(
-            &plan,
-            &[VALID_PK_1.to_string()],
-            &[],
-        );
+        let mut reg = SubscriptionRegistry::from_plan(&plan, &[VALID_PK_1.to_string()], &[]);
         // Dynamically add a second token.
         reg.apply(&SubscriptionCommand::SubscribeTokenTrades(vec![
-            VALID_PK_2.to_string(),
+            VALID_PK_2.to_string()
         ]));
         // Replay (as would happen on reconnect) must include both.
         let msgs = reg.replay_messages();
@@ -1597,11 +1763,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_command_updates_desired_state_before_socket_consumes_notification() {
-        let (sender, desired, mut notify_rx) =
-            make_sender(true, SubscriptionRegistry::default());
+        let (sender, desired, mut notify_rx) = make_sender(true, SubscriptionRegistry::default());
         sender
             .send(SubscriptionCommand::SubscribeTokenTrades(vec![
-                VALID_PK_1.to_string(),
+                VALID_PK_1.to_string()
             ]))
             .await
             .unwrap();
@@ -1615,11 +1780,10 @@ mod tests {
     async fn test_command_queued_while_disconnected_is_visible_to_replay() {
         // No worker draining; simulates socket down. Desired must still update so
         // the next reconnect replay carries it.
-        let (sender, desired, _notify_rx) =
-            make_sender(true, SubscriptionRegistry::default());
+        let (sender, desired, _notify_rx) = make_sender(true, SubscriptionRegistry::default());
         sender
             .send(SubscriptionCommand::SubscribeTokenTrades(vec![
-                VALID_PK_2.to_string(),
+                VALID_PK_2.to_string()
             ]))
             .await
             .unwrap();
@@ -1642,13 +1806,13 @@ mod tests {
         let (sender, desired, _n) = make_sender(true, SubscriptionRegistry::default());
         sender
             .send(SubscriptionCommand::SubscribeTokenTrades(vec![
-                VALID_PK_1.to_string(),
+                VALID_PK_1.to_string()
             ]))
             .await
             .unwrap();
         sender
             .send(SubscriptionCommand::SubscribeTokenTrades(vec![
-                VALID_PK_2.to_string(),
+                VALID_PK_2.to_string()
             ]))
             .await
             .unwrap();
@@ -1700,11 +1864,10 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_trade_command_without_api_key_rejected() {
         // api_key_present = false => metered trade command rejected BEFORE mutation.
-        let (sender, desired, mut notify_rx) =
-            make_sender(false, SubscriptionRegistry::default());
+        let (sender, desired, mut notify_rx) = make_sender(false, SubscriptionRegistry::default());
         let err = sender
             .send(SubscriptionCommand::SubscribeTokenTrades(vec![
-                VALID_PK_1.to_string(),
+                VALID_PK_1.to_string()
             ]))
             .await;
         assert!(err.is_err());
@@ -1926,15 +2089,11 @@ mod tests {
 
         // Full bounded channel forces the permit reservation to wait.
         let (event_tx, mut event_rx) = mpsc::channel::<PumpPortalEvent>(1);
-        event_tx
-            .send(PumpPortalEvent::Disconnected)
-            .await
-            .unwrap();
+        event_tx.send(PumpPortalEvent::Disconnected).await.unwrap();
 
         let tx_clone = event_tx.clone();
-        let reserver = tokio::spawn(async move {
-            tx_clone.reserve_owned().await.expect("reserve")
-        });
+        let reserver =
+            tokio::spawn(async move { tx_clone.reserve_owned().await.expect("reserve") });
 
         // While the permit waits, mutate desired B -> C (only PK_2, PK_1 removed).
         {
@@ -2040,7 +2199,7 @@ mod tests {
         // registry must reflect the command.
         let res = sender
             .send(SubscriptionCommand::SubscribeTokenTrades(vec![
-                VALID_PK_1.to_string(),
+                VALID_PK_1.to_string()
             ]))
             .await;
         assert!(res.is_ok(), "Full notify must coalesce to success");
@@ -2067,7 +2226,7 @@ mod tests {
 
         let res = sender
             .send(SubscriptionCommand::SubscribeTokenTrades(vec![
-                VALID_PK_1.to_string(),
+                VALID_PK_1.to_string()
             ]))
             .await;
         // Closed wake => Err(Error::Internal notify closed), no hang.
@@ -2097,11 +2256,206 @@ mod tests {
         let out = tokio::time::timeout(
             Duration::from_secs(2),
             sender.send(SubscriptionCommand::SubscribeTokenTrades(vec![
-                VALID_PK_2.to_string(),
+                VALID_PK_2.to_string()
             ])),
         )
         .await;
         let inner = out.expect("send() must not block on notify capacity");
         assert!(inner.is_ok(), "coalesced wake on a full queue is success");
+    }
+
+    // === P1-PROVIDER-DECODE-TRUTH-001 §13 — decode-vs-hard-error truth =========
+
+    /// A full, valid create message body with all strict NewToken fields. Callers
+    /// mutate/remove specific fields to exercise the decode paths. Uses fake but
+    /// well-formed identity values.
+    fn full_new_token_json() -> serde_json::Value {
+        serde_json::json!({
+            "signature": valid_sig(),
+            "mint": VALID_PK_2,
+            "traderPublicKey": VALID_PK_1,
+            "txType": "create",
+            "initialBuy": 1000000.5,
+            "bondingCurveKey": VALID_PK_3,
+            "vTokensInBondingCurve": 1000000000000.0,
+            "vSolInBondingCurve": 30.5,
+            "marketCapSol": 30.0,
+            "name": "Test Token",
+            "symbol": "TEST",
+            "uri": "https://example.com"
+        })
+    }
+
+    #[test]
+    fn test_new_token_shape_diagnostic_missing_field_names_only() {
+        let mut v = full_new_token_json();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("name");
+        obj.remove("uri");
+        let cat = diagnose_new_token_shape(&v);
+        // Fixed order preserved, only allowlisted names, no values.
+        assert_eq!(cat, "new_token_deserialize|missing=name,uri");
+    }
+
+    #[test]
+    fn test_new_token_shape_diagnostic_wrong_type_names_only() {
+        let mut v = full_new_token_json();
+        // initialBuy is a NUMBER field; a string value is a wrong_type.
+        v["initialBuy"] = serde_json::json!("1000000.5");
+        let cat = diagnose_new_token_shape(&v);
+        assert_eq!(cat, "new_token_deserialize|wrong_type=initialBuy:string");
+    }
+
+    #[test]
+    fn test_new_token_shape_diagnostic_contains_no_provider_values() {
+        let mut v = full_new_token_json();
+        // Provider values that MUST NOT appear in the category.
+        v["name"] = serde_json::json!("SECRETCOIN");
+        v["symbol"] = serde_json::json!(12345); // wrong type => reported by name only
+        let cat = diagnose_new_token_shape(&v);
+        assert!(!cat.contains("SECRETCOIN"), "leaked provider value: {cat}");
+        assert!(!cat.contains("12345"), "leaked provider value: {cat}");
+        // The wrong-typed symbol is reported by field NAME + json type only.
+        assert!(cat.contains("symbol:number"), "cat={cat}");
+    }
+
+    /// AUDIT-001 §5: the decode classifiers must never interpolate a raw
+    /// serde/validation/parse error Display, because those errors can render
+    /// rejected provider values (invalid mint/pubkey/signature/pool_id). Prove the
+    /// prior unsafe log patterns are gone from THIS source file. Needles are
+    /// assembled from split fragments via concat!() so this test does not itself
+    /// reintroduce the forbidden contiguous string.
+    #[test]
+    fn test_decode_classifiers_do_not_interpolate_raw_error_display() {
+        let src = include_str!("pumpportal.rs");
+        let forbidden: &[&str] = &[
+            concat!("Failed to deserialize new-token ", "event: {}"),
+            concat!("Dropped malformed new-token event ", "(validation): {}"),
+            concat!("Failed to deserialize trade ", "event: {}"),
+            concat!("Dropped malformed trade event ", "(validation): {}"),
+            concat!("Dropped malformed migration ", "event: {}"),
+        ];
+        for needle in forbidden {
+            assert!(
+                !src.contains(needle),
+                "decode classifier still interpolates a raw error Display: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_new_token_shape_diagnostic_does_not_emit_unknown_extra_fields() {
+        let mut v = full_new_token_json();
+        v["totallyUnknownField"] = serde_json::json!("whatever");
+        v["another_extra"] = serde_json::json!(999);
+        let cat = diagnose_new_token_shape(&v);
+        // A fully-valid-shaped object with only EXTRA fields yields the bare base.
+        assert_eq!(cat, "new_token_deserialize");
+        assert!(!cat.contains("totallyUnknownField"));
+        assert!(!cat.contains("another_extra"));
+    }
+
+    #[test]
+    fn test_new_token_shape_diagnostic_bounded() {
+        // Every expected field wrong-typed to null maximizes the wrong_type list.
+        let mut obj = serde_json::Map::new();
+        for &f in NEW_TOKEN_STRING_FIELDS {
+            obj.insert(f.to_string(), serde_json::Value::Null);
+        }
+        for &f in NEW_TOKEN_NUMBER_FIELDS {
+            obj.insert(f.to_string(), serde_json::Value::Null);
+        }
+        let v = serde_json::Value::Object(obj);
+        let cat = diagnose_new_token_shape(&v);
+        assert!(
+            cat.len() <= DECODE_CATEGORY_MAX,
+            "len {} : {cat}",
+            cat.len()
+        );
+        assert!(cat.is_ascii(), "category must be ASCII-only: {cat}");
+        // Non-object => fixed unknown-shape token.
+        let arr = serde_json::json!([1, 2, 3]);
+        assert_eq!(
+            diagnose_new_token_shape(&arr),
+            "new_token_deserialize|shape=unknown"
+        );
+    }
+
+    #[test]
+    fn test_new_token_deserialize_emits_decode_error_not_hard_error() {
+        // Missing a required numeric field => strict serde fails => DecodeError with
+        // NewTokenDeserialize, never a hard Error.
+        let mut v = full_new_token_json();
+        v.as_object_mut().unwrap().remove("marketCapSol");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenDeserialize);
+                assert!(e.category.starts_with("new_token_deserialize"));
+                assert!(e.category.contains("missing=marketCapSol"));
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_new_token_validation_emits_decode_error_not_hard_error() {
+        // Serde OK (all fields present, correct types) but an invalid mint pubkey
+        // => validation fails => DecodeError with NewTokenValidation.
+        let mut v = full_new_token_json();
+        v["mint"] = serde_json::json!("not_a_pubkey");
+        let text = serde_json::to_string(&v).unwrap();
+        match classify_new_token(&text, &v) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::NewTokenValidation);
+                assert_eq!(e.category, "new_token_validation");
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_provider_auth_error_remains_hard_error() {
+        // An auth-shaped provider message stays a HARD Error, never a DecodeError.
+        let value = serde_json::json!({ "error": "unauthorized: invalid api-key" });
+        let reason = detect_provider_error(&value).expect("must classify");
+        assert_eq!(reason, "PumpPortal authentication error");
+        // And the classifier for provider errors is independent of decode kinds:
+        // the event the stream would emit here is Error(reason), asserted by shape.
+        let ev = PumpPortalEvent::Error(reason);
+        assert!(matches!(ev, PumpPortalEvent::Error(_)));
+    }
+
+    #[test]
+    fn test_migration_parse_failure_is_decode_error() {
+        // Migration with a missing mint fails parse => MigrationParse DecodeError.
+        let value = serde_json::json!({ "txType": "migrate", "pool": "raydium" });
+        match classify_migration(&value) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::MigrationParse);
+                assert_eq!(e.category, "migration_parse");
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trade_deserialize_failure_is_decode_error() {
+        // A buy message missing required numeric fields fails strict serde =>
+        // TradeDeserialize DecodeError.
+        let text = serde_json::json!({
+            "signature": valid_sig(),
+            "mint": VALID_PK_1,
+            "traderPublicKey": VALID_PK_2,
+            "txType": "buy"
+        })
+        .to_string();
+        match classify_trade(&text) {
+            PumpPortalEvent::DecodeError(e) => {
+                assert_eq!(e.kind, PumpPortalDecodeKind::TradeDeserialize);
+                assert_eq!(e.category, "trade_deserialize");
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
     }
 }

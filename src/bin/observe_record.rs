@@ -41,6 +41,7 @@ use pumpfun_sniper::observation::schema::{
 };
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::runtime::RuntimeLease;
+use pumpfun_sniper::stream::pumpportal::{PumpPortalDecodeError, PumpPortalDecodeKind};
 use pumpfun_sniper::stream::{
     PumpPortalClient, PumpPortalConfig, PumpPortalEvent, PumpPortalSubscriptionPlan,
 };
@@ -283,7 +284,24 @@ struct RunCounters {
     tracking_completed: u64,
     stream_connected_events: u64,
     stream_disconnect_events: u64,
+    /// Schema-v1 TOTAL provider+decode anomaly count. This is the field serialized
+    /// as `RunFinished.provider_errors` and stays the TOTAL for schema-v1 compat
+    /// (P1-PROVIDER-DECODE-TRUTH-001 §10): a run may legitimately be
+    /// completion=degraded with provider_errors=4 when all 4 are decode anomalies.
+    /// Run-completion severity is driven by `hard_provider_errors` / `decode_errors`
+    /// below, NOT by this total.
     provider_errors: u64,
+    /// P1 §9 collector-internal ONLY (never serialized). HARD provider/transport
+    /// error subset; any nonzero count => Failed.
+    hard_provider_errors: u64,
+    /// P1 §9 collector-internal ONLY (never serialized). Decode/schema-loss subset;
+    /// nonzero (when not Failed) => Degraded.
+    decode_errors: u64,
+    /// P1 §9 collector-internal ONLY (never serialized). NewToken decode-loss
+    /// subset (NewTokenDeserialize|NewTokenValidation). A modeling-grade dataset
+    /// requires new_token_decode_errors==0 AND tracking_capacity_skips==0 (§12,
+    /// doc-only — no Rust threshold here).
+    new_token_decode_errors: u64,
     unexpected_trade_events: u64,
     migrations_seen: u64,
     task_failures: u64,
@@ -305,16 +323,22 @@ fn run_completion(
     ever_connected: bool,
     stream_connected_at_intake_end: bool,
 ) -> RunCompletion {
+    // P1-PROVIDER-DECODE-TRUTH-001 §10: FAILED keys off HARD provider errors, NOT
+    // the schema-v1 total `provider_errors` (which also counts decode anomalies).
     let failed = !ever_connected
         || !stream_connected_at_intake_end
-        || counters.provider_errors > 0
+        || counters.hard_provider_errors > 0
         || counters.unexpected_trade_events > 0
         || counters.drain_timed_out > 0
         || counters.recorder_failures > 0;
     if failed {
         return RunCompletion::Failed;
     }
-    if counters.stream_disconnect_events > 0 || counters.task_failures > 0 {
+    // P1 §10: DECODE/schema loss degrades (not fails) a run.
+    if counters.decode_errors > 0
+        || counters.stream_disconnect_events > 0
+        || counters.task_failures > 0
+    {
         return RunCompletion::Degraded;
     }
     RunCompletion::Complete
@@ -712,15 +736,24 @@ async fn handle_intake_event(
             append_required(recorder, stream_state(StreamStateKind::Disconnected, None)).await?;
         }
         PumpPortalEvent::Error(category) => {
+            // P1 §9: HARD provider error. Counts toward the schema-v1 total AND the
+            // internal hard subset; a provider error does not itself mutate
+            // stream_connected (§9); it fails the run.
             counters.provider_errors += 1;
-            // `category` is already a sanitized fixed provider category. A provider
-            // error does not itself mutate stream_connected (§9); it fails the run.
+            counters.hard_provider_errors += 1;
+            // `category` is already a sanitized fixed provider category.
             let safe = sanitize_persist_text(&category, 128);
             append_required(
                 recorder,
                 stream_state(StreamStateKind::ProviderError, Some(safe)),
             )
             .await?;
+        }
+        PumpPortalEvent::DecodeError(e) => {
+            // P1 §9/§11: LOCAL decode/schema loss. Counts toward the schema-v1 total
+            // AND the internal decode subset; NEVER mutates stream_connected, NEVER
+            // starts a task, NEVER fabricates a CandidateObserved. Degrades the run.
+            record_decode_error(recorder, counters, &e).await?;
         }
         PumpPortalEvent::Trade(_) => {
             // Free-only plan: a Trade is an anomaly. No trade fields recorded.
@@ -853,12 +886,18 @@ async fn drain_pre_stop(
             }
             PumpPortalEvent::Error(category) => {
                 counters.provider_errors += 1;
+                counters.hard_provider_errors += 1;
                 let safe = sanitize_persist_text(&category, 128);
                 append_required(
                     recorder,
                     stream_state(StreamStateKind::ProviderError, Some(safe)),
                 )
                 .await?;
+            }
+            PumpPortalEvent::DecodeError(e) => {
+                // P1 §11: decode loss in the pre-stop drain — count/persist, never
+                // mutate stream_connected, never start a task.
+                record_decode_error(recorder, counters, &e).await?;
             }
             PumpPortalEvent::Trade(_) => {
                 counters.unexpected_trade_events += 1;
@@ -909,12 +948,19 @@ async fn drain_post_stop(
             PumpPortalEvent::Connected | PumpPortalEvent::Disconnected => {}
             PumpPortalEvent::Error(category) => {
                 counters.provider_errors += 1;
+                counters.hard_provider_errors += 1;
                 let safe = sanitize_persist_text(&category, 128);
                 append_required(
                     recorder,
                     stream_state(StreamStateKind::ProviderError, Some(safe)),
                 )
                 .await?;
+            }
+            PumpPortalEvent::DecodeError(e) => {
+                // P1 §11: a post-stop decode event still counts/persists but does NOT
+                // change the already-captured intake connection truth (that bool was
+                // frozen before client.stop()).
+                record_decode_error(recorder, counters, &e).await?;
             }
             PumpPortalEvent::Trade(_) => {
                 counters.unexpected_trade_events += 1;
@@ -1257,6 +1303,37 @@ fn stream_state(state: StreamStateKind, category: Option<String>) -> Observation
     ObservationPayload::StreamState(StreamStateRecord { state, category })
 }
 
+/// P1-PROVIDER-DECODE-TRUTH-001 §9: account + persist a single decode/schema-loss
+/// anomaly. Increments the schema-v1 total (`provider_errors`) AND the internal
+/// `decode_errors` subset; NewToken decode kinds also bump `new_token_decode_errors`.
+/// Persists a `StreamStateKind::ProviderError` record (no new schema variant) whose
+/// category is prefixed `decode:` and bounded to <=256 chars with no raw provider
+/// values (the decode category is already a fixed structural token). NEVER touches
+/// stream_connected, NEVER starts a task, NEVER fabricates a CandidateObserved.
+async fn record_decode_error(
+    recorder: &ObservationRecorder,
+    counters: &mut RunCounters,
+    e: &PumpPortalDecodeError,
+) -> std::result::Result<(), CollectorRecordError> {
+    counters.provider_errors += 1;
+    counters.decode_errors += 1;
+    if matches!(
+        e.kind,
+        PumpPortalDecodeKind::NewTokenDeserialize | PumpPortalDecodeKind::NewTokenValidation
+    ) {
+        counters.new_token_decode_errors += 1;
+    }
+    // Fixed `decode:` prefix + the already-safe fixed category, then re-sanitized
+    // and capped at 256 for defense in depth.
+    let category = sanitize_persist_text(&format!("decode:{}", e.category), 256);
+    append_required(
+        recorder,
+        stream_state(StreamStateKind::ProviderError, Some(category)),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Build a CandidateObserved payload from a provider NewToken event. Provider f64
 /// fields are kept as-is (never cast, never divided by 1e9); untrusted text is
 /// sanitized/capped at name 256 / symbol 64 / uri 1024.
@@ -1540,9 +1617,12 @@ mod tests {
         assert_eq!(run_completion(&c, false, true), RunCompletion::Failed);
         // Connected, clean, connected-at-end => Complete.
         assert_eq!(run_completion(&c, true, true), RunCompletion::Complete);
-        // Provider error => Failed.
+        // HARD provider error => Failed. P1 §10: the Failed condition keys off
+        // hard_provider_errors (not the schema-v1 total provider_errors, which also
+        // counts decode anomalies).
         let mut c_err = RunCounters::default();
         c_err.provider_errors = 1;
+        c_err.hard_provider_errors = 1;
         assert_eq!(run_completion(&c_err, true, true), RunCompletion::Failed);
         // Unexpected trade => Failed.
         let mut c_tr = RunCounters::default();
@@ -1748,5 +1828,114 @@ mod tests {
         assert_eq!(counters.recorder_failures, 1);
         assert_eq!(counters.task_failures, 0);
         assert_eq!(run_completion(&counters, true, true), RunCompletion::Failed);
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-PROVIDER-DECODE-TRUTH-001 §14 — decode-loss classification tests.
+    // -----------------------------------------------------------------------
+
+    /// Apply a decode error's pure accounting to counters WITHOUT recorder I/O:
+    /// mirrors `record_decode_error`'s counter mutations exactly (the persist step
+    /// is a fixed `decode:`-prefixed StreamState, exercised separately).
+    fn account_decode(counters: &mut RunCounters, kind: PumpPortalDecodeKind) {
+        counters.provider_errors += 1;
+        counters.decode_errors += 1;
+        if matches!(
+            kind,
+            PumpPortalDecodeKind::NewTokenDeserialize | PumpPortalDecodeKind::NewTokenValidation
+        ) {
+            counters.new_token_decode_errors += 1;
+        }
+    }
+
+    #[test]
+    fn test_hard_provider_error_fails_run() {
+        let mut c = RunCounters::default();
+        c.provider_errors += 1;
+        c.hard_provider_errors += 1;
+        assert_eq!(run_completion(&c, true, true), RunCompletion::Failed);
+    }
+
+    #[test]
+    fn test_decode_error_degrades_run() {
+        let mut c = RunCounters::default();
+        account_decode(&mut c, PumpPortalDecodeKind::NewTokenDeserialize);
+        // No hard provider errors => not Failed; decode_errors>0 => Degraded.
+        assert_eq!(c.hard_provider_errors, 0);
+        assert_eq!(run_completion(&c, true, true), RunCompletion::Degraded);
+    }
+
+    #[test]
+    fn test_decode_error_is_not_complete() {
+        let mut c = RunCounters::default();
+        account_decode(&mut c, PumpPortalDecodeKind::TradeDeserialize);
+        assert_ne!(run_completion(&c, true, true), RunCompletion::Complete);
+    }
+
+    #[test]
+    fn test_decode_error_is_not_hard_provider_error() {
+        // Four decode anomalies must NOT increment hard_provider_errors, so the run
+        // is Degraded (not Failed) even though the schema-v1 total reads 4.
+        let mut c = RunCounters::default();
+        for _ in 0..4 {
+            account_decode(&mut c, PumpPortalDecodeKind::NewTokenDeserialize);
+        }
+        assert_eq!(c.hard_provider_errors, 0);
+        assert_eq!(c.decode_errors, 4);
+        assert_eq!(
+            c.provider_errors, 4,
+            "schema-v1 total stays the anomaly sum"
+        );
+        assert_eq!(run_completion(&c, true, true), RunCompletion::Degraded);
+    }
+
+    #[test]
+    fn test_new_token_decode_counter_increments() {
+        let mut c = RunCounters::default();
+        account_decode(&mut c, PumpPortalDecodeKind::NewTokenDeserialize);
+        account_decode(&mut c, PumpPortalDecodeKind::NewTokenValidation);
+        // Non-NewToken decode kinds do NOT bump the NewToken subset.
+        account_decode(&mut c, PumpPortalDecodeKind::TradeDeserialize);
+        account_decode(&mut c, PumpPortalDecodeKind::MigrationParse);
+        account_decode(&mut c, PumpPortalDecodeKind::TradeValidation);
+        assert_eq!(c.new_token_decode_errors, 2);
+        assert_eq!(c.decode_errors, 5);
+    }
+
+    #[test]
+    fn test_decode_category_persist_prefix_is_fixed() {
+        // The persisted category is the fixed `decode:` prefix + the safe structural
+        // category (no raw provider values), capped at 256.
+        let e = PumpPortalDecodeError {
+            kind: PumpPortalDecodeKind::NewTokenDeserialize,
+            category: "new_token_deserialize|missing=name,uri".to_string(),
+        };
+        let persisted = sanitize_persist_text(&format!("decode:{}", e.category), 256);
+        assert!(persisted.starts_with("decode:"));
+        assert!(persisted.chars().count() <= 256);
+        assert!(!persisted.contains("SECRET"));
+    }
+
+    #[test]
+    fn test_decode_event_does_not_change_stream_connected() {
+        // A decode event carries no StreamTransition; the intake bool is untouched.
+        // The pure transition helper has no decode variant, so an active-intake
+        // decode leaves stream_connected exactly as-is (modeled via NoChange).
+        assert!(apply_stream_transition(true, StreamTransition::NoChange));
+        assert!(!apply_stream_transition(false, StreamTransition::NoChange));
+    }
+
+    #[test]
+    fn test_post_stop_decode_event_does_not_change_intake_connection_truth() {
+        // The completeness bool is captured BEFORE stop; a post-stop decode event
+        // only counts/persists and cannot alter it. Model: captured=true, a decode
+        // anomaly present (Degraded), completion still uses the captured value.
+        let mut c = RunCounters::default();
+        account_decode(&mut c, PumpPortalDecodeKind::NewTokenDeserialize);
+        let stream_connected_at_intake_end = true; // frozen before client.stop()
+        assert_eq!(
+            run_completion(&c, true, stream_connected_at_intake_end),
+            RunCompletion::Degraded
+        );
     }
 }
