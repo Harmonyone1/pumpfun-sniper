@@ -16,7 +16,7 @@ use crate::market::types::{ExecutableQuote, MarketSide, MarketSnapshot, MarketVe
 
 /// Schema version for the observation dataset. Bumped only on incompatible
 /// changes; no silent incompatible changes are permitted.
-pub const OBSERVATION_SCHEMA_VERSION: u32 = 2;
+pub const OBSERVATION_SCHEMA_VERSION: u32 = 3;
 
 /// Fixed hypothetical entry size = 0.001 SOL. Not configurable in v1.
 pub const ENTRY_QUOTE_LAMPORTS: u64 = 1_000_000;
@@ -67,6 +67,7 @@ pub enum ObservationPayload {
     StreamState(StreamStateRecord),
     CandidateObserved(CandidateObservedRecord),
     InitialMarket(InitialMarketRecord),
+    DecisionPointBuyQuote(DecisionPointBuyQuoteRecord),
     OutcomeSample(OutcomeSampleRecord),
     MigrationObserved(MigrationObservedRecord),
     TrackingSkipped(TrackingSkippedRecord),
@@ -80,6 +81,7 @@ impl ObservationPayload {
         match self {
             ObservationPayload::CandidateObserved(r) => Some(&r.candidate_id),
             ObservationPayload::InitialMarket(r) => Some(&r.candidate_id),
+            ObservationPayload::DecisionPointBuyQuote(r) => Some(&r.candidate_id),
             ObservationPayload::OutcomeSample(r) => Some(&r.candidate_id),
             ObservationPayload::TrackingSkipped(r) => Some(&r.candidate_id),
             ObservationPayload::TrackingFinished(r) => Some(&r.candidate_id),
@@ -640,6 +642,48 @@ pub struct InitialMarketRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Section 16 — DecisionPointBuyQuote
+// ---------------------------------------------------------------------------
+
+/// A canonical exact-input buy quote requested only after the observations needed
+/// for a strategy-neutral decision point are available. This is distinct from the
+/// creation-time [`InitialMarketRecord`] buy quote and records timing/failure truth
+/// for delayed executable-entry research.
+///
+/// Invariants for a recorder-created record:
+/// - `buy_quote.is_some()` XOR `buy_quote_failure.is_some()`
+/// - `buy_quote_market_data_kind.is_some()` IFF `buy_quote_failure == MarketUnavailable`
+/// - `request_started_at >= decision_time`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionPointBuyQuoteRecord {
+    pub candidate_id: String,
+    pub mint: String,
+
+    pub nominal_decision_horizon_secs: u64,
+    pub decision_time: DateTime<Utc>,
+    pub request_started_at: DateTime<Utc>,
+    pub quote_observed_at: DateTime<Utc>,
+
+    pub decision_to_quote_start_lag_ms: i64,
+    pub decision_to_quote_available_lag_ms: i64,
+
+    pub buy_quote: Option<ExecutableQuoteRecord>,
+    pub buy_quote_failure: Option<ObservationFailureCode>,
+
+    /// Observation RPC gate wait and oracle call duration for this delayed buy
+    /// request. A gated recorder writes `Some(...)` regardless of success/failure.
+    #[serde(default)]
+    pub buy_rpc_gate_wait_ms: Option<u64>,
+    #[serde(default)]
+    pub buy_rpc_call_duration_ms: Option<u64>,
+
+    /// Safe market-data subtype for delayed buy failure. `Some(kind)` IFF the
+    /// failure code is `MarketUnavailable`; `None` on success/non-MarketData failure.
+    #[serde(default)]
+    pub buy_quote_market_data_kind: Option<MarketDataFailureKind>,
+}
+
+// ---------------------------------------------------------------------------
 // Section 17 + 18 — OutcomeSample + return math
 // ---------------------------------------------------------------------------
 
@@ -950,8 +994,8 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_2() {
-        assert_eq!(OBSERVATION_SCHEMA_VERSION, 2);
+    fn test_schema_version_is_3() {
+        assert_eq!(OBSERVATION_SCHEMA_VERSION, 3);
     }
 
     #[test]
@@ -1047,12 +1091,131 @@ mod tests {
         assert_eq!(back.partial_new_token_events, 7);
     }
 
+    fn delayed_buy_quote_record(quoted_at: DateTime<Utc>) -> ExecutableQuoteRecord {
+        ExecutableQuoteRecord {
+            side: ObservedSide::Buy,
+            venue: ObservedVenue::PumpBondingCurve,
+            quote_asset: ObservedQuoteAsset::Sol,
+            base_decimals: 6,
+            quote_decimals: 9,
+            base_amount_raw: 250_000,
+            base_amount_ui: 0.25,
+            quote_amount_raw: ENTRY_QUOTE_LAMPORTS,
+            expected_price_sol_per_token: Some(0.004),
+            protocol_fee_bps: 100,
+            creator_fee_bps: 50,
+            lp_fee_bps: 0,
+            slot: 123,
+            quoted_at,
+        }
+    }
+
+    #[test]
+    fn test_decision_point_buy_quote_success_round_trip() {
+        let decision_time = "2026-01-01T00:00:06.250Z".parse::<DateTime<Utc>>().unwrap();
+        let request_started_at = "2026-01-01T00:00:06.260Z".parse::<DateTime<Utc>>().unwrap();
+        let quote_observed_at = "2026-01-01T00:00:06.310Z".parse::<DateTime<Utc>>().unwrap();
+        let rec = DecisionPointBuyQuoteRecord {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            nominal_decision_horizon_secs: 6,
+            decision_time,
+            request_started_at,
+            quote_observed_at,
+            decision_to_quote_start_lag_ms: 10,
+            decision_to_quote_available_lag_ms: 60,
+            buy_quote: Some(delayed_buy_quote_record(quote_observed_at)),
+            buy_quote_failure: None,
+            buy_rpc_gate_wait_ms: Some(3),
+            buy_rpc_call_duration_ms: Some(47),
+            buy_quote_market_data_kind: None,
+        };
+        let payload = ObservationPayload::DecisionPointBuyQuote(rec.clone());
+        assert_eq!(payload.candidate_id(), Some("sig"));
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(
+            json.contains("\"kind\":\"decision_point_buy_quote\""),
+            "{json}"
+        );
+        assert!(json.contains("\"quote_amount_raw\":1000000"), "{json}");
+        assert!(json.contains("\"protocol_fee_bps\":100"), "{json}");
+        let back: ObservationPayload = serde_json::from_str(&json).unwrap();
+        match back {
+            ObservationPayload::DecisionPointBuyQuote(back) => {
+                assert_eq!(back.nominal_decision_horizon_secs, 6);
+                assert_eq!(
+                    back.buy_quote.unwrap().quote_amount_raw,
+                    ENTRY_QUOTE_LAMPORTS
+                );
+                assert_eq!(back.buy_quote_failure, None);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decision_point_buy_quote_failure_round_trips_safe_codes() {
+        let t = "2026-01-01T00:00:06Z".parse::<DateTime<Utc>>().unwrap();
+        let rec = DecisionPointBuyQuoteRecord {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            nominal_decision_horizon_secs: 6,
+            decision_time: t,
+            request_started_at: t,
+            quote_observed_at: t,
+            decision_to_quote_start_lag_ms: 0,
+            decision_to_quote_available_lag_ms: 0,
+            buy_quote: None,
+            buy_quote_failure: Some(ObservationFailureCode::MarketUnavailable),
+            buy_rpc_gate_wait_ms: Some(0),
+            buy_rpc_call_duration_ms: Some(12),
+            buy_quote_market_data_kind: Some(MarketDataFailureKind::AccountMissing),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            json.contains("\"buy_quote_failure\":\"market_unavailable\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"buy_quote_market_data_kind\":\"account_missing\""),
+            "{json}"
+        );
+        let back: DecisionPointBuyQuoteRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.buy_quote_failure,
+            Some(ObservationFailureCode::MarketUnavailable)
+        );
+        assert_eq!(
+            back.buy_quote_market_data_kind,
+            Some(MarketDataFailureKind::AccountMissing)
+        );
+
+        let mut rpc = back.clone();
+        rpc.buy_quote_failure = Some(ObservationFailureCode::RpcUnavailable);
+        rpc.buy_quote_market_data_kind = None;
+        let rpc_back: DecisionPointBuyQuoteRecord =
+            serde_json::from_str(&serde_json::to_string(&rpc).unwrap()).unwrap();
+        assert_eq!(
+            rpc_back.buy_quote_failure,
+            Some(ObservationFailureCode::RpcUnavailable)
+        );
+        assert_eq!(rpc_back.buy_quote_market_data_kind, None);
+
+        let mut unsupported = rpc_back;
+        unsupported.buy_quote_failure = Some(ObservationFailureCode::UnsupportedQuoteAsset);
+        let unsupported_back: DecisionPointBuyQuoteRecord =
+            serde_json::from_str(&serde_json::to_string(&unsupported).unwrap()).unwrap();
+        assert_eq!(
+            unsupported_back.buy_quote_failure,
+            Some(ObservationFailureCode::UnsupportedQuoteAsset)
+        );
+    }
     // -- RPC concurrency gate telemetry (packet §34) ------------------------
 
     #[test]
-    fn test_schema_version_still_2_with_gate_fields() {
-        // Gate telemetry is backward-compatible v2 metadata; NOT a v3 bump.
-        assert_eq!(OBSERVATION_SCHEMA_VERSION, 2);
+    fn test_schema_version_bumped_for_decision_point_buy_quote() {
+        // Gate telemetry stayed additive in v2, but a new tagged payload kind is a v3 bump.
+        assert_eq!(OBSERVATION_SCHEMA_VERSION, 3);
     }
 
     #[test]

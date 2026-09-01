@@ -35,11 +35,12 @@ use pumpfun_sniper::market::types::{ExecutableQuote, MarketSnapshot};
 use pumpfun_sniper::market::PumpMarketOracle;
 use pumpfun_sniper::observation::schema::{
     classify_observation_error_full, protocol_net_ex_network_return_bps, sanitize_persist_text,
-    CandidateObservedRecord, ExecutableQuoteRecord, InitialMarketRecord, MarketDataFailureKind,
-    MarketSnapshotRecord, MigrationObservedRecord, ObservationFailureCode, ObservationPayload,
-    OutcomeSampleRecord, ProviderCreateShape, RunCompletion, RunFinishedRecord, RunStartedRecord,
-    StreamStateKind, StreamStateRecord, TrackingFinishStatus, TrackingFinishedRecord,
-    TrackingSkippedRecord, ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
+    CandidateObservedRecord, DecisionPointBuyQuoteRecord, ExecutableQuoteRecord,
+    InitialMarketRecord, MarketDataFailureKind, MarketSnapshotRecord, MigrationObservedRecord,
+    ObservationFailureCode, ObservationPayload, OutcomeSampleRecord, ProviderCreateShape,
+    RunCompletion, RunFinishedRecord, RunStartedRecord, StreamStateKind, StreamStateRecord,
+    TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord, ENTRY_QUOTE_LAMPORTS,
+    OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
 };
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::runtime::RuntimeLease;
@@ -645,6 +646,29 @@ fn outcome_sampled_at(
         Some(quoted_at) => quoted_at,
         None => failure_completion_time,
     }
+}
+
+/// H1's decision timestamp is the latest actual observed/completed timestamp among
+/// the 2s, 4s, and 6s outcome observations. It is never the nominal 6s due time.
+fn h1_decision_time_from_observations(
+    sample_2s: DateTime<Utc>,
+    sample_4s: DateTime<Utc>,
+    sample_6s: DateTime<Utc>,
+) -> DateTime<Utc> {
+    sample_2s.max(sample_4s).max(sample_6s)
+}
+
+/// Wall-clock lag from an observed decision point to a later recorder timestamp.
+/// Clock jitter is clamped to zero for reporting, matching sample_lag_ms policy.
+fn wall_lag_ms(start: DateTime<Utc>, end: DateTime<Utc>) -> i64 {
+    (end - start).num_milliseconds().max(0)
+}
+
+fn delayed_quote_start_is_valid(
+    decision_time: DateTime<Utc>,
+    request_started_at: DateTime<Utc>,
+) -> bool {
+    request_started_at >= decision_time
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,6 +1655,10 @@ async fn track_candidate(
     // --- Section 37: horizons anchored to the anchor captured at buy-quote success. ---
     let mut successful_samples: u16 = 0;
     let mut failed_samples: u16 = 0;
+    let mut h1_sample_2s: Option<DateTime<Utc>> = None;
+    let mut h1_sample_4s: Option<DateTime<Utc>> = None;
+    let mut h1_sample_6s: Option<DateTime<Utc>> = None;
+    let mut delayed_entry_quote_recorded = false;
 
     for &horizon in OUTCOME_HORIZONS_SECS {
         // Sleep until the monotonic due instant (never negative).
@@ -1739,6 +1767,66 @@ async fn track_candidate(
             .is_err()
         {
             return Err(CandidateTaskFailure::RecorderWrite);
+        }
+
+        match horizon {
+            2 => h1_sample_2s = Some(sampled_at),
+            4 => h1_sample_4s = Some(sampled_at),
+            6 => h1_sample_6s = Some(sampled_at),
+            _ => {}
+        }
+
+        if horizon == 6 && !delayed_entry_quote_recorded {
+            let (Some(sample_2s), Some(sample_4s), Some(sample_6s)) =
+                (h1_sample_2s, h1_sample_4s, h1_sample_6s)
+            else {
+                return Err(CandidateTaskFailure::RecorderWrite);
+            };
+            let decision_time = h1_decision_time_from_observations(sample_2s, sample_4s, sample_6s);
+            let request_started_at = Utc::now();
+            if !delayed_quote_start_is_valid(decision_time, request_started_at) {
+                return Err(CandidateTaskFailure::RecorderWrite);
+            }
+            let delayed_buy_call =
+                gated_quote_buy_sol(&rpc_gate, &oracle, &mint, ENTRY_QUOTE_LAMPORTS).await;
+            let quote_observed_at = Utc::now();
+            let decision_to_quote_start_lag_ms = wall_lag_ms(decision_time, request_started_at);
+            let decision_to_quote_available_lag_ms = wall_lag_ms(decision_time, quote_observed_at);
+            let buy_rpc_gate_wait_ms = Some(delayed_buy_call.gate_wait_ms);
+            let buy_rpc_call_duration_ms = Some(delayed_buy_call.call_duration_ms);
+            let (buy_quote, buy_quote_failure, buy_quote_market_data_kind) =
+                match delayed_buy_call.result {
+                    Ok(q) => (Some(ExecutableQuoteRecord::from(&q)), None, None),
+                    Err(e) => {
+                        let c = classify_observation_error_full(&e);
+                        (None, Some(c.code), c.market_data_kind)
+                    }
+                };
+
+            if recorder
+                .append(ObservationPayload::DecisionPointBuyQuote(
+                    DecisionPointBuyQuoteRecord {
+                        candidate_id: candidate_id.clone(),
+                        mint: mint_str.clone(),
+                        nominal_decision_horizon_secs: 6,
+                        decision_time,
+                        request_started_at,
+                        quote_observed_at,
+                        decision_to_quote_start_lag_ms,
+                        decision_to_quote_available_lag_ms,
+                        buy_quote,
+                        buy_quote_failure,
+                        buy_rpc_gate_wait_ms,
+                        buy_rpc_call_duration_ms,
+                        buy_quote_market_data_kind,
+                    },
+                ))
+                .await
+                .is_err()
+            {
+                return Err(CandidateTaskFailure::RecorderWrite);
+            }
+            delayed_entry_quote_recorded = true;
         }
     }
 
@@ -2277,6 +2365,68 @@ mod tests {
         assert_eq!(sample_lag_ms(due, due), 0);
     }
 
+    #[test]
+    fn test_h1_decision_time_uses_actual_sample_timestamps() {
+        let nominal_6s = "2026-01-01T00:00:06.000Z".parse::<DateTime<Utc>>().unwrap();
+        let sample_2s = "2026-01-01T00:00:02.050Z".parse::<DateTime<Utc>>().unwrap();
+        let sample_4s = "2026-01-01T00:00:04.075Z".parse::<DateTime<Utc>>().unwrap();
+        let sample_6s = "2026-01-01T00:00:06.325Z".parse::<DateTime<Utc>>().unwrap();
+        let decision_time = h1_decision_time_from_observations(sample_2s, sample_4s, sample_6s);
+        assert_eq!(decision_time, sample_6s);
+        assert_ne!(decision_time, nominal_6s);
+    }
+
+    #[test]
+    fn test_delayed_buy_quote_cannot_start_before_decision_time() {
+        let decision_time = "2026-01-01T00:00:06.325Z".parse::<DateTime<Utc>>().unwrap();
+        let valid_start = "2026-01-01T00:00:06.326Z".parse::<DateTime<Utc>>().unwrap();
+        let invalid_start = "2026-01-01T00:00:06.324Z".parse::<DateTime<Utc>>().unwrap();
+        assert!(delayed_quote_start_is_valid(decision_time, decision_time));
+        assert!(delayed_quote_start_is_valid(decision_time, valid_start));
+        assert!(!delayed_quote_start_is_valid(decision_time, invalid_start));
+    }
+
+    #[test]
+    fn test_delayed_quote_lag_uses_decision_time() {
+        let decision_time = "2026-01-01T00:00:06.325Z".parse::<DateTime<Utc>>().unwrap();
+        let available_at = "2026-01-01T00:00:06.425Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(wall_lag_ms(decision_time, available_at), 100);
+        assert_eq!(wall_lag_ms(available_at, decision_time), 0);
+    }
+
+    #[test]
+    fn test_delayed_entry_source_uses_exact_0_001_sol_buy_quote() {
+        let src = include_str!("observe_record.rs");
+        let call = "gated_quote_buy_sol(&rpc_gate, &oracle, &mint, ENTRY_QUOTE_LAMPORTS)";
+        assert!(
+            src.matches(call).count() >= 2,
+            "initial and delayed buy quotes should both use the fixed entry size"
+        );
+        assert!(src.contains("ObservationPayload::DecisionPointBuyQuote"));
+    }
+
+    #[test]
+    fn test_delayed_entry_event_order_after_six_second_outcome() {
+        let src = include_str!("observe_record.rs");
+        let sample_assign = "6 => h1_sample_6s = Some(sampled_at)";
+        let delayed_payload = "ObservationPayload::DecisionPointBuyQuote";
+        let tracking_finished = "// --- Section 19/36: complete";
+        let sample_pos = src
+            .find(sample_assign)
+            .expect("6s sample assignment present");
+        let delayed_pos = src.find(delayed_payload).expect("delayed payload present");
+        let finished_pos = src
+            .find(tracking_finished)
+            .expect("tracking finish section present");
+        assert!(
+            sample_pos < delayed_pos,
+            "delayed quote follows the 6s sample"
+        );
+        assert!(
+            delayed_pos < finished_pos,
+            "delayed quote is part of tracking before finish"
+        );
+    }
     #[test]
     fn test_key_horizon_snapshot_policy() {
         for &h in &[15u64, 30, 60, 120] {
