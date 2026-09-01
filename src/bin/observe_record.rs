@@ -35,12 +35,12 @@ use pumpfun_sniper::market::types::{ExecutableQuote, MarketSnapshot};
 use pumpfun_sniper::market::PumpMarketOracle;
 use pumpfun_sniper::observation::schema::{
     classify_observation_error_full, protocol_net_ex_network_return_bps, sanitize_persist_text,
-    CandidateObservedRecord, DecisionPointBuyQuoteRecord, ExecutableQuoteRecord,
-    InitialMarketRecord, MarketDataFailureKind, MarketSnapshotRecord, MigrationObservedRecord,
-    ObservationFailureCode, ObservationPayload, OutcomeSampleRecord, ProviderCreateShape,
-    RunCompletion, RunFinishedRecord, RunStartedRecord, StreamStateKind, StreamStateRecord,
-    TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord, ENTRY_QUOTE_LAMPORTS,
-    OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
+    CandidateObservedRecord, DecisionPointBuyQuoteRecord, DecisionPointSellQuoteRecord,
+    ExecutableQuoteRecord, InitialMarketRecord, MarketDataFailureKind, MarketSnapshotRecord,
+    MigrationObservedRecord, ObservationFailureCode, ObservationPayload, OutcomeSampleRecord,
+    ProviderCreateShape, RunCompletion, RunFinishedRecord, RunStartedRecord, StreamStateKind,
+    StreamStateRecord, TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord,
+    ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
 };
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::runtime::RuntimeLease;
@@ -61,6 +61,10 @@ const EVENT_CHANNEL_CAPACITY: usize = 512;
 /// admitted candidate may need its 120s final horizon plus RPC latency.
 const OUTCOME_DRAIN_SECS: u64 = 240;
 
+/// Original-clock horizons where matched delayed-entry sell quotes are requested.
+/// These are NOT post-delayed-entry holding periods; actual elapsed timestamps are
+/// persisted on each matched event.
+const MATCHED_DELAYED_EXIT_HORIZONS_SECS: &[u64] = &[15, 30, 60, 120];
 /// Bounds for `--intake-seconds` (packet section 30). Max 6 hours in v1.
 const INTAKE_SECONDS_MIN: u64 = 60;
 const INTAKE_SECONDS_MAX: u64 = 21_600;
@@ -671,6 +675,31 @@ fn delayed_quote_start_is_valid(
     request_started_at >= decision_time
 }
 
+fn should_match_delayed_exit_at(horizon_secs: u64) -> bool {
+    MATCHED_DELAYED_EXIT_HORIZONS_SECS.contains(&horizon_secs)
+}
+
+fn matched_delayed_sell_base_input(
+    delayed_base_amount_raw: u64,
+    _original_entry_base_amount_raw: u64,
+) -> u64 {
+    delayed_base_amount_raw
+}
+fn matched_sell_start_is_valid(
+    delayed_buy_observed_at: DateTime<Utc>,
+    request_started_at: DateTime<Utc>,
+) -> bool {
+    request_started_at >= delayed_buy_observed_at
+}
+
+#[derive(Debug, Clone)]
+struct DelayedEntryQuoteTruth {
+    decision_time: DateTime<Utc>,
+    buy_request_started_at: DateTime<Utc>,
+    buy_quoted_at: DateTime<Utc>,
+    buy_observed_at: DateTime<Utc>,
+    base_amount_raw: u64,
+}
 // ---------------------------------------------------------------------------
 // Tracking task result (section 40)
 // ---------------------------------------------------------------------------
@@ -1659,6 +1688,7 @@ async fn track_candidate(
     let mut h1_sample_4s: Option<DateTime<Utc>> = None;
     let mut h1_sample_6s: Option<DateTime<Utc>> = None;
     let mut delayed_entry_quote_recorded = false;
+    let mut delayed_entry_quote_truth: Option<DelayedEntryQuoteTruth> = None;
 
     for &horizon in OUTCOME_HORIZONS_SECS {
         // Sleep until the monotonic due instant (never negative).
@@ -1794,12 +1824,22 @@ async fn track_candidate(
             let decision_to_quote_available_lag_ms = wall_lag_ms(decision_time, quote_observed_at);
             let buy_rpc_gate_wait_ms = Some(delayed_buy_call.gate_wait_ms);
             let buy_rpc_call_duration_ms = Some(delayed_buy_call.call_duration_ms);
-            let (buy_quote, buy_quote_failure, buy_quote_market_data_kind) =
+            let (buy_quote, buy_quote_failure, buy_quote_market_data_kind, delayed_truth) =
                 match delayed_buy_call.result {
-                    Ok(q) => (Some(ExecutableQuoteRecord::from(&q)), None, None),
+                    Ok(q) => {
+                        let rec = ExecutableQuoteRecord::from(&q);
+                        let delayed_truth = DelayedEntryQuoteTruth {
+                            decision_time,
+                            buy_request_started_at: request_started_at,
+                            buy_quoted_at: rec.quoted_at,
+                            buy_observed_at: quote_observed_at,
+                            base_amount_raw: rec.base_amount_raw,
+                        };
+                        (Some(rec), None, None, Some(delayed_truth))
+                    }
                     Err(e) => {
                         let c = classify_observation_error_full(&e);
-                        (None, Some(c.code), c.market_data_kind)
+                        (None, Some(c.code), c.market_data_kind, None)
                     }
                 };
 
@@ -1826,7 +1866,76 @@ async fn track_candidate(
             {
                 return Err(CandidateTaskFailure::RecorderWrite);
             }
+            delayed_entry_quote_truth = delayed_truth;
             delayed_entry_quote_recorded = true;
+        }
+
+        if should_match_delayed_exit_at(horizon) {
+            if let Some(delayed) = delayed_entry_quote_truth.clone() {
+                let request_started_at = Utc::now();
+                if !matched_sell_start_is_valid(delayed.buy_observed_at, request_started_at) {
+                    return Err(CandidateTaskFailure::RecorderWrite);
+                }
+                let matched_sell_call = gated_quote_sell_raw(
+                    &rpc_gate,
+                    &oracle,
+                    &mint,
+                    matched_delayed_sell_base_input(delayed.base_amount_raw, base_amount_raw),
+                )
+                .await;
+                let quote_observed_at = Utc::now();
+                let sample_lag_ms = sample_lag_ms(due_at, quote_observed_at);
+                let delayed_entry_to_quote_start_elapsed_ms =
+                    wall_lag_ms(delayed.buy_observed_at, request_started_at);
+                let delayed_entry_to_quote_available_elapsed_ms =
+                    wall_lag_ms(delayed.buy_observed_at, quote_observed_at);
+                let sell_rpc_gate_wait_ms = Some(matched_sell_call.gate_wait_ms);
+                let sell_rpc_call_duration_ms = Some(matched_sell_call.call_duration_ms);
+                let (sell_quote, sell_quote_failure, sell_market_data_kind) =
+                    match matched_sell_call.result {
+                        Ok(q) => {
+                            let rec = ExecutableQuoteRecord::from(&q);
+                            if rec.base_amount_raw != delayed.base_amount_raw {
+                                return Err(CandidateTaskFailure::RecorderWrite);
+                            }
+                            (Some(rec), None, None)
+                        }
+                        Err(e) => {
+                            let c = classify_observation_error_full(&e);
+                            (None, Some(c.code), c.market_data_kind)
+                        }
+                    };
+
+                if recorder
+                    .append(ObservationPayload::DecisionPointSellQuote(
+                        DecisionPointSellQuoteRecord {
+                            candidate_id: candidate_id.clone(),
+                            mint: mint_str.clone(),
+                            nominal_horizon_secs: horizon,
+                            delayed_entry_decision_time: delayed.decision_time,
+                            delayed_buy_request_started_at: delayed.buy_request_started_at,
+                            delayed_buy_quoted_at: delayed.buy_quoted_at,
+                            delayed_buy_observed_at: delayed.buy_observed_at,
+                            delayed_base_amount_raw: delayed.base_amount_raw,
+                            due_at,
+                            request_started_at,
+                            quote_observed_at,
+                            sample_lag_ms,
+                            delayed_entry_to_quote_start_elapsed_ms,
+                            delayed_entry_to_quote_available_elapsed_ms,
+                            sell_quote,
+                            sell_quote_failure,
+                            sell_rpc_gate_wait_ms,
+                            sell_rpc_call_duration_ms,
+                            sell_market_data_kind,
+                        },
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return Err(CandidateTaskFailure::RecorderWrite);
+                }
+            }
         }
     }
 
@@ -2426,6 +2535,77 @@ mod tests {
             delayed_pos < finished_pos,
             "delayed quote is part of tracking before finish"
         );
+    }
+
+    #[test]
+    fn test_matched_delayed_exit_horizons_are_fixed_subset() {
+        assert_eq!(MATCHED_DELAYED_EXIT_HORIZONS_SECS, &[15, 30, 60, 120]);
+        for &h in MATCHED_DELAYED_EXIT_HORIZONS_SECS {
+            assert!(OUTCOME_HORIZONS_SECS.contains(&h));
+            assert!(should_match_delayed_exit_at(h));
+        }
+        for &h in &[2u64, 4, 6, 8, 10, 12, 18, 21, 24, 27, 45, 90] {
+            assert!(!should_match_delayed_exit_at(h));
+        }
+    }
+
+    #[test]
+    fn test_matched_sell_uses_delayed_base_not_original_base() {
+        let original_base_raw = 34_636_456_468;
+        let delayed_base_raw = 36_844_135_778;
+        assert_ne!(original_base_raw, delayed_base_raw);
+        assert_eq!(
+            matched_delayed_sell_base_input(delayed_base_raw, original_base_raw),
+            delayed_base_raw
+        );
+    }
+
+    #[test]
+    fn test_matched_sell_cannot_start_before_delayed_buy_available() {
+        let delayed_buy_observed_at = "2026-01-01T00:00:06.425Z".parse::<DateTime<Utc>>().unwrap();
+        let valid_start = "2026-01-01T00:00:15.010Z".parse::<DateTime<Utc>>().unwrap();
+        let invalid_start = "2026-01-01T00:00:06.424Z".parse::<DateTime<Utc>>().unwrap();
+        assert!(matched_sell_start_is_valid(
+            delayed_buy_observed_at,
+            delayed_buy_observed_at
+        ));
+        assert!(matched_sell_start_is_valid(
+            delayed_buy_observed_at,
+            valid_start
+        ));
+        assert!(!matched_sell_start_is_valid(
+            delayed_buy_observed_at,
+            invalid_start
+        ));
+    }
+
+    #[test]
+    fn test_matched_exit_source_is_signal_neutral() {
+        let src = include_str!("observe_record.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix present");
+        assert!(
+            !production.contains("766"),
+            "collector must not embed frozen H1 threshold"
+        );
+        assert!(
+            !production.contains("f_early_max"),
+            "collector must not derive H1"
+        );
+        let delayed_success = "delayed_entry_quote_truth = delayed_truth";
+        let matched_gate = "if should_match_delayed_exit_at(horizon)";
+        assert!(production.find(delayed_success).unwrap() < production.find(matched_gate).unwrap());
+    }
+
+    #[test]
+    fn test_matched_exit_source_sells_delayed_quantity() {
+        let src = include_str!("observe_record.rs");
+        assert!(src.contains("ObservationPayload::DecisionPointSellQuote"));
+        assert!(src
+            .contains("matched_delayed_sell_base_input(delayed.base_amount_raw, base_amount_raw)"));
+        assert!(src.contains("rec.base_amount_raw != delayed.base_amount_raw"));
     }
     #[test]
     fn test_key_horizon_snapshot_policy() {

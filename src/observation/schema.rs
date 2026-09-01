@@ -16,7 +16,7 @@ use crate::market::types::{ExecutableQuote, MarketSide, MarketSnapshot, MarketVe
 
 /// Schema version for the observation dataset. Bumped only on incompatible
 /// changes; no silent incompatible changes are permitted.
-pub const OBSERVATION_SCHEMA_VERSION: u32 = 3;
+pub const OBSERVATION_SCHEMA_VERSION: u32 = 4;
 
 /// Fixed hypothetical entry size = 0.001 SOL. Not configurable in v1.
 pub const ENTRY_QUOTE_LAMPORTS: u64 = 1_000_000;
@@ -68,6 +68,7 @@ pub enum ObservationPayload {
     CandidateObserved(CandidateObservedRecord),
     InitialMarket(InitialMarketRecord),
     DecisionPointBuyQuote(DecisionPointBuyQuoteRecord),
+    DecisionPointSellQuote(DecisionPointSellQuoteRecord),
     OutcomeSample(OutcomeSampleRecord),
     MigrationObserved(MigrationObservedRecord),
     TrackingSkipped(TrackingSkippedRecord),
@@ -82,6 +83,7 @@ impl ObservationPayload {
             ObservationPayload::CandidateObserved(r) => Some(&r.candidate_id),
             ObservationPayload::InitialMarket(r) => Some(&r.candidate_id),
             ObservationPayload::DecisionPointBuyQuote(r) => Some(&r.candidate_id),
+            ObservationPayload::DecisionPointSellQuote(r) => Some(&r.candidate_id),
             ObservationPayload::OutcomeSample(r) => Some(&r.candidate_id),
             ObservationPayload::TrackingSkipped(r) => Some(&r.candidate_id),
             ObservationPayload::TrackingFinished(r) => Some(&r.candidate_id),
@@ -684,6 +686,55 @@ pub struct DecisionPointBuyQuoteRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Section 16b — DecisionPointSellQuote
+// ---------------------------------------------------------------------------
+
+/// A canonical exact-base sell quote for the token amount produced by a prior
+/// [`DecisionPointBuyQuoteRecord`]. This is distinct from [`OutcomeSampleRecord`],
+/// whose sell quote uses the original creation-time buy quantity.
+///
+/// Invariants for a recorder-created record:
+/// - `delayed_base_amount_raw` is copied from the delayed buy quote's raw base out
+/// - `sell_quote.is_some()` XOR `sell_quote_failure.is_some()`
+/// - on success, `sell_quote.side == Sell` and `sell_quote.base_amount_raw == delayed_base_amount_raw`
+/// - `request_started_at >= delayed_buy_observed_at`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionPointSellQuoteRecord {
+    pub candidate_id: String,
+    pub mint: String,
+
+    pub nominal_horizon_secs: u64,
+    pub delayed_entry_decision_time: DateTime<Utc>,
+    pub delayed_buy_request_started_at: DateTime<Utc>,
+    pub delayed_buy_quoted_at: DateTime<Utc>,
+    pub delayed_buy_observed_at: DateTime<Utc>,
+    pub delayed_base_amount_raw: u64,
+
+    pub due_at: DateTime<Utc>,
+    pub request_started_at: DateTime<Utc>,
+    pub quote_observed_at: DateTime<Utc>,
+    pub sample_lag_ms: i64,
+
+    pub delayed_entry_to_quote_start_elapsed_ms: i64,
+    pub delayed_entry_to_quote_available_elapsed_ms: i64,
+
+    pub sell_quote: Option<ExecutableQuoteRecord>,
+    pub sell_quote_failure: Option<ObservationFailureCode>,
+
+    /// Observation RPC gate wait and oracle call duration for this matched sell
+    /// request. A gated recorder writes `Some(...)` regardless of success/failure.
+    #[serde(default)]
+    pub sell_rpc_gate_wait_ms: Option<u64>,
+    #[serde(default)]
+    pub sell_rpc_call_duration_ms: Option<u64>,
+
+    /// Safe market-data subtype for matched sell failure. `Some(kind)` IFF the
+    /// failure code is `MarketUnavailable`; `None` on success/non-MarketData failure.
+    #[serde(default)]
+    pub sell_market_data_kind: Option<MarketDataFailureKind>,
+}
+
+// ---------------------------------------------------------------------------
 // Section 17 + 18 — OutcomeSample + return math
 // ---------------------------------------------------------------------------
 
@@ -994,8 +1045,8 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_3() {
-        assert_eq!(OBSERVATION_SCHEMA_VERSION, 3);
+    fn test_schema_version_is_4() {
+        assert_eq!(OBSERVATION_SCHEMA_VERSION, 4);
     }
 
     #[test]
@@ -1212,10 +1263,138 @@ mod tests {
     }
     // -- RPC concurrency gate telemetry (packet §34) ------------------------
 
+    fn matched_sell_quote_record(
+        base_amount_raw: u64,
+        quoted_at: DateTime<Utc>,
+    ) -> ExecutableQuoteRecord {
+        ExecutableQuoteRecord {
+            side: ObservedSide::Sell,
+            venue: ObservedVenue::PumpBondingCurve,
+            quote_asset: ObservedQuoteAsset::Sol,
+            base_decimals: 6,
+            quote_decimals: 9,
+            base_amount_raw,
+            base_amount_ui: 0.25,
+            quote_amount_raw: 1_100_000,
+            expected_price_sol_per_token: Some(0.0044),
+            protocol_fee_bps: 100,
+            creator_fee_bps: 50,
+            lp_fee_bps: 0,
+            slot: 124,
+            quoted_at,
+        }
+    }
+
     #[test]
-    fn test_schema_version_bumped_for_decision_point_buy_quote() {
-        // Gate telemetry stayed additive in v2, but a new tagged payload kind is a v3 bump.
-        assert_eq!(OBSERVATION_SCHEMA_VERSION, 3);
+    fn test_decision_point_sell_quote_success_round_trip() {
+        let t = "2026-01-01T00:00:15.070Z".parse::<DateTime<Utc>>().unwrap();
+        let delayed_base = 250_000;
+        let rec = DecisionPointSellQuoteRecord {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            nominal_horizon_secs: 15,
+            delayed_entry_decision_time: "2026-01-01T00:00:06.200Z".parse().unwrap(),
+            delayed_buy_request_started_at: "2026-01-01T00:00:06.210Z".parse().unwrap(),
+            delayed_buy_quoted_at: "2026-01-01T00:00:06.230Z".parse().unwrap(),
+            delayed_buy_observed_at: "2026-01-01T00:00:06.260Z".parse().unwrap(),
+            delayed_base_amount_raw: delayed_base,
+            due_at: "2026-01-01T00:00:15.000Z".parse().unwrap(),
+            request_started_at: "2026-01-01T00:00:15.010Z".parse().unwrap(),
+            quote_observed_at: t,
+            sample_lag_ms: 70,
+            delayed_entry_to_quote_start_elapsed_ms: 8750,
+            delayed_entry_to_quote_available_elapsed_ms: 8810,
+            sell_quote: Some(matched_sell_quote_record(delayed_base, t)),
+            sell_quote_failure: None,
+            sell_rpc_gate_wait_ms: Some(2),
+            sell_rpc_call_duration_ms: Some(58),
+            sell_market_data_kind: None,
+        };
+        let payload = ObservationPayload::DecisionPointSellQuote(rec);
+        assert_eq!(payload.candidate_id(), Some("sig"));
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(
+            json.contains("\"kind\":\"decision_point_sell_quote\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"delayed_base_amount_raw\":250000"),
+            "{json}"
+        );
+        assert!(json.contains("\"quote_amount_raw\":1100000"), "{json}");
+        let back: ObservationPayload = serde_json::from_str(&json).unwrap();
+        match back {
+            ObservationPayload::DecisionPointSellQuote(back) => {
+                let q = back.sell_quote.unwrap();
+                assert_eq!(back.nominal_horizon_secs, 15);
+                assert_eq!(back.delayed_base_amount_raw, delayed_base);
+                assert_eq!(q.side, ObservedSide::Sell);
+                assert_eq!(q.base_amount_raw, delayed_base);
+                assert_eq!(back.sell_quote_failure, None);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decision_point_sell_quote_failure_round_trips_safe_codes() {
+        let t = "2026-01-01T00:00:15Z".parse::<DateTime<Utc>>().unwrap();
+        let rec = DecisionPointSellQuoteRecord {
+            candidate_id: "sig".into(),
+            mint: "mint".into(),
+            nominal_horizon_secs: 15,
+            delayed_entry_decision_time: t,
+            delayed_buy_request_started_at: t,
+            delayed_buy_quoted_at: t,
+            delayed_buy_observed_at: t,
+            delayed_base_amount_raw: 250_000,
+            due_at: t,
+            request_started_at: t,
+            quote_observed_at: t,
+            sample_lag_ms: 0,
+            delayed_entry_to_quote_start_elapsed_ms: 0,
+            delayed_entry_to_quote_available_elapsed_ms: 0,
+            sell_quote: None,
+            sell_quote_failure: Some(ObservationFailureCode::MarketUnavailable),
+            sell_rpc_gate_wait_ms: Some(0),
+            sell_rpc_call_duration_ms: Some(12),
+            sell_market_data_kind: Some(MarketDataFailureKind::AccountMissing),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: DecisionPointSellQuoteRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.sell_quote_failure,
+            Some(ObservationFailureCode::MarketUnavailable)
+        );
+        assert_eq!(
+            back.sell_market_data_kind,
+            Some(MarketDataFailureKind::AccountMissing)
+        );
+
+        let mut rpc = back.clone();
+        rpc.sell_quote_failure = Some(ObservationFailureCode::RpcUnavailable);
+        rpc.sell_market_data_kind = None;
+        let rpc_back: DecisionPointSellQuoteRecord =
+            serde_json::from_str(&serde_json::to_string(&rpc).unwrap()).unwrap();
+        assert_eq!(
+            rpc_back.sell_quote_failure,
+            Some(ObservationFailureCode::RpcUnavailable)
+        );
+        assert_eq!(rpc_back.sell_market_data_kind, None);
+
+        let mut unsupported = rpc_back;
+        unsupported.sell_quote_failure = Some(ObservationFailureCode::UnsupportedQuoteAsset);
+        let unsupported_back: DecisionPointSellQuoteRecord =
+            serde_json::from_str(&serde_json::to_string(&unsupported).unwrap()).unwrap();
+        assert_eq!(
+            unsupported_back.sell_quote_failure,
+            Some(ObservationFailureCode::UnsupportedQuoteAsset)
+        );
+    }
+    #[test]
+    fn test_schema_version_bumped_for_decision_point_sell_quote() {
+        // A second new tagged payload kind is not clearly backward-compatible with old v3 readers.
+        assert_eq!(OBSERVATION_SCHEMA_VERSION, 4);
     }
 
     #[test]

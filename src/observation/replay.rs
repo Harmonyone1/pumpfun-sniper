@@ -13,7 +13,7 @@ use crate::observation::schema::{ObservationEnvelope, ObservationPayload};
 pub struct ReplayRun {
     pub run_id: String,
     pub records: Vec<ObservationEnvelope>,
-    /// The single schema version used by every line in the run (1, 2, or 3). A run
+    /// The single schema version used by every line in the run (1, 2, 3, or 4). A run
     /// file must use exactly one version; mixed versions are rejected.
     pub schema_version: u32,
     /// True when a single unterminated trailing fragment failed to parse and
@@ -43,7 +43,7 @@ fn err<T>(msg: &str) -> crate::Result<T> {
 ///
 /// Fail-closed rules:
 /// - any interior (newline-terminated) malformed line => Err;
-/// - schema_version not in {1, 2, 3} => Err (version 0 or >3 rejected);
+/// - schema_version not in {1, 2, 3, 4} => Err (version 0 or >4 rejected);
 /// - mixed schema versions within one run => Err (all lines must match);
 /// - more than one distinct run_id => Err;
 /// - seq must be exactly 0,1,2,... contiguous => Err on any gap;
@@ -123,10 +123,10 @@ fn validate(records: &[ObservationEnvelope]) -> crate::Result<u32> {
     }
 
     // schema version, single run_id, contiguous seq. The run's version is taken
-    // from the first line; it must be a supported version (1, 2, or 3) and every
+    // from the first line; it must be a supported version (1, 2, 3, or 4) and every
     // subsequent line must match it exactly (no mixed schema-version runs).
     let schema_version = records[0].schema_version;
-    if schema_version != 1 && schema_version != 2 && schema_version != 3 {
+    if schema_version != 1 && schema_version != 2 && schema_version != 3 && schema_version != 4 {
         return err("unsupported schema version");
     }
     let run_id = &records[0].run_id;
@@ -299,6 +299,29 @@ mod tests {
             ObservationPayload::DecisionPointBuyQuote(_)
         ));
     }
+
+    #[test]
+    fn test_replay_v4_decision_point_sell_quote_supported() {
+        let run_started = r#"{"schema_version":4,"run_id":"v4","seq":0,"recorded_at":"2026-08-31T00:00:00Z","payload":{"kind":"run_started","data":{"source_revision":"abc","working_tree_clean":true,"binary_version":"0.1.0","network":"solana-mainnet","entry_quote_lamports":1000000,"outcome_horizons_secs":[2,4,6,15],"snapshot_horizons_secs":[15,30],"return_model":"protocol_net_ex_network_v1","intake_seconds":600,"max_active_candidates":64,"discovery_universe":"pumpportal_create_identity_v2","outcome_universe":"canonical_sol_quote_exact_0_001_sol_v1","observation_rpc_concurrency_limit":24}}}"#;
+        let matched = r#"{"schema_version":4,"run_id":"v4","seq":1,"recorded_at":"2026-08-31T00:00:15Z","payload":{"kind":"decision_point_sell_quote","data":{"candidate_id":"sig","mint":"mint","nominal_horizon_secs":15,"delayed_entry_decision_time":"2026-08-31T00:00:06.200Z","delayed_buy_request_started_at":"2026-08-31T00:00:06.210Z","delayed_buy_quoted_at":"2026-08-31T00:00:06.230Z","delayed_buy_observed_at":"2026-08-31T00:00:06.260Z","delayed_base_amount_raw":250000,"due_at":"2026-08-31T00:00:15.000Z","request_started_at":"2026-08-31T00:00:15.010Z","quote_observed_at":"2026-08-31T00:00:15.070Z","sample_lag_ms":70,"delayed_entry_to_quote_start_elapsed_ms":8750,"delayed_entry_to_quote_available_elapsed_ms":8810,"sell_quote":{"side":"sell","venue":"pump_bonding_curve","quote_asset":"sol","base_decimals":6,"quote_decimals":9,"base_amount_raw":250000,"base_amount_ui":0.25,"quote_amount_raw":1100000,"expected_price_sol_per_token":0.0044,"protocol_fee_bps":100,"creator_fee_bps":50,"lp_fee_bps":0,"slot":124,"quoted_at":"2026-08-31T00:00:15.050Z"},"sell_quote_failure":null,"sell_rpc_gate_wait_ms":2,"sell_rpc_call_duration_ms":58,"sell_market_data_kind":null}}}"#;
+        let run_finished = r#"{"schema_version":4,"run_id":"v4","seq":2,"recorded_at":"2026-08-31T00:00:16Z","payload":{"kind":"run_finished","data":{"completion":"complete","candidates_seen":1,"unique_candidates":1,"duplicate_candidate_events":0,"tracking_started":1,"tracking_skipped":0,"tracking_completed":1,"stream_connected_events":1,"stream_disconnect_events":0,"provider_errors":0,"unexpected_trade_events":0,"migrations_seen":0,"partial_new_token_events":0,"rpc_gate_peak_in_flight":1,"rpc_gate_acquisitions":1,"rpc_gate_wait_ms_total":2,"rpc_gate_wait_ms_max":2}}}"#;
+        let f = write_lines(
+            &[
+                run_started.to_string(),
+                matched.to_string(),
+                run_finished.to_string(),
+            ],
+            true,
+        );
+        let run = read_observation_run(f.path()).unwrap();
+        assert_eq!(run.schema_version, 4);
+        let timelines = run.candidate_timelines();
+        assert_eq!(timelines.get("sig").unwrap().len(), 1);
+        assert!(matches!(
+            timelines.get("sig").unwrap()[0].payload,
+            ObservationPayload::DecisionPointSellQuote(_)
+        ));
+    }
     #[test]
     fn test_replay_rejects_mixed_versions() {
         // First line v2, second line v1 => mixed run rejected.
@@ -310,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_replay_rejects_unsupported_version_high() {
-        let l0 = line(&envelope_v(4, 0, "r", run_started_payload()));
+        let l0 = line(&envelope_v(5, 0, "r", run_started_payload()));
         let f = write_lines(&[l0], true);
         assert!(read_observation_run(f.path()).is_err());
     }
