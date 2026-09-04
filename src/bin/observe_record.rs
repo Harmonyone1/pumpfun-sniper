@@ -52,7 +52,8 @@ use pumpfun_sniper::observation::measurement_runtime::{
     MEASUREMENT_TRADE_QUEUE_CAPACITY,
 };
 use pumpfun_sniper::observation::measurement_sink::{
-    normalize_trade_event, MeasurementPayload, MeasurementSink, SubscriptionStateRecord,
+    normalize_trade_event, MeasurementPayload, MeasurementRunSummary, MeasurementSink,
+    SubscriptionStateRecord,
 };
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::market::pump_state::bonding_curve_pda;
@@ -747,13 +748,55 @@ struct CandidateTaskResult {
 /// each per-candidate task is a CONSUMER that reads the buffer at its actual T2/T6
 /// sampled_at cutoffs to emit exactly-once snapshots. Both write the append-only
 /// sink. Critical sections are lock-brief and NEVER held across `.await`.
+/// Run-scoped P3 telemetry counters (2D). Aggregated across the main loop and all
+/// enrichment/track tasks; snapshotted into the RunSummary at shutdown.
+#[derive(Debug, Default, Clone)]
+struct MeasurementCounters {
+    eligible_candidates: u64,
+    subscribe_attempts: u64,
+    subscribe_successes: u64,
+    subscribe_failures: u64,
+    unsubscribe_attempts: u64,
+    unsubscribe_successes: u64,
+    unsubscribe_failures: u64,
+    disconnects: u64,
+    reconnects: u64,
+    resubscribe_attempts: u64,
+    resubscribe_successes: u64,
+    resubscribe_failures: u64,
+    trade_events_received: u64,
+    trade_observed_persisted: u64,
+    duplicate_trade_events: u64,
+    stale_trade_events: u64,
+    backpressure_failures: u64,
+    t2_attempts: u64,
+    t2_successes: u64,
+    t6_attempts: u64,
+    t6_successes: u64,
+    holder_attempts: u64,
+    holder_successes: u64,
+    holder_failures: u64,
+    probe_attempts: u64,
+    probe_successes: u64,
+    probe_failures: u64,
+}
+
+use pumpfun_sniper::observation::measurement_runtime::CoverageState;
+
 struct MeasurementShared {
     state: std::sync::Mutex<ParticipationState>,
+    registry: std::sync::Mutex<SubscriptionRegistry>,
+    counters: std::sync::Mutex<MeasurementCounters>,
     sink: std::sync::Mutex<MeasurementSink<std::fs::File>>,
+    sender: CommandSender,
     run_id: String,
 }
 
 impl MeasurementShared {
+    fn count(&self, f: impl FnOnce(&mut MeasurementCounters)) {
+        f(&mut self.counters.lock().expect("counters poisoned"));
+    }
+
     /// Record a deduped, normalized trade into its mint buffer AND persist it to
     /// the durable sink. Buffer inclusion is keyed by `event_received_at` (stamped
     /// at main-loop processing time), so a trade is in the buffer iff it already
@@ -764,20 +807,191 @@ impl MeasurementShared {
             let mut st = self.state.lock().expect("participation state poisoned");
             st.record_trade(t.clone());
         }
-        let _ = self
+        if self
             .sink
             .lock()
             .expect("sink poisoned")
-            .append(MeasurementPayload::TradeObserved(t), Utc::now());
+            .append(MeasurementPayload::TradeObserved(t), Utc::now())
+            .is_ok()
+        {
+            self.count(|c| c.trade_observed_persisted += 1);
+        }
     }
 
-    /// Persist an arbitrary measurement payload (subscription state, failure).
+    /// Persist an arbitrary measurement payload (subscription state, failure, summary).
+    /// After sink close this is rejected and counted as a late write by the sink.
     fn append(&self, payload: MeasurementPayload) {
         let _ = self.sink.lock().expect("sink poisoned").append(payload, Utc::now());
     }
 
-    fn set_coverage(&self, mint: &str, cov: pumpfun_sniper::observation::measurement_runtime::CoverageState) {
+    fn set_coverage(&self, mint: &str, cov: CoverageState) {
         self.state.lock().expect("participation state poisoned").set_coverage(mint, cov);
+    }
+
+    /// Is this mint an expected-active subscription right now?
+    fn is_active(&self, mint: &str) -> bool {
+        self.registry.lock().expect("registry poisoned").is_active(mint)
+    }
+
+    /// Has this mint's candidate terminated (tombstoned)? Distinguishes stale trades.
+    fn is_terminated(&self, mint: &str) -> bool {
+        self.registry.lock().expect("registry poisoned").is_terminated(mint)
+    }
+
+    /// Ingestion signature dedup (earliest wins).
+    fn accept_signature(&self, mint: &str, sig: &str) -> bool {
+        self.registry.lock().expect("registry poisoned").accept_signature(mint, sig)
+    }
+
+    fn note_trade(&self, mint: &str, at: DateTime<Utc>) {
+        if let Some(s) = self.registry.lock().expect("registry poisoned").get_mut(mint) {
+            s.note_trade(at);
+        }
+    }
+
+    /// UNCONDITIONAL subscribe-on-admission: request, send SubscribeTokenTrades,
+    /// record ack/failure, publish coverage, persist the subscription-state row.
+    async fn subscribe(&self, mint: &str) {
+        {
+            let mut reg = self.registry.lock().expect("registry poisoned");
+            reg.request(mint, Utc::now());
+        }
+        self.count(|c| {
+            c.eligible_candidates += 1;
+            c.subscribe_attempts += 1;
+        });
+        let res = self
+            .sender
+            .send(SubscriptionCommand::SubscribeTokenTrades(vec![mint.to_string()]))
+            .await;
+        let (cov, record) = {
+            let mut reg = self.registry.lock().expect("registry poisoned");
+            if let Some(s) = reg.get_mut(mint) {
+                match res {
+                    Ok(()) => s.mark_active(Utc::now()),
+                    Err(_) => s.mark_failed(MeasurementFailureCategory::RpcUnavailable),
+                }
+            }
+            (
+                reg.get(mint).map(|s| s.coverage_state()),
+                reg.get(mint).map(SubscriptionStateRecord::from_sub),
+            )
+        };
+        self.count(|c| {
+            if res.is_ok() {
+                c.subscribe_successes += 1;
+            } else {
+                c.subscribe_failures += 1;
+            }
+        });
+        if let Some(cov) = cov {
+            self.set_coverage(mint, cov);
+        }
+        if let Some(rec) = record {
+            self.append(MeasurementPayload::SubscriptionState(rec));
+        }
+    }
+
+    /// Terminal candidate lifecycle: issue UnsubscribeTokenTrades, record ack/failure
+    /// (never pretend clean), persist the final subscription-state row, then TOMBSTONE
+    /// the mint (registry + participation state) so a late trade cannot resurrect it.
+    async fn unsubscribe_and_terminate(&self, mint: &str) {
+        let was_active = self.is_active(mint);
+        if was_active {
+            self.count(|c| c.unsubscribe_attempts += 1);
+            let res = self
+                .sender
+                .send(SubscriptionCommand::UnsubscribeTokenTrades(vec![mint.to_string()]))
+                .await;
+            {
+                let mut reg = self.registry.lock().expect("registry poisoned");
+                match res {
+                    Ok(()) => {
+                        reg.unsubscribe(mint, true);
+                    }
+                    Err(_) => reg.unsubscribe_failed(mint, MeasurementFailureCategory::RpcUnavailable),
+                }
+                if let Some(rec) = reg.get(mint).map(SubscriptionStateRecord::from_sub) {
+                    let _ = self
+                        .sink
+                        .lock()
+                        .expect("sink poisoned")
+                        .append(MeasurementPayload::SubscriptionState(rec), Utc::now());
+                }
+            }
+            self.count(|c| {
+                if res.is_ok() {
+                    c.unsubscribe_successes += 1;
+                } else {
+                    c.unsubscribe_failures += 1;
+                }
+            });
+        }
+        // Tombstone + clear all per-candidate state (idempotent).
+        self.registry.lock().expect("registry poisoned").cleanup(mint);
+        self.state.lock().expect("participation state poisoned").cleanup(mint);
+    }
+
+    /// On stream disconnect: every active subscription's coverage becomes UNKNOWN
+    /// (interruption is never later encoded as zero trades).
+    fn on_disconnect(&self) {
+        self.count(|c| c.disconnects += 1);
+        self.registry.lock().expect("registry poisoned").mark_all_coverage_unknown();
+        // Mirror UNKNOWN coverage into participation state for any active mint.
+        let mints: Vec<String> = self
+            .registry
+            .lock()
+            .expect("registry poisoned")
+            .active_mints();
+        for m in mints {
+            self.set_coverage(&m, CoverageState::StreamCoverageUnknown);
+        }
+    }
+
+    /// On reconnect: resubscribe ALL active-eligible mints (never selective), record
+    /// per-mint outcome. Coverage returns to known only after a fresh ack.
+    async fn on_reconnect(&self) {
+        self.count(|c| c.reconnects += 1);
+        let mints = self.registry.lock().expect("registry poisoned").reconnect_resubscribe_all();
+        for mint in mints {
+            self.count(|c| c.resubscribe_attempts += 1);
+            let res = self
+                .sender
+                .send(SubscriptionCommand::SubscribeTokenTrades(vec![mint.clone()]))
+                .await;
+            let cov = {
+                let mut reg = self.registry.lock().expect("registry poisoned");
+                if let Some(s) = reg.get_mut(&mint) {
+                    match res {
+                        Ok(()) => s.mark_active(Utc::now()),
+                        Err(_) => s.mark_failed(MeasurementFailureCategory::RpcUnavailable),
+                    }
+                }
+                reg.get(&mint).map(|s| s.coverage_state())
+            };
+            self.count(|c| {
+                if res.is_ok() {
+                    c.resubscribe_successes += 1;
+                } else {
+                    c.resubscribe_failures += 1;
+                }
+            });
+            if let Some(cov) = cov {
+                self.set_coverage(&mint, cov);
+            }
+        }
+    }
+
+    /// Run-end sweep: unsubscribe every still-active/uncertain mint. Returns
+    /// (active_before_sweep, active_after_sweep).
+    async fn run_end_sweep(&self) -> (u64, u64) {
+        let mints = self.registry.lock().expect("registry poisoned").active_mints();
+        let before = mints.len() as u64;
+        for mint in mints {
+            self.unsubscribe_and_terminate(&mint).await;
+        }
+        let after = self.registry.lock().expect("registry poisoned").active_mints().len() as u64;
+        (before, after)
     }
 
     /// Emit the final T2/T6 snapshot for a mint exactly once. `cutoff` is the actual
@@ -790,12 +1004,23 @@ impl MeasurementShared {
         cutoff: DateTime<Utc>,
         computed_at: DateTime<Utc>,
     ) {
+        self.count(|c| match class {
+            SnapshotClass::T2 => c.t2_attempts += 1,
+            SnapshotClass::T6 => c.t6_attempts += 1,
+        });
         let snap = {
             let mut st = self.state.lock().expect("participation state poisoned");
             st.build_snapshot(&self.run_id, mint, class, cutoff, computed_at)
         };
         if let Some(s) = snap {
+            let ok = s.failure.is_none();
             self.append(MeasurementPayload::ParticipationSnapshot(s));
+            if ok {
+                self.count(|c| match class {
+                    SnapshotClass::T2 => c.t2_successes += 1,
+                    SnapshotClass::T6 => c.t6_successes += 1,
+                });
+            }
         }
     }
 
@@ -804,12 +1029,80 @@ impl MeasurementShared {
     fn cleanup(&self, mint: &str) {
         self.state.lock().expect("participation state poisoned").cleanup(mint);
     }
+
+    /// Flush + seal the sink. After this, any append is rejected + counted late.
+    fn close_sink(&self) -> (u64, bool) {
+        let mut sink = self.sink.lock().expect("sink poisoned");
+        let flush_ok = sink.close().is_ok();
+        (sink.appended(), flush_ok)
+    }
+
+    fn late_write_attempts(&self) -> u64 {
+        self.sink.lock().expect("sink poisoned").late_write_attempts()
+    }
+
+    /// Build the run-scoped measurement summary from the counters + registry sweep
+    /// results + queue/sink telemetry. Called at shutdown before sink close.
+    fn build_summary(
+        &self,
+        queue_high_water: usize,
+        silent_drops: u64,
+        pending_before: u64,
+        completed_during: u64,
+        timed_out: u64,
+        active_before_sweep: u64,
+        stale_after: u64,
+    ) -> MeasurementRunSummary {
+        let c = self.counters.lock().expect("counters poisoned").clone();
+        let (rows, _) = {
+            let sink = self.sink.lock().expect("sink poisoned");
+            (sink.appended(), sink.is_closed())
+        };
+        MeasurementRunSummary {
+            eligible_candidates: c.eligible_candidates,
+            subscribe_attempts: c.subscribe_attempts,
+            subscribe_successes: c.subscribe_successes,
+            subscribe_failures: c.subscribe_failures,
+            unsubscribe_attempts: c.unsubscribe_attempts,
+            unsubscribe_successes: c.unsubscribe_successes,
+            unsubscribe_failures: c.unsubscribe_failures,
+            disconnects: c.disconnects,
+            reconnects: c.reconnects,
+            resubscribe_attempts: c.resubscribe_attempts,
+            resubscribe_successes: c.resubscribe_successes,
+            resubscribe_failures: c.resubscribe_failures,
+            trade_events_received: c.trade_events_received,
+            trade_observed_persisted: c.trade_observed_persisted,
+            duplicate_trade_events: c.duplicate_trade_events,
+            stale_trade_events: c.stale_trade_events,
+            queue_high_water,
+            backpressure_failures: c.backpressure_failures,
+            silent_drops,
+            t2_attempts: c.t2_attempts,
+            t2_successes: c.t2_successes,
+            t6_attempts: c.t6_attempts,
+            t6_successes: c.t6_successes,
+            holder_attempts: c.holder_attempts,
+            holder_successes: c.holder_successes,
+            holder_failures: c.holder_failures,
+            probe_attempts: c.probe_attempts,
+            probe_successes: c.probe_successes,
+            probe_failures: c.probe_failures,
+            pending_tasks_before_drain: pending_before,
+            tasks_completed_during_drain: completed_during,
+            tasks_timed_out: timed_out,
+            late_write_attempts: self.late_write_attempts(),
+            active_before_sweep,
+            stale_subscriptions_after_shutdown: stale_after,
+            measurement_rows_written: rows,
+            sink_flush_success: true,
+        }
+    }
 }
 
-/// RAII guard: clears a candidate's in-memory participation state when the
-/// per-candidate task ends by ANY path (normal return, early error, panic).
-/// Guarantees no stale buffer/coverage/emission mapping outlives the task.
-/// (Full unsubscribe/reconnect lifecycle certification remains 2D.)
+/// RAII guard: clears a candidate's in-memory participation state if the
+/// per-candidate task PANICS before its normal terminate path runs. On the normal
+/// path `unsubscribe_and_terminate` has already cleaned + tombstoned (idempotent).
 struct ParticipationCleanup {
     shared: Arc<MeasurementShared>,
     mint: String,
@@ -982,10 +1275,11 @@ async fn acquire_microstructure_probe(
 /// Frozen T0 microstructure probe sizes (lamports).
 const MICROSTRUCTURE_PROBE_LAMPORTS: [u64; 3] = [500_000, 1_000_000, 2_000_000];
 
-/// Domain 2 + 3 T0 enrichment, run as a DETACHED task so canonical outcome-horizon
-/// scheduling is never blocked (enrichment is expendable; the observation core is
-/// not). Unconditional per candidate — no dependence on hypothesis/price/future
-/// state. Persists a HolderSnapshot + one MicrostructureProbe per frozen size to the
+/// Domain 2 + 3 T0 enrichment. Owned by the run's bounded enrichment JoinSet (NOT a
+/// detached task) so RunFinished can await/abort it — canonical outcome-horizon
+/// scheduling is still never blocked (it runs concurrently, awaited only at shutdown).
+/// Unconditional per candidate — no dependence on hypothesis/price/future state.
+/// Persists a HolderSnapshot + one MicrostructureProbe per frozen size to the
 /// separate measurement sink. `t0_deadline` is the T0 point (candidate admission);
 /// `available_in_time` is truthful, never backdated.
 #[allow(clippy::too_many_arguments)]
@@ -1017,6 +1311,14 @@ async fn t0_enrichment(
         t0_deadline,
     )
     .await;
+    shared.count(|c| {
+        c.holder_attempts += 1;
+        if holder.failure.is_none() {
+            c.holder_successes += 1;
+        } else {
+            c.holder_failures += 1;
+        }
+    });
     shared.append(MeasurementPayload::HolderSnapshot(holder));
 
     // Domain 3 — read-only microstructure probes at each frozen size (unconditional).
@@ -1031,13 +1333,22 @@ async fn t0_enrichment(
             t0_deadline,
         )
         .await;
+        shared.count(|c| {
+            c.probe_attempts += 1;
+            if probe.success {
+                c.probe_successes += 1;
+            } else {
+                c.probe_failures += 1;
+            }
+        });
         shared.append(MeasurementPayload::MicrostructureProbe(probe));
     }
 }
 
+/// Frozen bounded shutdown budget (secs) for draining P3 enrichment tasks.
+const MEASUREMENT_ENRICHMENT_DRAIN_SECS: u64 = 20;
+
 struct MeasurementCtx {
-    sender: CommandSender,
-    registry: SubscriptionRegistry,
     shared: Arc<MeasurementShared>,
     queue: BoundedTradeQueue,
     /// Shared read-only RPC handle for Domain-2/3 T0 enrichment (never signs/sends).
@@ -1047,27 +1358,10 @@ struct MeasurementCtx {
 }
 
 impl MeasurementCtx {
-    /// Unconditional: issue a token-trade subscribe for a just-admitted mint and
-    /// record subscription state. No dependence on any hypothesis/price/outcome.
+    /// Unconditional subscribe-on-admission (delegates lifecycle to the shared handle
+    /// so the same registry/sender is used by candidate-terminate + reconnect sweeps).
     async fn on_candidate_admitted(&mut self, mint: &str) {
-        self.registry.request(mint, Utc::now());
-        let res = self
-            .sender
-            .send(SubscriptionCommand::SubscribeTokenTrades(vec![mint.to_string()]))
-            .await;
-        if let Some(s) = self.registry.get_mut(mint) {
-            match res {
-                Ok(()) => s.mark_active(Utc::now()),
-                Err(_) => s.mark_failed(MeasurementFailureCategory::RpcUnavailable),
-            }
-        }
-        if let Some(s) = self.registry.get(mint) {
-            // Publish coverage truth so the per-candidate task derives zero-activity
-            // vs missing/failure correctly, then persist the subscription-state row.
-            self.shared.set_coverage(mint, s.coverage_state());
-            self.shared
-                .append(MeasurementPayload::SubscriptionState(SubscriptionStateRecord::from_sub(s)));
-        }
+        self.shared.subscribe(mint).await;
     }
 
     /// Route an incoming trade for an expected-active mint: dedup by signature
@@ -1075,7 +1369,9 @@ impl MeasurementCtx {
     /// queue (explicit backpressure failure, never a silent drop), then persist
     /// TradeObserved to the shared sink + candidate buffer for T2/T6 snapshots.
     fn on_expected_trade(&mut self, ev: &TradeEvent) {
-        if !self.registry.accept_signature(&ev.mint, &ev.signature) {
+        self.shared.count(|c| c.trade_events_received += 1);
+        if !self.shared.accept_signature(&ev.mint, &ev.signature) {
+            self.shared.count(|c| c.duplicate_trade_events += 1);
             return; // duplicate signature — not persisted twice
         }
         let now = Utc::now();
@@ -1083,13 +1379,12 @@ impl MeasurementCtx {
         match self.queue.push(t) {
             Ok(()) => {
                 for qt in self.queue.drain() {
-                    if let Some(s) = self.registry.get_mut(&qt.mint) {
-                        s.note_trade(qt.event_received_at);
-                    }
+                    self.shared.note_trade(&qt.mint, qt.event_received_at);
                     self.shared.record_and_persist(qt);
                 }
             }
             Err(_bp) => {
+                self.shared.count(|c| c.backpressure_failures += 1);
                 self.shared.append(MeasurementPayload::MeasurementFailure(MeasurementFailureRecord {
                     run_id: self.run_id.clone(),
                     mint: ev.mint.clone(),
@@ -1212,22 +1507,26 @@ async fn main() -> Result<()> {
         std::fs::File::create(&measurement_path).context("failed to create measurement sink file")?;
     let measurement_shared = Arc::new(MeasurementShared {
         state: std::sync::Mutex::new(ParticipationState::new()),
+        registry: std::sync::Mutex::new(SubscriptionRegistry::new()),
+        counters: std::sync::Mutex::new(MeasurementCounters::default()),
         sink: std::sync::Mutex::new(MeasurementSink::new(
             measurement_file,
             &measurement_run_id,
             &source_revision,
         )),
+        sender: client.get_command_sender(),
         run_id: measurement_run_id.clone(),
     });
     let mut meas = MeasurementCtx {
-        sender: client.get_command_sender(),
-        registry: SubscriptionRegistry::new(),
         shared: measurement_shared.clone(),
         queue: BoundedTradeQueue::new(MEASUREMENT_TRADE_QUEUE_CAPACITY),
         rpc: rpc.clone(),
         run_id: measurement_run_id.clone(),
         source_revision: source_revision.clone(),
     };
+    // Owned bounded registry for P3 enrichment tasks — no untracked tokio::spawn for
+    // run-scoped measurement work; drained (bounded) at shutdown.
+    let mut enrichment_tasks: JoinSet<()> = JoinSet::new();
 
     let oracle = Arc::new(PumpMarketOracle::new(rpc.clone()));
     let semaphore = Arc::new(Semaphore::new(max_active_candidates));
@@ -1278,6 +1577,7 @@ async fn main() -> Result<()> {
                     &mut seen_signatures,
                     &mut counters,
                     &mut tasks,
+                    &mut enrichment_tasks,
                     &mut ever_connected,
                     &mut stream_connected,
                     &mut meas,
@@ -1339,7 +1639,53 @@ async fn main() -> Result<()> {
     }
 
     // --- Section 42: bounded outcome drain of already-started tasks. ---
+    // (Each track task self-unsubscribes + tombstones on its normal exit path.)
     drain_outcome_tasks(&mut tasks, &recorder, &mut counters).await;
+
+    // --- P3 (2D): finalize the measurement subsystem BEFORE canonical RunFinished. ---
+    // Ordering: sweep remaining subscriptions -> bounded-drain owned enrichment tasks
+    // -> persist run summary -> flush+seal sink. After the sink is sealed, any late
+    // write (e.g. an aborted straggler) is rejected and counted, never appended.
+    // 1) Unsubscribe every still-active subscription (tasks aborted by the outcome
+    //    drain never reached their self-unsubscribe; this is the backstop sweep).
+    let (active_before_sweep, stale_after_sweep) = measurement_shared.run_end_sweep().await;
+    // 2) Drain the OWNED enrichment task set within a bounded budget; abort stragglers.
+    let pending_before = enrichment_tasks.len() as u64;
+    let mut completed_during = 0u64;
+    let drain_enrichment = async {
+        while enrichment_tasks.join_next().await.is_some() {
+            completed_during += 1;
+        }
+    };
+    let timed_out = match tokio::time::timeout(
+        Duration::from_secs(MEASUREMENT_ENRICHMENT_DRAIN_SECS),
+        drain_enrichment,
+    )
+    .await
+    {
+        Ok(()) => 0u64,
+        Err(_) => {
+            enrichment_tasks.abort_all();
+            while enrichment_tasks.join_next().await.is_some() {}
+            pending_before.saturating_sub(completed_during)
+        }
+    };
+    // 3) Persist the run-scoped measurement summary, then flush + seal the sink.
+    let summary = measurement_shared.build_summary(
+        meas.queue.high_water,
+        meas.queue.silent_drops,
+        pending_before,
+        completed_during,
+        timed_out,
+        active_before_sweep,
+        stale_after_sweep,
+    );
+    measurement_shared.append(MeasurementPayload::RunSummary(summary));
+    let (measurement_rows, measurement_flush_ok) = measurement_shared.close_sink();
+    println!(
+        "Measurement sink sealed: rows={measurement_rows} flush_ok={measurement_flush_ok} late_writes={}",
+        measurement_shared.late_write_attempts()
+    );
 
     // --- Section 22/43: append authoritative RunFinished, then sync. ---
     // §16: aggregate observation RPC gate stats (read after the outcome drain so
@@ -1414,6 +1760,7 @@ async fn handle_intake_event(
     seen_signatures: &mut HashSet<String>,
     counters: &mut RunCounters,
     tasks: &mut JoinSet<CandidateTaskOutcome>,
+    enrichment: &mut JoinSet<()>,
     ever_connected: &mut bool,
     stream_connected: &mut bool,
     meas: &mut MeasurementCtx,
@@ -1421,16 +1768,24 @@ async fn handle_intake_event(
     match event {
         PumpPortalEvent::Connected => {
             counters.stream_connected_events += 1;
+            // A Connected AFTER we were ever connected is a RECONNECT: resubscribe
+            // ALL active eligible mints (unconditional, never selective).
+            let is_reconnect = *ever_connected;
             *ever_connected = true;
             *stream_connected =
                 apply_stream_transition(*stream_connected, StreamTransition::Connected);
             append_required(recorder, stream_state(StreamStateKind::Connected, None)).await?;
+            if is_reconnect {
+                meas.shared.on_reconnect().await;
+            }
             println!("PumpPortal: connected");
         }
         PumpPortalEvent::Disconnected => {
             counters.stream_disconnect_events += 1;
             *stream_connected =
                 apply_stream_transition(*stream_connected, StreamTransition::Disconnected);
+            // P3: mark all active subscriptions coverage-UNKNOWN (never zero-fill).
+            meas.shared.on_disconnect();
             append_required(recorder, stream_state(StreamStateKind::Disconnected, None)).await?;
         }
         PumpPortalEvent::Error(category) => {
@@ -1457,9 +1812,14 @@ async fn handle_intake_event(
             // P3 Domain-1: if this mint has an expected-active token-trade
             // subscription, route it to the SEPARATE measurement sink (canonical
             // stream untouched). Otherwise preserve the unexpected-trade anomaly.
-            if meas.registry.is_active(&ev.mint) {
+            if meas.shared.is_active(&ev.mint) {
                 meas.on_expected_trade(&ev);
             } else {
+                // A trade for a terminated (tombstoned) mint is STALE — recorded as a
+                // distinct measurement diagnostic and NEVER used to resurrect state.
+                if meas.shared.is_terminated(&ev.mint) {
+                    meas.shared.count(|c| c.stale_trade_events += 1);
+                }
                 counters.unexpected_trade_events += 1;
                 append_required(recorder, stream_state(StreamStateKind::UnexpectedTrade, None)).await?;
             }
@@ -1491,6 +1851,7 @@ async fn handle_intake_event(
                 seen_signatures,
                 counters,
                 tasks,
+                enrichment,
                 meas,
             )
             .await?;
@@ -1512,6 +1873,7 @@ async fn handle_intake_event(
                 seen_signatures,
                 counters,
                 tasks,
+                enrichment,
                 meas,
             )
             .await?;
@@ -1634,6 +1996,7 @@ async fn discover_candidate(
     seen_signatures: &mut HashSet<String>,
     counters: &mut RunCounters,
     tasks: &mut JoinSet<CandidateTaskOutcome>,
+    enrichment: &mut JoinSet<()>,
     meas: &mut MeasurementCtx,
 ) -> std::result::Result<(), CollectorRecordError> {
     let candidate_received_at = Utc::now();
@@ -1691,7 +2054,7 @@ async fn discover_candidate(
             // P3 Domain-2/3 (unconditional): detached T0 holder + microstructure
             // enrichment. Detached on purpose — canonical outcome-horizon scheduling
             // outranks enrichment and must never wait on it (enrichment is expendable).
-            tokio::spawn(t0_enrichment(
+            enrichment.spawn(t0_enrichment(
                 mint,
                 candidate.creator.clone(),
                 oracle.clone(),
@@ -1955,11 +2318,43 @@ async fn drain_outcome_tasks(
 // Tracking task (sections 36-40)
 // ---------------------------------------------------------------------------
 
+/// Thin lifecycle wrapper: runs the tracking body, then ALWAYS issues the terminal
+/// P3 unsubscribe + tombstone + state-clear on the normal exit path (any early Ok/Err
+/// return from the body). A panic is covered by the inner ParticipationCleanup guard
+/// (participation state) plus the run-end unsubscribe sweep (subscription). Preserves
+/// the exact CandidateTaskOutcome the reaper/drain accounting expects.
+async fn track_candidate(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    candidate_id: String,
+    mint: Pubkey,
+    candidate_received_at: DateTime<Utc>,
+    oracle: Arc<PumpMarketOracle>,
+    rpc_gate: Arc<ObservationRpcGate>,
+    recorder: ObservationRecorder,
+    measurement: Arc<MeasurementShared>,
+) -> CandidateTaskOutcome {
+    let mint_str = mint.to_string();
+    let outcome = track_candidate_inner(
+        permit,
+        candidate_id,
+        mint,
+        candidate_received_at,
+        oracle,
+        rpc_gate,
+        recorder,
+        measurement.clone(),
+    )
+    .await;
+    measurement.unsubscribe_and_terminate(&mint_str).await;
+    outcome
+}
+
 /// Bounded initial snapshot + buy-quote retry schedule (0/250/500/1000ms), then a
 /// fixed-horizon outcome sampling loop anchored to the successful initial buy
 /// quote. Read-only throughout: `quote_buy_sol`/`quote_sell_raw`/`snapshot` are
 /// canonical quotes, never order submissions.
-async fn track_candidate(
+#[allow(clippy::too_many_arguments)]
+async fn track_candidate_inner(
     _permit: tokio::sync::OwnedSemaphorePermit,
     candidate_id: String,
     mint: Pubkey,

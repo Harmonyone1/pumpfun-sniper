@@ -163,6 +163,9 @@ pub struct SubscriptionRegistry {
     subs: std::collections::BTreeMap<String, MintSubscription>,
     buffers: std::collections::BTreeMap<String, Vec<TradeObserved>>,
     seen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Tombstone of mints whose candidate lifecycle has terminated. Survives
+    /// `cleanup` so a late trade is classified STALE (never resurrects state).
+    terminated: std::collections::BTreeSet<String>,
 }
 
 impl SubscriptionRegistry {
@@ -207,11 +210,51 @@ impl SubscriptionRegistry {
     pub fn buffer(&self, mint: &str) -> &[TradeObserved] {
         self.buffers.get(mint).map(|v| v.as_slice()).unwrap_or(&[])
     }
-    /// Terminal cleanup: remove all state + buffer for a candidate (no stale state).
+    /// Mark an unsubscribe as requested (and optionally confirmed) for a mint.
+    /// Returns whether the mint was active/requested before this call. The actual
+    /// provider command is issued by the caller; this only records lifecycle truth.
+    pub fn unsubscribe(&mut self, mint: &str, confirmed: bool) -> bool {
+        let was_active = self.is_active(mint);
+        if let Some(s) = self.subs.get_mut(mint) {
+            s.mark_unsubscribed(confirmed);
+        }
+        was_active
+    }
+
+    /// Record an unsubscribe failure explicitly (provider rejected/no ack). Keeps
+    /// the request flag but does not pretend the candidate was cleanly removed.
+    pub fn unsubscribe_failed(&mut self, mint: &str, cat: MeasurementFailureCategory) {
+        if let Some(s) = self.subs.get_mut(mint) {
+            s.unsubscribe_requested = true;
+            s.unsubscribe_confirmed = false;
+            s.failure = Some(cat);
+        }
+    }
+
+    /// On disconnect: coverage for every active/requested subscription becomes
+    /// UNKNOWN (the interruption is never later encoded as zero trades). Does NOT
+    /// change the phase — a resubscribe on reconnect restores known coverage.
+    pub fn mark_all_coverage_unknown(&mut self) {
+        for s in self.subs.values_mut() {
+            if matches!(s.phase, SubscriptionPhase::Active | SubscriptionPhase::Requested) {
+                s.coverage_known = false;
+            }
+        }
+    }
+
+    /// True if this mint's candidate has terminated (tombstoned). Distinguishes a
+    /// STALE trade (was tracked, now gone) from a never-subscribed unexpected trade.
+    pub fn is_terminated(&self, mint: &str) -> bool {
+        self.terminated.contains(mint)
+    }
+
+    /// Terminal cleanup: remove all state + buffer for a candidate and TOMBSTONE the
+    /// mint (no stale state; late trades cannot resurrect it).
     pub fn cleanup(&mut self, mint: &str) {
         self.subs.remove(mint);
         self.buffers.remove(mint);
         self.seen.remove(mint);
+        self.terminated.insert(mint.to_string());
     }
     /// Mints still active (for reconnect restore). Unconditional set.
     pub fn active_mints(&self) -> Vec<String> {
@@ -773,5 +816,61 @@ mod tests {
         assert!(!audit.within_tolerance);
         assert_eq!(audit.class, super::super::measurement::RedundancyClass::NonRedundant);
         assert!(microstructure_redundancy(1000, 0, 6, 30.0, 1e9).is_none());
+    }
+
+    // --- 2D: subscription lifecycle (unsubscribe, coverage-unknown, tombstone) ---
+
+    #[test] // unsubscribe clears active state and reports prior activity
+    fn unsub_clears_active() {
+        let mut reg = SubscriptionRegistry::new();
+        reg.request("M", ts(0));
+        reg.get_mut("M").unwrap().mark_active(ts(1));
+        assert!(reg.is_active("M"));
+        assert!(reg.unsubscribe("M", true));
+        assert!(!reg.is_active("M"));
+        assert!(reg.get("M").unwrap().unsubscribe_confirmed);
+    }
+
+    #[test] // unsubscribe failure is explicit; not pretended clean
+    fn unsub_failure_explicit() {
+        let mut reg = SubscriptionRegistry::new();
+        reg.request("M", ts(0));
+        reg.get_mut("M").unwrap().mark_active(ts(1));
+        reg.unsubscribe_failed("M", MeasurementFailureCategory::Timeout);
+        let s = reg.get("M").unwrap();
+        assert!(s.unsubscribe_requested);
+        assert!(!s.unsubscribe_confirmed);
+        assert_eq!(s.failure, Some(MeasurementFailureCategory::Timeout));
+    }
+
+    #[test] // disconnect marks active candidates coverage-unknown (never zero-filled)
+    fn disconnect_marks_coverage_unknown() {
+        let mut reg = SubscriptionRegistry::new();
+        for m in ["A", "B"] {
+            reg.request(m, ts(0));
+            reg.get_mut(m).unwrap().mark_active(ts(1));
+        }
+        reg.mark_all_coverage_unknown();
+        assert_eq!(reg.get("A").unwrap().coverage_state(), CoverageState::StreamCoverageUnknown);
+        assert_eq!(reg.get("B").unwrap().coverage_state(), CoverageState::StreamCoverageUnknown);
+        // reconnect resubscribe leaves them still uncertain until re-acked
+        let restored = reg.reconnect_resubscribe_all();
+        assert_eq!(restored.len(), 2);
+        // re-ack restores known coverage from that point forward
+        reg.get_mut("A").unwrap().mark_active(ts(9));
+        assert_eq!(reg.get("A").unwrap().coverage_state(), CoverageState::Active);
+    }
+
+    #[test] // cleanup tombstones the mint so a late trade is STALE, never resurrected
+    fn cleanup_tombstones_mint() {
+        let mut reg = SubscriptionRegistry::new();
+        reg.request("M", ts(0));
+        reg.get_mut("M").unwrap().mark_active(ts(1));
+        reg.cleanup("M");
+        assert!(!reg.is_active("M"));
+        assert!(reg.is_terminated("M"));
+        // a never-seen mint is neither active nor terminated
+        assert!(!reg.is_active("Z"));
+        assert!(!reg.is_terminated("Z"));
     }
 }

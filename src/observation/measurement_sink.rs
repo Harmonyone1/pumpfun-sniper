@@ -56,6 +56,49 @@ impl SubscriptionStateRecord {
     }
 }
 
+/// Final run-scoped measurement summary (2D). Persisted once at shutdown so a run's
+/// acquisition/lifecycle health is auditable from the sink alone. Run-scoped: no mint.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeasurementRunSummary {
+    pub eligible_candidates: u64,
+    pub subscribe_attempts: u64,
+    pub subscribe_successes: u64,
+    pub subscribe_failures: u64,
+    pub unsubscribe_attempts: u64,
+    pub unsubscribe_successes: u64,
+    pub unsubscribe_failures: u64,
+    pub disconnects: u64,
+    pub reconnects: u64,
+    pub resubscribe_attempts: u64,
+    pub resubscribe_successes: u64,
+    pub resubscribe_failures: u64,
+    pub trade_events_received: u64,
+    pub trade_observed_persisted: u64,
+    pub duplicate_trade_events: u64,
+    pub stale_trade_events: u64,
+    pub queue_high_water: usize,
+    pub backpressure_failures: u64,
+    pub silent_drops: u64,
+    pub t2_attempts: u64,
+    pub t2_successes: u64,
+    pub t6_attempts: u64,
+    pub t6_successes: u64,
+    pub holder_attempts: u64,
+    pub holder_successes: u64,
+    pub holder_failures: u64,
+    pub probe_attempts: u64,
+    pub probe_successes: u64,
+    pub probe_failures: u64,
+    pub pending_tasks_before_drain: u64,
+    pub tasks_completed_during_drain: u64,
+    pub tasks_timed_out: u64,
+    pub late_write_attempts: u64,
+    pub active_before_sweep: u64,
+    pub stale_subscriptions_after_shutdown: u64,
+    pub measurement_rows_written: u64,
+    pub sink_flush_success: bool,
+}
+
 /// The payload union persisted to the measurement sink.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
@@ -66,6 +109,7 @@ pub enum MeasurementPayload {
     MicrostructureProbe(MicrostructureProbe),
     MeasurementFailure(MeasurementFailureRecord),
     SubscriptionState(SubscriptionStateRecord),
+    RunSummary(MeasurementRunSummary),
 }
 
 impl MeasurementPayload {
@@ -77,9 +121,10 @@ impl MeasurementPayload {
             MeasurementPayload::MicrostructureProbe(_) => "MicrostructureProbe",
             MeasurementPayload::MeasurementFailure(_) => "MeasurementFailure",
             MeasurementPayload::SubscriptionState(_) => "SubscriptionState",
+            MeasurementPayload::RunSummary(_) => "RunSummary",
         }
     }
-    /// Candidate/mint linkage (best-effort from the payload).
+    /// Candidate/mint linkage (best-effort from the payload). Run-scoped rows have none.
     pub fn mint(&self) -> String {
         match self {
             MeasurementPayload::TradeObserved(t) => t.mint.clone(),
@@ -88,6 +133,7 @@ impl MeasurementPayload {
             MeasurementPayload::MicrostructureProbe(m) => m.mint.clone(),
             MeasurementPayload::MeasurementFailure(f) => f.mint.clone(),
             MeasurementPayload::SubscriptionState(s) => s.mint.clone(),
+            MeasurementPayload::RunSummary(_) => String::new(),
         }
     }
 }
@@ -114,14 +160,34 @@ pub struct MeasurementSink<W: Write> {
     run_id: String,
     source_revision: String,
     seq: u64,
+    closed: bool,
+    late_write_attempts: u64,
 }
 
 impl<W: Write> MeasurementSink<W> {
     pub fn new(writer: W, run_id: &str, source_revision: &str) -> Self {
-        Self { writer, run_id: run_id.to_string(), source_revision: source_revision.to_string(), seq: 0 }
+        Self {
+            writer,
+            run_id: run_id.to_string(),
+            source_revision: source_revision.to_string(),
+            seq: 0,
+            closed: false,
+            late_write_attempts: 0,
+        }
     }
-    /// Append one measurement event as a JSON line. Returns the assigned seq.
+    /// Append one measurement event as a JSON line. Returns the assigned seq. After
+    /// `close()` the sink is sealed: any further append is REJECTED (never appended)
+    /// and increments `late_write_attempts` — the hard no-post-RunFinished-write
+    /// guarantee. `seq` is strictly monotonic and never reused, even across a
+    /// rejected late write (the counter only advances on a real append).
     pub fn append(&mut self, payload: MeasurementPayload, emitted_at: DateTime<Utc>) -> std::io::Result<u64> {
+        if self.closed {
+            self.late_write_attempts += 1;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "measurement sink closed: late write rejected",
+            ));
+        }
         let seq = self.seq;
         let env = MeasurementEnvelope {
             run_id: self.run_id.clone(),
@@ -139,11 +205,27 @@ impl<W: Write> MeasurementSink<W> {
         self.seq += 1;
         Ok(seq)
     }
+    /// Number of appended rows (== next seq).
     pub fn appended(&self) -> u64 {
         self.seq
     }
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
+    }
+    /// Flush and seal the sink. Idempotent. After this, `append` is rejected.
+    pub fn close(&mut self) -> std::io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let r = self.writer.flush();
+        self.closed = true;
+        r
+    }
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+    pub fn late_write_attempts(&self) -> u64 {
+        self.late_write_attempts
     }
 }
 
@@ -290,5 +372,66 @@ mod tests {
     #[test]
     fn sink_schema_version_frozen() {
         assert_eq!(MEASUREMENT_SINK_SCHEMA_VERSION, 1);
+    }
+
+    // --- 2D: sink close / late-write / summary ---
+
+    #[test] // 25/26: post-close write rejected + late_write_attempts increments
+    fn sink_post_close_write_rejected() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sink = MeasurementSink::new(&mut buf, "r", "rev");
+        let t = normalize_trade_event(&tev(), "r", "rev", ts(5));
+        sink.append(MeasurementPayload::TradeObserved(t.clone()), ts(6)).unwrap();
+        sink.close().unwrap();
+        assert!(sink.is_closed());
+        assert!(sink.append(MeasurementPayload::TradeObserved(t), ts(7)).is_err());
+        assert_eq!(sink.late_write_attempts(), 1);
+        assert_eq!(sink.appended(), 1); // seq did NOT advance on the rejected write
+    }
+
+    #[test] // 24: flush before close; close is idempotent
+    fn sink_close_idempotent() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sink = MeasurementSink::new(&mut buf, "r", "rev");
+        assert!(!sink.is_closed());
+        sink.close().unwrap();
+        sink.close().unwrap(); // idempotent
+        assert!(sink.is_closed());
+        assert_eq!(sink.late_write_attempts(), 0); // no writes attempted after close
+    }
+
+    #[test] // 27/28: seq strictly monotonic, no reuse, across mixed payload kinds
+    fn sink_seq_monotonic_no_reuse() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sink = MeasurementSink::new(&mut buf, "r", "rev");
+        let t = normalize_trade_event(&tev(), "r", "rev", ts(5));
+        let mut last: i64 = -1;
+        for _ in 0..50 {
+            let s = sink.append(MeasurementPayload::TradeObserved(t.clone()), ts(6)).unwrap();
+            assert!(s as i64 > last, "seq must strictly increase");
+            last = s as i64;
+        }
+        let s = sink.append(MeasurementPayload::RunSummary(MeasurementRunSummary::default()), ts(7)).unwrap();
+        assert_eq!(s, 50);
+    }
+
+    #[test] // run summary round-trips through the sink with run-scoped (empty) mint
+    fn sink_run_summary_roundtrip() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut sink = MeasurementSink::new(&mut buf, "r", "rev");
+            let mut sum = MeasurementRunSummary::default();
+            sum.subscribe_attempts = 3;
+            sum.silent_drops = 0;
+            sink.append(MeasurementPayload::RunSummary(sum), ts(9)).unwrap();
+        }
+        let s = String::from_utf8(buf).unwrap();
+        let e: MeasurementEnvelope = serde_json::from_str(s.trim_end()).unwrap();
+        assert_eq!(e.event_type, "RunSummary");
+        assert_eq!(e.mint, "");
+        match e.payload {
+            MeasurementPayload::RunSummary(x) => assert_eq!(x.subscribe_attempts, 3),
+            _ => panic!("wrong payload"),
+        }
     }
 }
