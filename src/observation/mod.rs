@@ -5,6 +5,7 @@
 //! market state was, exact executable buy/sell quotes, and future path/horizon
 //! outcomes — with NO strategy, filter, or trading behavior.
 
+pub mod measurement;
 pub mod recorder;
 pub mod replay;
 pub mod schema;
