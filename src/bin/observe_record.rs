@@ -48,8 +48,8 @@ use pumpfun_sniper::observation::measurement::{
     TOTAL_MINT_SUPPLY_TOKENS,
 };
 use pumpfun_sniper::observation::measurement_runtime::{
-    classify_holder_accounts_by_owner, BoundedTradeQueue, ParticipationState, RawHolderAccount,
-    SubscriptionRegistry, MEASUREMENT_TRADE_QUEUE_CAPACITY,
+    classify_holder_accounts_by_owner, BoundedTradeQueue, CoverageBreak, CoverageTracker,
+    ParticipationState, RawHolderAccount, SubscriptionRegistry, MEASUREMENT_TRADE_QUEUE_CAPACITY,
 };
 use pumpfun_sniper::observation::measurement_sink::{
     normalize_trade_event, MeasurementPayload, MeasurementRunSummary, MeasurementSink,
@@ -780,6 +780,10 @@ struct MeasurementCounters {
     probe_attempts: u64,
     probe_successes: u64,
     probe_failures: u64,
+    // P3-COVERAGE-DEFECT-001 audit counters
+    t2_invalid_due_to_coverage: u64,
+    t6_invalid_due_to_coverage: u64,
+    zero_activity_valid_snapshots: u64,
 }
 
 use pumpfun_sniper::observation::measurement_runtime::CoverageState;
@@ -787,6 +791,10 @@ use pumpfun_sniper::observation::measurement_runtime::CoverageState;
 struct MeasurementShared {
     state: std::sync::Mutex<ParticipationState>,
     registry: std::sync::Mutex<SubscriptionRegistry>,
+    /// Authoritative per-mint coverage truth (connection-generation + window
+    /// continuity). Drives whether a T2/T6 snapshot may be VALID zero-activity vs
+    /// MISSING (P3-COVERAGE-DEFECT-001).
+    coverage: std::sync::Mutex<CoverageTracker>,
     counters: std::sync::Mutex<MeasurementCounters>,
     sink: std::sync::Mutex<MeasurementSink<std::fs::File>>,
     sender: CommandSender,
@@ -865,19 +873,28 @@ impl MeasurementShared {
             .sender
             .send(SubscriptionCommand::SubscribeTokenTrades(vec![mint.to_string()]))
             .await;
-        let (cov, record) = {
+        let now = Utc::now();
+        let record = {
             let mut reg = self.registry.lock().expect("registry poisoned");
             if let Some(s) = reg.get_mut(mint) {
                 match res {
-                    Ok(()) => s.mark_active(Utc::now()),
+                    Ok(()) => s.mark_active(now),
                     Err(_) => s.mark_failed(MeasurementFailureCategory::RpcUnavailable),
                 }
             }
-            (
-                reg.get(mint).map(|s| s.coverage_state()),
-                reg.get(mint).map(SubscriptionStateRecord::from_sub),
-            )
+            reg.get(mint).map(SubscriptionStateRecord::from_sub)
         };
+        // Coverage truth: a successful SEND establishes coverage on the current
+        // connection generation (the strongest signal PumpPortal exposes — no per-sub
+        // ack). A subsequent auth/stream error will invalidate it (on_stream_error).
+        {
+            let mut cov = self.coverage.lock().expect("coverage poisoned");
+            if res.is_ok() {
+                cov.mark_active(mint, now);
+            } else {
+                cov.mark_failed(mint);
+            }
+        }
         self.count(|c| {
             if res.is_ok() {
                 c.subscribe_successes += 1;
@@ -885,12 +902,24 @@ impl MeasurementShared {
                 c.subscribe_failures += 1;
             }
         });
-        if let Some(cov) = cov {
-            self.set_coverage(mint, cov);
-        }
         if let Some(rec) = record {
             self.append(MeasurementPayload::SubscriptionState(rec));
         }
+    }
+
+    /// A provider/stream error (auth or other). Reliable coverage-break signal: bump
+    /// the connection generation and invalidate coverage for ALL active mints so a
+    /// window overlapping the error cannot be emitted as valid zero-activity. The
+    /// overloaded `Connected` event is NOT used as a break signal (it also fires on
+    /// desired-state resync); this and `on_disconnect` are the authoritative breaks.
+    fn on_stream_error(&self, sanitized_category: &str) {
+        let is_auth = sanitized_category.to_ascii_lowercase().contains("auth");
+        self.coverage
+            .lock()
+            .expect("coverage poisoned")
+            .on_break(if is_auth { CoverageBreak::AuthError } else { CoverageBreak::ProviderError });
+        // Registry coverage-unknown mirror (subscription lifecycle side).
+        self.registry.lock().expect("registry poisoned").mark_all_coverage_unknown();
     }
 
     /// Terminal candidate lifecycle: issue UnsubscribeTokenTrades, record ack/failure
@@ -931,22 +960,16 @@ impl MeasurementShared {
         // Tombstone + clear all per-candidate state (idempotent).
         self.registry.lock().expect("registry poisoned").cleanup(mint);
         self.state.lock().expect("participation state poisoned").cleanup(mint);
+        self.coverage.lock().expect("coverage poisoned").cleanup(mint);
     }
 
     /// On stream disconnect: every active subscription's coverage becomes UNKNOWN
     /// (interruption is never later encoded as zero trades).
     fn on_disconnect(&self) {
         self.count(|c| c.disconnects += 1);
+        // Authoritative coverage break: invalidate all active mints on a new generation.
+        self.coverage.lock().expect("coverage poisoned").on_break(CoverageBreak::StreamDisconnected);
         self.registry.lock().expect("registry poisoned").mark_all_coverage_unknown();
-        // Mirror UNKNOWN coverage into participation state for any active mint.
-        let mints: Vec<String> = self
-            .registry
-            .lock()
-            .expect("registry poisoned")
-            .active_mints();
-        for m in mints {
-            self.set_coverage(&m, CoverageState::StreamCoverageUnknown);
-        }
     }
 
     /// On reconnect: resubscribe ALL active-eligible mints (never selective), record
@@ -960,16 +983,27 @@ impl MeasurementShared {
                 .sender
                 .send(SubscriptionCommand::SubscribeTokenTrades(vec![mint.clone()]))
                 .await;
-            let cov = {
+            let now = Utc::now();
+            {
                 let mut reg = self.registry.lock().expect("registry poisoned");
                 if let Some(s) = reg.get_mut(&mint) {
                     match res {
-                        Ok(()) => s.mark_active(Utc::now()),
+                        Ok(()) => s.mark_active(now),
                         Err(_) => s.mark_failed(MeasurementFailureCategory::RpcUnavailable),
                     }
                 }
-                reg.get(&mint).map(|s| s.coverage_state())
-            };
+            }
+            // Coverage re-establishes on the CURRENT generation. If a prior break bumped
+            // the generation, this starts a fresh epoch (coverage_start = now), so any
+            // window that began before the break stays UNKNOWN (never rescued).
+            {
+                let mut cov = self.coverage.lock().expect("coverage poisoned");
+                if res.is_ok() {
+                    cov.mark_active(&mint, now);
+                } else {
+                    cov.mark_failed(&mint);
+                }
+            }
             self.count(|c| {
                 if res.is_ok() {
                     c.resubscribe_successes += 1;
@@ -977,9 +1011,6 @@ impl MeasurementShared {
                     c.resubscribe_failures += 1;
                 }
             });
-            if let Some(cov) = cov {
-                self.set_coverage(&mint, cov);
-            }
         }
     }
 
@@ -1009,19 +1040,30 @@ impl MeasurementShared {
             SnapshotClass::T2 => c.t2_attempts += 1,
             SnapshotClass::T6 => c.t6_attempts += 1,
         });
+        // AUTHORITATIVE coverage at the emit instant (connection-generation + window
+        // continuity). This is what prevents an auth/reset-compromised window from
+        // being emitted as valid zero-activity (P3-COVERAGE-DEFECT-001).
+        let coverage = self.coverage.lock().expect("coverage poisoned").coverage_of(mint);
         let snap = {
             let mut st = self.state.lock().expect("participation state poisoned");
+            st.set_coverage(mint, coverage);
             st.build_snapshot(&self.run_id, mint, class, cutoff, computed_at)
         };
         if let Some(s) = snap {
             let ok = s.failure.is_none();
             self.append(MeasurementPayload::ParticipationSnapshot(s));
-            if ok {
-                self.count(|c| match class {
-                    SnapshotClass::T2 => c.t2_successes += 1,
-                    SnapshotClass::T6 => c.t6_successes += 1,
-                });
-            }
+            self.count(|c| match (class, ok) {
+                (SnapshotClass::T2, true) => {
+                    c.t2_successes += 1;
+                    c.zero_activity_valid_snapshots += 1;
+                }
+                (SnapshotClass::T6, true) => {
+                    c.t6_successes += 1;
+                    c.zero_activity_valid_snapshots += 1;
+                }
+                (SnapshotClass::T2, false) => c.t2_invalid_due_to_coverage += 1,
+                (SnapshotClass::T6, false) => c.t6_invalid_due_to_coverage += 1,
+            });
         }
     }
 
@@ -1055,6 +1097,11 @@ impl MeasurementShared {
         stale_after: u64,
     ) -> MeasurementRunSummary {
         let c = self.counters.lock().expect("counters poisoned").clone();
+        let (cov_auth, cov_stream, cov_gen, cov_inval, cov_unknown) = {
+            let cov = self.coverage.lock().expect("coverage poisoned");
+            (cov.auth_errors, cov.provider_stream_errors, cov.generation_changes,
+             cov.coverage_invalidations, cov.coverage_unknown_count())
+        };
         let (rows, _) = {
             let sink = self.sink.lock().expect("sink poisoned");
             (sink.appended(), sink.is_closed())
@@ -1097,6 +1144,14 @@ impl MeasurementShared {
             stale_subscriptions_after_shutdown: stale_after,
             measurement_rows_written: rows,
             sink_flush_success: true,
+            provider_auth_errors: cov_auth,
+            provider_stream_errors: cov_stream,
+            connection_generation_changes: cov_gen,
+            coverage_invalidations: cov_inval,
+            coverage_unknown_mints: cov_unknown,
+            t2_invalid_due_to_coverage: c.t2_invalid_due_to_coverage,
+            t6_invalid_due_to_coverage: c.t6_invalid_due_to_coverage,
+            zero_activity_valid_snapshots: c.zero_activity_valid_snapshots,
         }
     }
 }
@@ -1648,6 +1703,7 @@ async fn main() -> Result<()> {
     let measurement_shared = Arc::new(MeasurementShared {
         state: std::sync::Mutex::new(ParticipationState::new()),
         registry: std::sync::Mutex::new(SubscriptionRegistry::new()),
+        coverage: std::sync::Mutex::new(CoverageTracker::new()),
         counters: std::sync::Mutex::new(MeasurementCounters::default()),
         sink: std::sync::Mutex::new(MeasurementSink::new(
             measurement_file,
@@ -1934,6 +1990,10 @@ async fn handle_intake_event(
             // stream_connected (§9); it fails the run.
             counters.provider_errors += 1;
             counters.hard_provider_errors += 1;
+            // P3-COVERAGE-DEFECT-001: a provider/auth error is an authoritative coverage
+            // break — invalidate coverage for all active token-trade mints so any
+            // overlapping T2/T6 window cannot be emitted as valid zero-activity.
+            meas.shared.on_stream_error(&category);
             // `category` is already a sanitized fixed provider category.
             let safe = sanitize_persist_text(&category, 128);
             append_required(

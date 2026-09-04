@@ -310,6 +310,144 @@ pub fn should_attempt_subscription() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Coverage truth (P3-COVERAGE-DEFECT-001): connection-generation + window
+// continuity. "Subscription command sent" is NOT proof of coverage — a provider
+// auth/stream error or disconnect invalidates coverage for all active mints, and a
+// snapshot may only be VALID zero-activity if coverage was continuously known from
+// the mint's initial establishment through the emit instant. Pure + testable.
+// ---------------------------------------------------------------------------
+
+/// A coverage-breaking runtime event (reliable signals only — NOT the overloaded
+/// `Connected`, which the live client re-emits on every subscription resync).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageBreak {
+    AuthError,
+    ProviderError,
+    StreamDisconnected,
+}
+
+#[derive(Debug, Clone)]
+struct MintCoverage {
+    /// Frozen at initial coverage establishment (first successful subscribe send).
+    window_start: Option<DateTime<Utc>>,
+    /// Generation on which this mint currently has known coverage.
+    covered_generation: Option<u64>,
+    /// Start of the CURRENT unbroken coverage epoch (reset to None on any break).
+    coverage_start: Option<DateTime<Utc>>,
+    /// Subscribe send failed outright.
+    failed: bool,
+}
+
+/// Authoritative per-mint coverage-truth driven by a monotonic connection generation.
+#[derive(Debug, Default)]
+pub struct CoverageTracker {
+    generation: u64,
+    mints: std::collections::BTreeMap<String, MintCoverage>,
+    pub auth_errors: u64,
+    pub provider_stream_errors: u64,
+    pub generation_changes: u64,
+    pub coverage_invalidations: u64,
+}
+
+impl CoverageTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Successful subscribe/resubscribe SEND for a mint on the current generation.
+    /// `window_start` is frozen at the FIRST establishment; `coverage_start` is set to
+    /// `at` when (re)entering active on the current generation, and is NOT reset by a
+    /// same-generation resync (preserves continuity across desired-state replays).
+    pub fn mark_active(&mut self, mint: &str, at: DateTime<Utc>) {
+        let gen = self.generation;
+        let e = self.mints.entry(mint.to_string()).or_insert(MintCoverage {
+            window_start: None,
+            covered_generation: None,
+            coverage_start: None,
+            failed: false,
+        });
+        e.failed = false;
+        if e.window_start.is_none() {
+            e.window_start = Some(at);
+        }
+        let already_active_this_gen = e.covered_generation == Some(gen) && e.coverage_start.is_some();
+        if !already_active_this_gen {
+            e.covered_generation = Some(gen);
+            e.coverage_start = Some(at);
+        }
+    }
+
+    /// Subscribe send failed outright (never became active).
+    pub fn mark_failed(&mut self, mint: &str) {
+        let e = self.mints.entry(mint.to_string()).or_insert(MintCoverage {
+            window_start: None,
+            covered_generation: None,
+            coverage_start: None,
+            failed: true,
+        });
+        e.failed = true;
+        e.covered_generation = None;
+        e.coverage_start = None;
+    }
+
+    /// A coverage break: bump the connection generation and invalidate coverage for
+    /// EVERY currently-covered mint (they must be resubscribed on the new generation
+    /// to regain coverage). An interruption+restore therefore cannot be rescued.
+    pub fn on_break(&mut self, kind: CoverageBreak) {
+        self.generation += 1;
+        self.generation_changes += 1;
+        match kind {
+            CoverageBreak::AuthError => self.auth_errors += 1,
+            CoverageBreak::ProviderError | CoverageBreak::StreamDisconnected => {
+                self.provider_stream_errors += 1
+            }
+        }
+        for c in self.mints.values_mut() {
+            if c.covered_generation.is_some() || c.coverage_start.is_some() {
+                c.covered_generation = None;
+                c.coverage_start = None;
+                self.coverage_invalidations += 1;
+            }
+        }
+    }
+
+    /// Coverage truth for a mint at the current (emit) instant. VALID (Active) only if:
+    /// it is covered on the CURRENT generation AND the current coverage epoch began at
+    /// or before the mint's initial establishment (i.e. no break since the window
+    /// started). Otherwise UNKNOWN; an outright send failure is SubscriptionFailed.
+    pub fn coverage_of(&self, mint: &str) -> CoverageState {
+        match self.mints.get(mint) {
+            None => CoverageState::StreamCoverageUnknown,
+            Some(c) if c.failed => CoverageState::SubscriptionFailed,
+            Some(c) => {
+                let continuous = c.covered_generation == Some(self.generation)
+                    && matches!((c.coverage_start, c.window_start), (Some(cs), Some(ws)) if cs <= ws);
+                if continuous {
+                    CoverageState::Active
+                } else {
+                    CoverageState::StreamCoverageUnknown
+                }
+            }
+        }
+    }
+
+    /// Count mints currently not in known-good coverage (for telemetry).
+    pub fn coverage_unknown_count(&self) -> u64 {
+        self.mints
+            .keys()
+            .filter(|m| self.coverage_of(m) != CoverageState::Active)
+            .count() as u64
+    }
+
+    pub fn cleanup(&mut self, mint: &str) {
+        self.mints.remove(mint);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Domain 2/3 (2C): deterministic classification + redundancy glue (pure).
 // ---------------------------------------------------------------------------
 
@@ -859,6 +997,116 @@ mod tests {
         ];
         let (_classified, curve_resolved) = classify_holder_accounts_by_owner(&accts, "CURVE_PDA", None);
         assert!(!curve_resolved, "curve must be reported UNRESOLVED so caller emits MISSING/FAILURE, not zero curve share");
+    }
+
+    // --- P3-COVERAGE-DEFECT-001: connection-generation coverage truth ---
+
+    #[test] // clean subscribe, no break => ACTIVE_KNOWN (valid zero-activity allowed)
+    fn cov_clean_active() {
+        let mut c = CoverageTracker::new();
+        c.mark_active("M", ts(0));
+        assert_eq!(c.coverage_of("M"), CoverageState::Active);
+        assert_eq!(c.generation(), 0);
+    }
+
+    #[test] // send failure => SubscriptionFailed (never Active)
+    fn cov_send_failed() {
+        let mut c = CoverageTracker::new();
+        c.mark_failed("M");
+        assert_eq!(c.coverage_of("M"), CoverageState::SubscriptionFailed);
+    }
+
+    #[test] // auth error invalidates all active mints -> UNKNOWN; generation bumps
+    fn cov_auth_error_invalidates() {
+        let mut c = CoverageTracker::new();
+        c.mark_active("A", ts(0));
+        c.mark_active("B", ts(0));
+        c.on_break(CoverageBreak::AuthError);
+        assert_eq!(c.generation(), 1);
+        assert_eq!(c.coverage_of("A"), CoverageState::StreamCoverageUnknown);
+        assert_eq!(c.coverage_of("B"), CoverageState::StreamCoverageUnknown);
+        assert_eq!(c.auth_errors, 1);
+        assert_eq!(c.coverage_invalidations, 2);
+    }
+
+    #[test] // stream disconnect invalidates; generation change tracked
+    fn cov_disconnect_invalidates() {
+        let mut c = CoverageTracker::new();
+        c.mark_active("M", ts(0));
+        c.on_break(CoverageBreak::StreamDisconnected);
+        assert_eq!(c.coverage_of("M"), CoverageState::StreamCoverageUnknown);
+        assert_eq!(c.generation_changes, 1);
+    }
+
+    #[test] // same-generation resync does NOT reset coverage_start (continuity preserved)
+    fn cov_resync_preserves_continuity() {
+        let mut c = CoverageTracker::new();
+        c.mark_active("M", ts(0)); // window_start=0, coverage_start=0
+        c.mark_active("M", ts(5)); // resync same gen -> coverage_start stays 0
+        assert_eq!(c.coverage_of("M"), CoverageState::Active);
+    }
+
+    #[test] // CRITICAL CASE: subscribe@0, break@0.8, resubscribe@1.5 -> T2 NOT valid
+    fn cov_interruption_then_restore_is_unknown() {
+        let mut c = CoverageTracker::new();
+        c.mark_active("M", ts(0)); // window_start=0
+        c.on_break(CoverageBreak::AuthError); // gen1, invalidate
+        c.mark_active("M", ts(2)); // restore on gen1, coverage_start=2 > window_start 0
+        // evaluated at emit: covered on current gen BUT epoch started after window_start
+        assert_eq!(c.coverage_of("M"), CoverageState::StreamCoverageUnknown);
+    }
+
+    #[test] // failed resubscribe after break remains unknown/failed
+    fn cov_failed_resubscribe() {
+        let mut c = CoverageTracker::new();
+        c.mark_active("M", ts(0));
+        c.on_break(CoverageBreak::AuthError);
+        c.mark_failed("M");
+        assert_eq!(c.coverage_of("M"), CoverageState::SubscriptionFailed);
+    }
+
+    #[test] // T2 valid before break, T6 invalid after break (evaluated at emit time)
+    fn cov_t2_valid_t6_missing_across_break() {
+        let mut c = CoverageTracker::new();
+        c.mark_active("M", ts(0));
+        // T2 emitted at ~2s, before any break:
+        assert_eq!(c.coverage_of("M"), CoverageState::Active); // T2 valid
+        c.on_break(CoverageBreak::AuthError); // break between T2 and T6
+        // T6 emitted at ~6s, after the break, no resubscribe:
+        assert_eq!(c.coverage_of("M"), CoverageState::StreamCoverageUnknown); // T6 missing
+    }
+
+    #[test] // cleanup removes coverage; a fresh candidate later is independent
+    fn cov_cleanup() {
+        let mut c = CoverageTracker::new();
+        c.mark_active("M", ts(0));
+        c.cleanup("M");
+        assert_eq!(c.coverage_of("M"), CoverageState::StreamCoverageUnknown);
+    }
+
+    #[test] // PILOT REPRODUCTION: subscribes + repeated auth errors + no trades =>
+    // NO valid zero-activity snapshots (the exact B2 failure shape)
+    fn cov_pilot_auth_storm_no_valid_zero() {
+        let mut c = CoverageTracker::new();
+        // 3 candidates subscribed, then the provider auth-errors (as in the pilot).
+        for m in ["A", "B", "C"] {
+            c.mark_active(m, ts(0));
+        }
+        // Provider rejects the metered stream repeatedly; connection never cleanly drops.
+        for _ in 0..5 {
+            c.on_break(CoverageBreak::AuthError);
+        }
+        // Even if the client resyncs/resubscribes on a later generation:
+        c.mark_active("A", ts(3));
+        for m in ["A", "B", "C"] {
+            assert_eq!(
+                c.coverage_of(m),
+                CoverageState::StreamCoverageUnknown,
+                "auth-storm window must be UNKNOWN, never valid zero-activity"
+            );
+        }
+        assert!(c.auth_errors >= 5);
+        assert_eq!(c.coverage_unknown_count(), 3);
     }
 
     #[test] // 15: no balance-size heuristic — the biggest balance is NOT auto-curve

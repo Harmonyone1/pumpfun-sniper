@@ -97,6 +97,15 @@ pub struct MeasurementRunSummary {
     pub stale_subscriptions_after_shutdown: u64,
     pub measurement_rows_written: u64,
     pub sink_flush_success: bool,
+    // P3-COVERAGE-DEFECT-001: coverage-truth audit
+    pub provider_auth_errors: u64,
+    pub provider_stream_errors: u64,
+    pub connection_generation_changes: u64,
+    pub coverage_invalidations: u64,
+    pub coverage_unknown_mints: u64,
+    pub t2_invalid_due_to_coverage: u64,
+    pub t6_invalid_due_to_coverage: u64,
+    pub zero_activity_valid_snapshots: u64,
 }
 
 /// The payload union persisted to the measurement sink.
