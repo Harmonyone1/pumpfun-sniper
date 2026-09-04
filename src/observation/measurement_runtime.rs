@@ -23,6 +23,14 @@ use super::measurement::{
 /// buffer bursts without unbounded growth; frozen before any pilot run.
 pub const MEASUREMENT_TRADE_QUEUE_CAPACITY: usize = 4096;
 
+/// Timestamp-architecture AMENDMENT-001 (frozen). `timestamp_semantics_version = 1`.
+/// SOURCE CUTOFF and DECISION TIMESTAMP are separate: a feature's `available_in_time`
+/// is evaluated against its registered decision timestamp (anchor + budget), never the
+/// raw source cutoff. Feature formulas / trade inclusion are UNCHANGED.
+pub const TIMESTAMP_SEMANTICS_VERSION: u32 = 1;
+/// Domain-1 participation: T{2,6}_AVAILABLE = source cutoff + this budget (ms).
+pub const PARTICIPATION_FINALIZATION_BUDGET_MS: i64 = 5;
+
 // ---------------------------------------------------------------------------
 // Bounded no-silent-drop queue
 // ---------------------------------------------------------------------------
@@ -587,7 +595,12 @@ impl ParticipationState {
         self.emitted.insert(key);
         let cov = self.coverage_of(mint);
         let buf = self.buffers.get(mint).map(|v| v.as_slice()).unwrap_or(&[]);
-        Some(coverage_aware_snapshot(cov, run_id, mint, class, cutoff, computed_at, cutoff, buf))
+        // Timestamp architecture AMENDMENT-001: source cutoff is UNCHANGED (feature/trade
+        // inclusion still filter by `cutoff`); the DECISION timestamp is T{2,6}_AVAILABLE =
+        // cutoff + PARTICIPATION_FINALIZATION_BUDGET_MS, so available_in_time reflects the
+        // registered decision timestamp, not the raw cutoff.
+        let decision_deadline = cutoff + chrono::Duration::milliseconds(PARTICIPATION_FINALIZATION_BUDGET_MS);
+        Some(coverage_aware_snapshot(cov, run_id, mint, class, cutoff, computed_at, decision_deadline, buf))
     }
 
     /// True if a final snapshot of this class was already emitted for the mint.
@@ -916,6 +929,56 @@ mod tests {
         assert_eq!(ps.buffer_of("M").len(), 0);
         assert_eq!(ps.coverage_of("M"), CoverageState::StreamCoverageUnknown);
         assert!(!ps.already_emitted("M", SnapshotClass::T2)); // emission guard cleared
+    }
+
+    // --- AMENDMENT-001: T2/T6_AVAILABLE = cutoff + 5ms (decision timestamp) ---
+
+    #[test] // budget constant + semantics version frozen
+    fn ts_arch_constants_frozen() {
+        assert_eq!(PARTICIPATION_FINALIZATION_BUDGET_MS, 5);
+        assert_eq!(TIMESTAMP_SEMANTICS_VERSION, 1);
+    }
+
+    fn ps_active(cutoff: DateTime<Utc>, computed_at: DateTime<Utc>, class: SnapshotClass) -> ParticipationSnapshot {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        ps.build_snapshot("r", "M", class, cutoff, computed_at).unwrap()
+    }
+
+    #[test] // computed +0.3ms after cutoff -> available (was false under strict <=cutoff)
+    fn avail_t2_plus_300us_true() {
+        let c = ts(2);
+        assert!(ps_active(c, c + chrono::Duration::microseconds(300), SnapshotClass::T2).available_in_time);
+    }
+    #[test] // computed +4.9ms -> available true; boundary +5ms exact -> true
+    fn avail_t2_within_budget_true() {
+        let c = ts(2);
+        assert!(ps_active(c, c + chrono::Duration::microseconds(4900), SnapshotClass::T2).available_in_time);
+        assert!(ps_active(c, c + chrono::Duration::milliseconds(5), SnapshotClass::T2).available_in_time);
+    }
+    #[test] // computed +5.1ms -> NOT available
+    fn avail_t2_over_budget_false() {
+        let c = ts(2);
+        assert!(!ps_active(c, c + chrono::Duration::microseconds(5100), SnapshotClass::T2).available_in_time);
+    }
+    #[test] // T6 same boundary behavior
+    fn avail_t6_boundary() {
+        let c = ts(6);
+        assert!(ps_active(c, c + chrono::Duration::microseconds(4000), SnapshotClass::T6).available_in_time);
+        assert!(!ps_active(c, c + chrono::Duration::milliseconds(6), SnapshotClass::T6).available_in_time);
+    }
+    #[test] // +5ms budget does NOT admit post-cutoff trades (source cutoff unchanged)
+    fn avail_budget_does_not_admit_post_cutoff_trades() {
+        let c = ts(2);
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        ps.record_trade(trade("a", "M", 1)); // <= cutoff (ts 1)
+        // a trade received AFTER cutoff (even within the +5ms availability budget) must
+        // NOT enter the features — inclusion is still event_received_at <= source cutoff.
+        ps.record_trade(trade("b", "M", 3)); // > cutoff ts 2
+        let snap = ps.build_snapshot("r", "M", SnapshotClass::T2, c, c + chrono::Duration::milliseconds(3)).unwrap();
+        assert!(snap.available_in_time);
+        assert_eq!(snap.features.buy_count, 1); // only the pre-cutoff trade
     }
 
     #[test] // cleanup of one candidate does not disturb another

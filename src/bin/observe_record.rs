@@ -1152,6 +1152,7 @@ impl MeasurementShared {
             t2_invalid_due_to_coverage: c.t2_invalid_due_to_coverage,
             t6_invalid_due_to_coverage: c.t6_invalid_due_to_coverage,
             zero_activity_valid_snapshots: c.zero_activity_valid_snapshots,
+            timestamp_semantics_version: pumpfun_sniper::observation::measurement_runtime::TIMESTAMP_SEMANTICS_VERSION,
         }
     }
 }
@@ -1203,10 +1204,23 @@ fn is_retryable_holder_failure(cat: MeasurementFailureCategory) -> bool {
     )
 }
 
-/// Frozen bounded holder-acquisition retry backoffs (ms from first attempt). Absorbs
-/// the observed PumpPortal->RPC mint-visibility lag; still bounded (~6s) and truthful:
-/// a late completion sets available_in_time=false rather than redefining T0.
+/// Frozen bounded holder-acquisition retry backoffs (ms from first attempt). Cumulative
+/// attempts at ~0/1/4/10s (~10s window). A late completion sets available_in_time=false
+/// (evaluated against the T10 decision timestamp), never redefining T0.
 const HOLDER_FRESHNESS_BACKOFFS_MS: [u64; 4] = [0, 1000, 3000, 6000];
+
+/// Timestamp-architecture AMENDMENT-001 budgets (ms). Decision timestamp = anchor + budget.
+/// Holder anchor = requested_at (T0 measurement start) -> T10; probe anchor = requested_at
+/// (T0 probe start) -> T0_AVAILABLE. available_in_time is recomputable at replay from the
+/// record's stored anchor + completed_at + these frozen constants.
+const HOLDER_DECISION_BUDGET_MS: i64 = 10_000;
+const MICROSTRUCTURE_T0_BUDGET_MS: i64 = 250;
+
+/// available_in_time: the finalized measurement completed within `budget_ms` of its anchor
+/// (the registered decision timestamp = anchor + budget). Pure; runtime & replay agree.
+fn within_budget(anchor: DateTime<Utc>, completed: DateTime<Utc>, budget_ms: i64) -> bool {
+    completed <= anchor + chrono::Duration::milliseconds(budget_ms)
+}
 
 /// Commitment for the T0 holder account-state fetch. `confirmed` (not the RPC default
 /// `finalized`): at T0 the target accounts are seconds old, so `finalized` can return
@@ -1283,7 +1297,6 @@ async fn acquire_holder_snapshot(
     run_id: &str,
     source_revision: &str,
     requested_at: DateTime<Utc>,
-    t0_deadline: DateTime<Utc>,
 ) -> HolderSnapshot {
     let curve_pda = bonding_curve_pda(mint).0.to_string();
     let creator_deterministic = creator.is_some();
@@ -1428,7 +1441,8 @@ async fn acquire_holder_snapshot(
         requested_at,
         completed_at,
         rpc_slot,
-        available_in_time: completed_at <= t0_deadline,
+        // Domain-2 T10: decision timestamp = requested_at (T0 measurement start) + 10s.
+        available_in_time: within_budget(requested_at, completed_at, HOLDER_DECISION_BUDGET_MS),
         raw_accounts,
         total_mint_supply_tokens: TOTAL_MINT_SUPPLY_TOKENS,
         failure,
@@ -1451,7 +1465,6 @@ async fn acquire_microstructure_probe(
     lamports: u64,
     run_id: &str,
     requested_at: DateTime<Utc>,
-    t0_deadline: DateTime<Utc>,
 ) -> MicrostructureProbe {
     let call = gated_quote_buy_sol(gate, oracle, mint, lamports).await;
     let completed_at = Utc::now();
@@ -1482,7 +1495,8 @@ async fn acquire_microstructure_probe(
         mint: mint.to_string(),
         requested_at,
         completed_at,
-        available_in_time: completed_at <= t0_deadline,
+        // Domain-3 T0_AVAILABLE: decision timestamp = requested_at (T0 probe start) + 250ms.
+        available_in_time: within_budget(requested_at, completed_at, MICROSTRUCTURE_T0_BUDGET_MS),
         input_lamports: lamports,
         expected_base_raw,
         base_decimals,
@@ -1522,19 +1536,26 @@ async fn t0_enrichment(
     // Creator classification is by OWNER: the creator's account is owned by the
     // creator WALLET. Deterministic only if the provider creator pubkey parses.
     let creator_wallet = Pubkey::from_str(&creator).ok().map(|c| c.to_string());
+    // T0 anchor = candidate admission. Both measurements record requested_at = T0 so
+    // available_in_time is evaluated against the registered decision timestamps
+    // (holder T10 = T0+10s; probe T0_AVAILABLE = T0+250ms) and is replay-self-contained.
+    let t0 = t0_deadline;
 
-    // Domain 2 — holder snapshot.
-    let holder = acquire_holder_snapshot(
-        &rpc_gate,
-        &rpc,
-        &mint,
-        creator_wallet.as_deref(),
-        &run_id,
-        &source_revision,
-        Utc::now(),
-        t0_deadline,
-    )
-    .await;
+    // AMENDMENT-001: holder and microstructure run CONCURRENTLY — the holder's ~10s
+    // freshness retry must NOT delay probe initiation (D3 decoupling). Both share the
+    // bounded RPC gate; both stay owned by this enrichment task (drained at shutdown).
+    let holder_fut = acquire_holder_snapshot(
+        &rpc_gate, &rpc, &mint, creator_wallet.as_deref(), &run_id, &source_revision, t0,
+    );
+    let probes_fut = async {
+        let mut probes = Vec::with_capacity(MICROSTRUCTURE_PROBE_LAMPORTS.len());
+        for lamports in MICROSTRUCTURE_PROBE_LAMPORTS {
+            probes.push(acquire_microstructure_probe(&rpc_gate, &oracle, &mint, lamports, &run_id, t0).await);
+        }
+        probes
+    };
+    let (holder, probes) = tokio::join!(holder_fut, probes_fut);
+
     shared.count(|c| {
         c.holder_attempts += 1;
         if holder.failure.is_none() {
@@ -1545,18 +1566,7 @@ async fn t0_enrichment(
     });
     shared.append(MeasurementPayload::HolderSnapshot(holder));
 
-    // Domain 3 — read-only microstructure probes at each frozen size (unconditional).
-    for lamports in MICROSTRUCTURE_PROBE_LAMPORTS {
-        let probe = acquire_microstructure_probe(
-            &rpc_gate,
-            &oracle,
-            &mint,
-            lamports,
-            &run_id,
-            Utc::now(),
-            t0_deadline,
-        )
-        .await;
+    for probe in probes {
         shared.count(|c| {
             c.probe_attempts += 1;
             if probe.success {
@@ -3234,6 +3244,46 @@ mod tests {
     fn freshness_backoffs_frozen() {
         assert_eq!(HOLDER_FRESHNESS_BACKOFFS_MS, [0, 1000, 3000, 6000]);
         assert!(HOLDER_FRESHNESS_BACKOFFS_MS.iter().sum::<u64>() <= 10_000);
+    }
+
+    // --- AMENDMENT-001: decision-timestamp availability budgets (D2 T10 / D3 T0) ---
+
+    #[test] // frozen budgets
+    fn ts_arch_budgets_frozen() {
+        assert_eq!(HOLDER_DECISION_BUDGET_MS, 10_000);
+        assert_eq!(MICROSTRUCTURE_T0_BUDGET_MS, 250);
+    }
+
+    #[test] // holder T10: completed within 10s of T0 -> available; over -> not
+    fn holder_t10_boundary() {
+        let t0 = chrono::Utc.timestamp_opt(1_000_000, 0).unwrap();
+        use chrono::TimeZone;
+        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(9_999), HOLDER_DECISION_BUDGET_MS));
+        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(10_000), HOLDER_DECISION_BUDGET_MS)); // boundary inclusive
+        assert!(!within_budget(t0, t0 + chrono::Duration::milliseconds(10_001), HOLDER_DECISION_BUDGET_MS));
+    }
+
+    #[test] // microstructure T0_AVAILABLE: within 250ms -> available; over -> not
+    fn probe_t0_boundary() {
+        use chrono::TimeZone;
+        let t0 = chrono::Utc.timestamp_opt(1_000_000, 0).unwrap();
+        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(249), MICROSTRUCTURE_T0_BUDGET_MS));
+        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(250), MICROSTRUCTURE_T0_BUDGET_MS));
+        assert!(!within_budget(t0, t0 + chrono::Duration::milliseconds(251), MICROSTRUCTURE_T0_BUDGET_MS));
+    }
+
+    #[tokio::test] // D3 DECOUPLING: a slow holder does NOT delay probe start under join!
+    async fn probes_not_delayed_by_holder_sequencing() {
+        use tokio::time::{Duration, Instant};
+        let start = Instant::now();
+        let holder = async { tokio::time::sleep(Duration::from_millis(300)).await; };
+        let probe = async { Instant::now() }; // resolves on first poll
+        let (_, probe_started_at) = tokio::join!(holder, probe);
+        // Under join!, the probe is polled immediately — NOT after the holder's 300ms.
+        assert!(
+            probe_started_at.duration_since(start) < Duration::from_millis(150),
+            "probe must not wait on the holder chain"
+        );
     }
 
     #[test] // rate-limit / timeout still classify explicitly (unchanged)

@@ -106,6 +106,9 @@ pub struct MeasurementRunSummary {
     pub t2_invalid_due_to_coverage: u64,
     pub t6_invalid_due_to_coverage: u64,
     pub zero_activity_valid_snapshots: u64,
+    /// Timestamp-architecture semantics in force for this run (AMENDMENT-001).
+    #[serde(default)]
+    pub timestamp_semantics_version: u32,
 }
 
 /// The payload union persisted to the measurement sink.
