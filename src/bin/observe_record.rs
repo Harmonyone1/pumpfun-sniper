@@ -42,9 +42,16 @@ use pumpfun_sniper::observation::schema::{
     StreamStateRecord, TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord,
     ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
 };
+use pumpfun_sniper::observation::measurement::{MeasurementFailureCategory, MeasurementFailureRecord};
+use pumpfun_sniper::observation::measurement_runtime::{BoundedTradeQueue, SubscriptionRegistry, MEASUREMENT_TRADE_QUEUE_CAPACITY};
+use pumpfun_sniper::observation::measurement_sink::{
+    normalize_trade_event, MeasurementPayload, MeasurementSink, SubscriptionStateRecord,
+};
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::runtime::RuntimeLease;
-use pumpfun_sniper::stream::pumpportal::{PumpPortalDecodeError, PumpPortalDecodeKind};
+use pumpfun_sniper::stream::pumpportal::{
+    CommandSender, PumpPortalDecodeError, PumpPortalDecodeKind, SubscriptionCommand, TradeEvent,
+};
 use pumpfun_sniper::stream::{
     PumpPortalClient, PumpPortalConfig, PumpPortalEvent, PumpPortalSubscriptionPlan,
 };
@@ -721,6 +728,76 @@ struct CandidateTaskResult {
 // main
 // ---------------------------------------------------------------------------
 
+/// Shared P3 measurement runtime context (Option B). Owns the separate sink,
+/// the per-mint subscription registry, the bounded trade queue, and a handle to
+/// issue token-trade subscribe/unsubscribe. Passed by &mut through the intake
+/// path so no wide signature churn is needed. Measurement failures NEVER touch
+/// canonical observation state.
+struct MeasurementCtx {
+    sender: CommandSender,
+    registry: SubscriptionRegistry,
+    sink: MeasurementSink<std::fs::File>,
+    queue: BoundedTradeQueue,
+    run_id: String,
+    source_revision: String,
+}
+
+impl MeasurementCtx {
+    /// Unconditional: issue a token-trade subscribe for a just-admitted mint and
+    /// record subscription state. No dependence on any hypothesis/price/outcome.
+    async fn on_candidate_admitted(&mut self, mint: &str) {
+        self.registry.request(mint, Utc::now());
+        let res = self
+            .sender
+            .send(SubscriptionCommand::SubscribeTokenTrades(vec![mint.to_string()]))
+            .await;
+        if let Some(s) = self.registry.get_mut(mint) {
+            match res {
+                Ok(()) => s.mark_active(Utc::now()),
+                Err(_) => s.mark_failed(MeasurementFailureCategory::RpcUnavailable),
+            }
+        }
+        if let Some(s) = self.registry.get(mint) {
+            let _ = self
+                .sink
+                .append(MeasurementPayload::SubscriptionState(SubscriptionStateRecord::from_sub(s)), Utc::now());
+        }
+    }
+
+    /// Route an incoming trade for an expected-active mint: dedup by signature
+    /// (earliest receipt wins; never persisted twice), push through the bounded
+    /// queue (explicit backpressure failure, never a silent drop), then persist
+    /// TradeObserved to the separate sink and update the candidate buffer.
+    fn on_expected_trade(&mut self, ev: &TradeEvent) {
+        if !self.registry.accept_signature(&ev.mint, &ev.signature) {
+            return; // duplicate signature — not persisted twice
+        }
+        let now = Utc::now();
+        let t = normalize_trade_event(ev, &self.run_id, &self.source_revision, now);
+        match self.queue.push(t) {
+            Ok(()) => {
+                for qt in self.queue.drain() {
+                    self.registry.route_trade(qt.clone());
+                    let _ = self.sink.append(MeasurementPayload::TradeObserved(qt), Utc::now());
+                }
+            }
+            Err(_bp) => {
+                let _ = self.sink.append(
+                    MeasurementPayload::MeasurementFailure(MeasurementFailureRecord {
+                        run_id: self.run_id.clone(),
+                        mint: ev.mint.clone(),
+                        domain: "trade_stream".to_string(),
+                        stage: "bounded_queue".to_string(),
+                        category: MeasurementFailureCategory::Other, // TradeStreamBackpressureFailure
+                        at: now,
+                    }),
+                    now,
+                );
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -782,8 +859,9 @@ async fn main() -> Result<()> {
 
     // --- Section 33: create the recorder ONLY after config + lease + mainnet +
     // slot are proven. RunStarted is auto-appended by create(). ---
+    let source_revision = detect_source_revision();
     let run_started = RunStartedRecord::new(
-        detect_source_revision(),
+        source_revision.clone(),
         detect_working_tree_clean(),
         env!("CARGO_PKG_VERSION").to_string(),
         intake_seconds,
@@ -793,10 +871,18 @@ async fn main() -> Result<()> {
     let recorder = ObservationRecorder::create(&args.output_dir, run_started)
         .await
         .context("failed to create observation recorder")?;
-    if let Some(name) = run_file_name(&args.output_dir).await {
+    let run_file = run_file_name(&args.output_dir).await;
+    if let Some(name) = &run_file {
         // Filename only — never the directory path.
         println!("Recorder file: {name}");
     }
+    // Canonical run_id parsed from `observation_<stamp>_<run_id>.jsonl` for the
+    // measurement-sink linkage contract (ties both files to the same run).
+    let measurement_run_id = run_file
+        .as_ref()
+        .and_then(|n| n.strip_prefix("observation_").and_then(|s| s.strip_suffix(".jsonl")))
+        .and_then(|s| s.split_once('_').map(|(_, id)| id.to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
 
     // --- Section 34: single PumpPortal client, free-only plan. ---
     let pp_config = PumpPortalConfig {
@@ -812,6 +898,21 @@ async fn main() -> Result<()> {
         .start(free_only_plan())
         .await
         .context("failed to start PumpPortal client")?;
+
+    // --- P3 (Option B): separate measurement sink + Domain-1 subscription ctx. ---
+    let measurement_path = args
+        .output_dir
+        .join(format!("measurement_{measurement_run_id}.jsonl"));
+    let measurement_file =
+        std::fs::File::create(&measurement_path).context("failed to create measurement sink file")?;
+    let mut meas = MeasurementCtx {
+        sender: client.get_command_sender(),
+        registry: SubscriptionRegistry::new(),
+        sink: MeasurementSink::new(measurement_file, &measurement_run_id, &source_revision),
+        queue: BoundedTradeQueue::new(MEASUREMENT_TRADE_QUEUE_CAPACITY),
+        run_id: measurement_run_id.clone(),
+        source_revision: source_revision.clone(),
+    };
 
     let oracle = Arc::new(PumpMarketOracle::new(rpc.clone()));
     let semaphore = Arc::new(Semaphore::new(max_active_candidates));
@@ -864,6 +965,7 @@ async fn main() -> Result<()> {
                     &mut tasks,
                     &mut ever_connected,
                     &mut stream_connected,
+                    &mut meas,
                 )
                 .await
                 {
@@ -999,6 +1101,7 @@ async fn handle_intake_event(
     tasks: &mut JoinSet<CandidateTaskOutcome>,
     ever_connected: &mut bool,
     stream_connected: &mut bool,
+    meas: &mut MeasurementCtx,
 ) -> std::result::Result<(), CollectorRecordError> {
     match event {
         PumpPortalEvent::Connected => {
@@ -1035,14 +1138,16 @@ async fn handle_intake_event(
             // starts a task, NEVER fabricates a CandidateObserved. Degrades the run.
             record_decode_error(recorder, counters, &e).await?;
         }
-        PumpPortalEvent::Trade(_) => {
-            // Free-only plan: a Trade is an anomaly. No trade fields recorded.
-            counters.unexpected_trade_events += 1;
-            append_required(
-                recorder,
-                stream_state(StreamStateKind::UnexpectedTrade, None),
-            )
-            .await?;
+        PumpPortalEvent::Trade(ev) => {
+            // P3 Domain-1: if this mint has an expected-active token-trade
+            // subscription, route it to the SEPARATE measurement sink (canonical
+            // stream untouched). Otherwise preserve the unexpected-trade anomaly.
+            if meas.registry.is_active(&ev.mint) {
+                meas.on_expected_trade(&ev);
+            } else {
+                counters.unexpected_trade_events += 1;
+                append_required(recorder, stream_state(StreamStateKind::UnexpectedTrade, None)).await?;
+            }
         }
         PumpPortalEvent::Migration(ev) => {
             counters.migrations_seen += 1;
@@ -1071,6 +1176,7 @@ async fn handle_intake_event(
                 seen_signatures,
                 counters,
                 tasks,
+                meas,
             )
             .await?;
         }
@@ -1091,6 +1197,7 @@ async fn handle_intake_event(
                 seen_signatures,
                 counters,
                 tasks,
+                meas,
             )
             .await?;
         }
@@ -1212,6 +1319,7 @@ async fn discover_candidate(
     seen_signatures: &mut HashSet<String>,
     counters: &mut RunCounters,
     tasks: &mut JoinSet<CandidateTaskOutcome>,
+    meas: &mut MeasurementCtx,
 ) -> std::result::Result<(), CollectorRecordError> {
     let candidate_received_at = Utc::now();
     counters.candidates_seen += 1;
@@ -1271,6 +1379,8 @@ async fn discover_candidate(
                 rpc_gate,
                 recorder,
             ));
+            // P3 Domain-1 (unconditional): subscribe to this tracked mint's trades.
+            meas.on_candidate_admitted(&mint_str).await;
         }
         Err(_) => {
             counters.tracking_skipped += 1;

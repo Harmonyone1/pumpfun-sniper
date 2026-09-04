@@ -161,6 +161,7 @@ impl MintSubscription {
 pub struct SubscriptionRegistry {
     subs: std::collections::BTreeMap<String, MintSubscription>,
     buffers: std::collections::BTreeMap<String, Vec<TradeObserved>>,
+    seen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 impl SubscriptionRegistry {
@@ -177,6 +178,20 @@ impl SubscriptionRegistry {
     }
     pub fn get(&self, mint: &str) -> Option<&MintSubscription> {
         self.subs.get(mint)
+    }
+    /// True if `sig` is NEW for `mint` (first receipt) — records it. A duplicate
+    /// signature returns false so it is persisted at most once (earliest wins by
+    /// receive order). Ingestion-time dedup complements the pure order-independent
+    /// dedup used at snapshot derivation.
+    pub fn accept_signature(&mut self, mint: &str, sig: &str) -> bool {
+        self.seen.entry(mint.to_string()).or_default().insert(sig.to_string())
+    }
+    /// Is this mint an expected-active subscription (Requested or Active)?
+    pub fn is_active(&self, mint: &str) -> bool {
+        matches!(
+            self.subs.get(mint).map(|s| s.phase),
+            Some(SubscriptionPhase::Requested) | Some(SubscriptionPhase::Active)
+        )
     }
     /// Route a normalized trade into its candidate buffer (drop-free; caller has
     /// already accepted it from the bounded queue). Updates last_trade.
@@ -195,6 +210,7 @@ impl SubscriptionRegistry {
     pub fn cleanup(&mut self, mint: &str) {
         self.subs.remove(mint);
         self.buffers.remove(mint);
+        self.seen.remove(mint);
     }
     /// Mints still active (for reconnect restore). Unconditional set.
     pub fn active_mints(&self) -> Vec<String> {
@@ -393,5 +409,18 @@ mod tests {
     #[test] // frozen queue capacity
     fn frozen_capacity() {
         assert_eq!(MEASUREMENT_TRADE_QUEUE_CAPACITY, 4096);
+    }
+
+    #[test] // ingestion signature dedup: earliest wins, duplicate rejected; is_active
+    fn accept_signature_dedup() {
+        let mut reg = SubscriptionRegistry::new();
+        reg.request("M", ts(0));
+        assert!(reg.is_active("M"));
+        assert!(reg.accept_signature("M", "sig1")); // new
+        assert!(!reg.accept_signature("M", "sig1")); // duplicate rejected
+        assert!(reg.accept_signature("M", "sig2")); // different new
+        reg.cleanup("M");
+        assert!(!reg.is_active("M"));
+        assert!(reg.accept_signature("M", "sig1")); // cleared after cleanup
     }
 }
