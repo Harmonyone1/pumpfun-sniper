@@ -553,7 +553,7 @@ impl From<MarketSide> for ObservedSide {
 
 /// Recorder-owned serializable executable quote. No slippage tolerance, priority
 /// fee, Jito tip, or modeled fill is added.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableQuoteRecord {
     pub side: ObservedSide,
     pub venue: ObservedVenue,
@@ -820,6 +820,139 @@ pub fn protocol_net_ex_network_return_bps(
 }
 
 // ---------------------------------------------------------------------------
+// Section 46 — P3 decision-base return measurement (Option-B sink types)
+// ---------------------------------------------------------------------------
+//
+// Frozen under P3-DECISION-BASE-RETURN-MEASUREMENT-WORKSTREAM-001 (protocol
+// hashes in phase_c/p3_decision_base_return_manifest.json). Economic-outcome
+// records for the causal decision-base return substrate: a per-class read-only
+// BUY(base) quote at the feature's own decision timestamp, plus matched forward
+// SELL quotes of that EXACT base quantity. Routed to the isolated measurement
+// sink, never the canonical ObservationPayload stream. Read-only quotes only —
+// no signing / transaction / submission. They live here (with the return math +
+// ExecutableQuoteRecord), not in measurement.rs, which is frozen observation-only
+// with no economic-outcome computation.
+
+/// Bump only on an incompatible decision-base measurement change.
+pub const DECISION_BASE_MEASUREMENT_VERSION: u32 = 1;
+/// Secondary-label thresholds (frozen A4), on the matched net return.
+pub const DECISION_BASE_SEVERE_LOSS_50_BPS: i64 = -5000;
+pub const DECISION_BASE_POSITIVE_TAIL_50_BPS: i64 = 5000;
+
+/// The four frozen decision classes. Each carries its OWN base quantity; a
+/// class's sell path uses only that class's quantity (never T0, never another
+/// class). T1/T15 anchor on the admission timeline (t0_enrichment), T2/T6 on the
+/// tracking timeline (track_candidate sampled_at).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DecisionClass {
+    T1,
+    T2,
+    T6,
+    T15,
+}
+
+/// Base-quote disposition (frozen A7 + SEMANTICS AMENDMENT). Explicit; never
+/// numeric zero, never reused from another timestamp. NOT a causal deadline gate
+/// — there is no quote-acquisition budget (amendment §4); raw latencies below
+/// carry the timing truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DecisionBaseStatus {
+    /// A base buy quote was successfully acquired (request initiated at/after D).
+    Success,
+    /// Base quote RPC/oracle call failed.
+    RpcFailure,
+    /// The market/account was not available to quote (fail-closed, no base).
+    AccountMissing,
+}
+
+/// One decision-base BUY quote at a class decision timestamp. `base_amount_raw`
+/// (inside `buy_quote`) is the per-class quantity every matched sell must reuse.
+/// The causal entry anchor B is `buy_quote.quoted_at` (the trusted state
+/// timestamp) — forward horizons are measured from B, not from `decision_timestamp`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionBaseQuoteRecord {
+    pub candidate_id: String,
+    pub mint: String,
+    pub decision_class: DecisionClass,
+    /// D — the class decision timestamp (earliest the feature is decision-usable).
+    /// `requested_at` is guaranteed >= D (amendment §3).
+    pub decision_timestamp: DateTime<Utc>,
+    pub requested_at: DateTime<Utc>,
+    /// B — the base entry anchor = quote `quoted_at` on success; None on failure.
+    pub sampled_at: Option<DateTime<Utc>>,
+    /// Wall completion of the quote await (>= B on success; the failure-return
+    /// instant on failure).
+    pub completed_at: DateTime<Utc>,
+    /// requested_at - decision_timestamp (>= 0 by construction).
+    pub request_lag_ms: i64,
+    /// completed_at - requested_at (raw acquisition latency).
+    pub quote_latency_ms: i64,
+    /// B - decision_timestamp (the causal entry-anchor lag); None on failure.
+    pub entry_anchor_lag_ms: Option<i64>,
+    pub base_input_lamports: u64,
+    pub base_status: DecisionBaseStatus,
+    pub buy_quote: Option<ExecutableQuoteRecord>,
+    pub buy_quote_failure: Option<ObservationFailureCode>,
+    pub rpc_gate_wait_ms: Option<u64>,
+    pub rpc_call_duration_ms: Option<u64>,
+    pub decision_base_measurement_version: u32,
+}
+
+/// One matched forward SELL of a class's exact base quantity at Tx + horizon.
+/// `market_attrition` is true when the matched sell is missing (liquidity/venue
+/// gone). Returns are recomputable at replay from the two quotes + constants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionBaseOutcomeRecord {
+    pub candidate_id: String,
+    pub mint: String,
+    pub decision_class: DecisionClass,
+    /// D — the class decision timestamp (context; the return does NOT start here).
+    pub decision_timestamp: DateTime<Utc>,
+    /// B — the base entry anchor (base buy `sampled_at`). Forward horizons and
+    /// `due_at` are measured from B (amendment §5-6): due_at = B + horizon_secs.
+    pub base_entry_anchor: DateTime<Utc>,
+    pub horizon_secs: u64,
+    /// The EXACT matched quantity sold = the class base buy's `base_amount_raw`.
+    pub base_amount_raw: u64,
+    pub due_at: DateTime<Utc>,
+    pub sell_requested_at: DateTime<Utc>,
+    /// Sell quote `quoted_at` on success; completion instant on failure.
+    pub sell_sampled_at: DateTime<Utc>,
+    pub sample_lag_ms: i64,
+    pub matched_sell_available: bool,
+    /// The sell quote's own base_in exactly equals the class base quantity.
+    pub quantity_match: bool,
+    pub sell_quote: Option<ExecutableQuoteRecord>,
+    pub sell_quote_failure: Option<ObservationFailureCode>,
+    /// Raw ratio return (sell out vs base input). This collector applies no
+    /// distinct network-cost layer, so gross == net here (both from the same
+    /// frozen `protocol_net_ex_network_return_bps`); kept as separate fields for
+    /// the audit checklist and a future split without a schema change.
+    pub gross_return_bps: Option<i64>,
+    pub net_return_bps: Option<i64>,
+    pub severe_loss_50: Option<bool>,
+    pub positive_tail_50: Option<bool>,
+    pub market_attrition: bool,
+    pub rpc_gate_wait_ms: Option<u64>,
+    pub rpc_call_duration_ms: Option<u64>,
+    pub decision_base_measurement_version: u32,
+}
+
+/// Secondary labels from a matched net return (frozen A4). `None` when there is
+/// no matched sell (never fabricated as a label).
+pub fn decision_base_secondary_labels(net_return_bps: Option<i64>) -> (Option<bool>, Option<bool>) {
+    match net_return_bps {
+        Some(bps) => (
+            Some(bps <= DECISION_BASE_SEVERE_LOSS_50_BPS),
+            Some(bps >= DECISION_BASE_POSITIVE_TAIL_50_BPS),
+        ),
+        None => (None, None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Section 19 — TrackingFinished
 // ---------------------------------------------------------------------------
 
@@ -927,6 +1060,7 @@ pub struct RunFinishedRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn test_return_bps_plus_10_percent() {
@@ -1842,5 +1976,123 @@ mod tests {
             round.snapshot_market_data_kind,
             Some(MarketDataFailureKind::FeeConfigInvalid)
         );
+    }
+
+    // ---- P3 decision-base return semantics (frozen + amendment) ----
+
+    #[test]
+    fn decision_base_labels_thresholds() {
+        // severe_loss_50 at <= -5000; positive_tail_50 at >= +5000; boundaries inclusive.
+        assert_eq!(decision_base_secondary_labels(Some(-5000)), (Some(true), Some(false)));
+        assert_eq!(decision_base_secondary_labels(Some(-4999)), (Some(false), Some(false)));
+        assert_eq!(decision_base_secondary_labels(Some(5000)), (Some(false), Some(true)));
+        assert_eq!(decision_base_secondary_labels(Some(4999)), (Some(false), Some(false)));
+        assert_eq!(decision_base_secondary_labels(Some(0)), (Some(false), Some(false)));
+        // No matched sell => no fabricated labels.
+        assert_eq!(decision_base_secondary_labels(None), (None, None));
+        assert_eq!(DECISION_BASE_SEVERE_LOSS_50_BPS, -5000);
+        assert_eq!(DECISION_BASE_POSITIVE_TAIL_50_BPS, 5000);
+    }
+
+    #[test]
+    fn decision_base_return_uses_frozen_canonical_fn() {
+        // Return math is the same frozen semantic as canonical outcomes, on the
+        // per-class base input (ENTRY_QUOTE_LAMPORTS) vs the matched sell out.
+        let input = 1_000_000u64;
+        assert_eq!(protocol_net_ex_network_return_bps(input, 1_100_000), Some(1000));
+        assert_eq!(protocol_net_ex_network_return_bps(input, 920_000), Some(-800));
+        assert_eq!(protocol_net_ex_network_return_bps(input, 1_200_000), Some(2000));
+        // gross == net here (no distinct network-cost layer): both come from the
+        // same fn on the same inputs.
+    }
+
+    #[test]
+    fn decision_base_forward_anchor_is_b_not_d() {
+        // Amendment §6: due_at = B + horizon, where B is the base sampled_at (not D).
+        let d = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let b = d + chrono::Duration::milliseconds(342); // base sampled 342ms after D
+        for h in [15i64, 30, 60, 120] {
+            let due_from_b = b + chrono::Duration::seconds(h);
+            let due_from_d = d + chrono::Duration::seconds(h);
+            assert_ne!(due_from_b, due_from_d, "horizon must anchor on B, not D");
+            assert_eq!((due_from_b - b).num_seconds(), h);
+        }
+    }
+
+    #[test]
+    fn decision_base_status_has_no_budget_late_variant() {
+        // Amendment §4: there is no quote-acquisition budget, so no "Late" status.
+        let j = serde_json::to_string(&DecisionBaseStatus::Success).unwrap();
+        assert_eq!(j, "\"SUCCESS\"");
+        assert_eq!(serde_json::to_string(&DecisionBaseStatus::RpcFailure).unwrap(), "\"RPC_FAILURE\"");
+        assert_eq!(serde_json::to_string(&DecisionBaseStatus::AccountMissing).unwrap(), "\"ACCOUNT_MISSING\"");
+    }
+
+    #[test]
+    fn decision_base_records_roundtrip_and_carry_latencies() {
+        let d = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let b = d + chrono::Duration::milliseconds(300);
+        let q = DecisionBaseQuoteRecord {
+            candidate_id: "c1".into(),
+            mint: "M".into(),
+            decision_class: DecisionClass::T15,
+            decision_timestamp: d,
+            requested_at: d + chrono::Duration::milliseconds(5),
+            sampled_at: Some(b),
+            completed_at: b + chrono::Duration::milliseconds(2),
+            request_lag_ms: 5,
+            quote_latency_ms: 297,
+            entry_anchor_lag_ms: Some(300),
+            base_input_lamports: 1_000_000,
+            base_status: DecisionBaseStatus::Success,
+            buy_quote: None,
+            buy_quote_failure: None,
+            rpc_gate_wait_ms: Some(1),
+            rpc_call_duration_ms: Some(296),
+            decision_base_measurement_version: DECISION_BASE_MEASUREMENT_VERSION,
+        };
+        let round: DecisionBaseQuoteRecord =
+            serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
+        assert_eq!(round, q);
+        assert_eq!(round.entry_anchor_lag_ms, Some(300));
+
+        let o = DecisionBaseOutcomeRecord {
+            candidate_id: "c1".into(),
+            mint: "M".into(),
+            decision_class: DecisionClass::T15,
+            decision_timestamp: d,
+            base_entry_anchor: b,
+            horizon_secs: 120,
+            base_amount_raw: 42,
+            due_at: b + chrono::Duration::seconds(120),
+            sell_requested_at: b + chrono::Duration::seconds(120),
+            sell_sampled_at: b + chrono::Duration::seconds(120),
+            sample_lag_ms: 0,
+            matched_sell_available: true,
+            quantity_match: true,
+            sell_quote: None,
+            sell_quote_failure: None,
+            gross_return_bps: Some(-800),
+            net_return_bps: Some(-800),
+            severe_loss_50: Some(false),
+            positive_tail_50: Some(false),
+            market_attrition: false,
+            rpc_gate_wait_ms: Some(0),
+            rpc_call_duration_ms: Some(5),
+            decision_base_measurement_version: DECISION_BASE_MEASUREMENT_VERSION,
+        };
+        let round_o: DecisionBaseOutcomeRecord =
+            serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
+        assert_eq!(round_o, o);
+        // due_at anchored on B.
+        assert_eq!(round_o.due_at, round_o.base_entry_anchor + chrono::Duration::seconds(120));
+    }
+
+    #[test]
+    fn decision_class_serialization_is_stable() {
+        assert_eq!(serde_json::to_string(&DecisionClass::T1).unwrap(), "\"T1\"");
+        assert_eq!(serde_json::to_string(&DecisionClass::T2).unwrap(), "\"T2\"");
+        assert_eq!(serde_json::to_string(&DecisionClass::T6).unwrap(), "\"T6\"");
+        assert_eq!(serde_json::to_string(&DecisionClass::T15).unwrap(), "\"T15\"");
     }
 }

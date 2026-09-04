@@ -40,6 +40,8 @@ use pumpfun_sniper::observation::schema::{
     MigrationObservedRecord, ObservationFailureCode, ObservationPayload, OutcomeSampleRecord,
     ProviderCreateShape, RunCompletion, RunFinishedRecord, RunStartedRecord, StreamStateKind,
     StreamStateRecord, TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord,
+    decision_base_secondary_labels, DecisionBaseOutcomeRecord, DecisionBaseQuoteRecord,
+    DecisionBaseStatus, DecisionClass, DECISION_BASE_MEASUREMENT_VERSION,
     ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
 };
 use pumpfun_sniper::observation::measurement::{
@@ -784,6 +786,17 @@ struct MeasurementCounters {
     t2_invalid_due_to_coverage: u64,
     t6_invalid_due_to_coverage: u64,
     zero_activity_valid_snapshots: u64,
+    // P3-DECISION-BASE-RETURN-MEASUREMENT-WORKSTREAM-001 counters.
+    decision_base_attempts: u64,
+    decision_base_available: u64,
+    decision_base_late: u64,
+    decision_base_rpc_failure: u64,
+    decision_base_account_missing: u64,
+    decision_base_sells_attempted: u64,
+    decision_base_sells_available: u64,
+    decision_base_sells_missing: u64,
+    decision_base_quantity_mismatches: u64,
+    decision_base_t0_fallbacks: u64,
 }
 
 use pumpfun_sniper::observation::measurement_runtime::CoverageState;
@@ -1153,6 +1166,18 @@ impl MeasurementShared {
             t6_invalid_due_to_coverage: c.t6_invalid_due_to_coverage,
             zero_activity_valid_snapshots: c.zero_activity_valid_snapshots,
             timestamp_semantics_version: pumpfun_sniper::observation::measurement_runtime::TIMESTAMP_SEMANTICS_VERSION,
+            decision_base_measurement_version:
+                pumpfun_sniper::observation::schema::DECISION_BASE_MEASUREMENT_VERSION,
+            decision_base_attempts: c.decision_base_attempts,
+            decision_base_available: c.decision_base_available,
+            decision_base_late: c.decision_base_late,
+            decision_base_rpc_failure: c.decision_base_rpc_failure,
+            decision_base_account_missing: c.decision_base_account_missing,
+            decision_base_sells_attempted: c.decision_base_sells_attempted,
+            decision_base_sells_available: c.decision_base_sells_available,
+            decision_base_sells_missing: c.decision_base_sells_missing,
+            decision_base_quantity_mismatches: c.decision_base_quantity_mismatches,
+            decision_base_t0_fallbacks: c.decision_base_t0_fallbacks,
         }
     }
 }
@@ -1528,6 +1553,7 @@ const MICROSTRUCTURE_PROBE_LAMPORTS: [u64; 3] = [500_000, 1_000_000, 2_000_000];
 /// `available_in_time` is truthful, never backdated.
 #[allow(clippy::too_many_arguments)]
 async fn t0_enrichment(
+    candidate_id: String,
     mint: Pubkey,
     creator: String,
     oracle: Arc<PumpMarketOracle>,
@@ -1538,6 +1564,9 @@ async fn t0_enrichment(
     source_revision: String,
     t0_deadline: DateTime<Utc>,
 ) {
+    // Monotonic admission anchor for the admission-timeline decision bases (DB_T1
+    // at ~T0+1s, DB_T15 at T0+15s). Captured at task start (≈ candidate admission).
+    let t0_instant = tokio::time::Instant::now();
     // Creator classification is by OWNER: the creator's account is owned by the
     // creator WALLET. Deterministic only if the provider creator pubkey parses.
     let creator_wallet = Pubkey::from_str(&creator).ok().map(|c| c.to_string());
@@ -1587,10 +1616,202 @@ async fn t0_enrichment(
         });
         shared.append(MeasurementPayload::MicrostructureProbe(probe));
     }
+
+    // --- P3-DECISION-BASE-RETURN (admission timeline): DB_T1 + DB_T15. ---
+    // Run-owned local JoinSet, joined before this enrichment task returns (never
+    // detached). DB_T1's feature (probe) already fired at ~T0+1s above, so its base
+    // is requested now (>= T0+1s). DB_T15 fires at T0+15s. Each runs its own buy +
+    // matched forward sells of its OWN base quantity (amendment §1,§5).
+    let mut db_tasks: JoinSet<()> = JoinSet::new();
+    let d_t1 = t0 + chrono::Duration::seconds(1);
+    db_tasks.spawn(run_decision_base(
+        rpc_gate.clone(),
+        oracle.clone(),
+        shared.clone(),
+        candidate_id.clone(),
+        mint,
+        DecisionClass::T1,
+        d_t1,
+    ));
+    {
+        let (g, o, s, cid) = (rpc_gate.clone(), oracle.clone(), shared.clone(), candidate_id.clone());
+        let d_t15 = t0 + chrono::Duration::seconds(15);
+        let t15_due = t0_instant + Duration::from_secs(15);
+        db_tasks.spawn(async move {
+            let now = tokio::time::Instant::now();
+            if t15_due > now {
+                tokio::time::sleep(t15_due - now).await;
+            }
+            run_decision_base(g, o, s, cid, mint, DecisionClass::T15, d_t15).await;
+        });
+    }
+    while db_tasks.join_next().await.is_some() {}
 }
 
 /// Frozen bounded shutdown budget (secs) for draining P3 enrichment tasks.
-const MEASUREMENT_ENRICHMENT_DRAIN_SECS: u64 = 20;
+/// Raised 20 -> 240 for P3-DECISION-BASE-RETURN-MEASUREMENT-WORKSTREAM-001: the
+/// enrichment task now owns DB_T1/T15 decision-base work that runs to ~135s after
+/// admission (T15 + 120s) + RPC margin. The 20s drain would have aborted those
+/// run-owned tasks; 240s covers MAX_DECISION_OFFSET(15) + MAX_FORWARD_HORIZON(120)
+/// + margin, matching the run-level OUTCOME_DRAIN_SECS (amendment §5).
+const MEASUREMENT_ENRICHMENT_DRAIN_SECS: u64 = 240;
+
+/// Frozen decision-base matched forward-sell horizons (secs), measured from the
+/// actual base entry anchor B (amendment §6), never from the nominal decision D.
+const DECISION_BASE_FORWARD_HORIZONS_SECS: [u64; 4] = [15, 30, 60, 120];
+
+/// Acquire one decision-base BUY quote for `class` at its already-reached decision
+/// timestamp `decision_timestamp` (D; caller guarantees now >= D), then run matched
+/// forward SELL quotes of that EXACT base quantity at B + {15,30,60,120}s, where B
+/// is the base quote's own `quoted_at` (the causal entry anchor). Persists one
+/// DecisionBaseQuote row + one DecisionBaseOutcome row per horizon to the isolated
+/// measurement sink. Read-only quotes only — no signing / transaction / submission.
+/// Run-owned: the caller spawns this into a local JoinSet joined before the owning
+/// task returns; never a detached spawn. Never falls back to a T0 quantity and
+/// never reuses another class's quantity.
+async fn run_decision_base(
+    rpc_gate: Arc<ObservationRpcGate>,
+    oracle: Arc<PumpMarketOracle>,
+    measurement: Arc<MeasurementShared>,
+    candidate_id: String,
+    mint: Pubkey,
+    class: DecisionClass,
+    decision_timestamp: DateTime<Utc>,
+) {
+    let mint_str = mint.to_string();
+    measurement.count(|c| c.decision_base_attempts += 1);
+
+    let requested_at = Utc::now();
+    let base_instant = tokio::time::Instant::now();
+    let buy_call = gated_quote_buy_sol(&rpc_gate, &oracle, &mint, ENTRY_QUOTE_LAMPORTS).await;
+    let completed_at = Utc::now();
+    let request_lag_ms = wall_lag_ms(decision_timestamp, requested_at);
+    let quote_latency_ms = wall_lag_ms(requested_at, completed_at);
+
+    let (base_status, buy_quote, buy_quote_failure, sampled_at, entry_anchor_lag_ms, base_amount_raw) =
+        match buy_call.result {
+            Ok(q) => {
+                let rec = ExecutableQuoteRecord::from(&q);
+                let b = rec.quoted_at;
+                let lag = wall_lag_ms(decision_timestamp, b);
+                let base = rec.base_amount_raw;
+                (DecisionBaseStatus::Success, Some(rec), None, Some(b), Some(lag), Some(base))
+            }
+            Err(e) => {
+                let c = classify_observation_error_full(&e);
+                let status = if matches!(c.code, ObservationFailureCode::MarketUnavailable) {
+                    DecisionBaseStatus::AccountMissing
+                } else {
+                    DecisionBaseStatus::RpcFailure
+                };
+                (status, None, Some(c.code), None, None, None)
+            }
+        };
+
+    measurement.append(MeasurementPayload::DecisionBaseQuote(DecisionBaseQuoteRecord {
+        candidate_id: candidate_id.clone(),
+        mint: mint_str.clone(),
+        decision_class: class,
+        decision_timestamp,
+        requested_at,
+        sampled_at,
+        completed_at,
+        request_lag_ms,
+        quote_latency_ms,
+        entry_anchor_lag_ms,
+        base_input_lamports: ENTRY_QUOTE_LAMPORTS,
+        base_status,
+        buy_quote,
+        buy_quote_failure,
+        rpc_gate_wait_ms: Some(buy_call.gate_wait_ms),
+        rpc_call_duration_ms: Some(buy_call.call_duration_ms),
+        decision_base_measurement_version: DECISION_BASE_MEASUREMENT_VERSION,
+    }));
+    measurement.count(|c| match base_status {
+        DecisionBaseStatus::Success => c.decision_base_available += 1,
+        DecisionBaseStatus::RpcFailure => c.decision_base_rpc_failure += 1,
+        DecisionBaseStatus::AccountMissing => c.decision_base_account_missing += 1,
+    });
+
+    // No base => no sells. NEVER fall back to a T0 quantity (amendment §8).
+    let (Some(base_amount_raw), Some(b)) = (base_amount_raw, sampled_at) else {
+        return;
+    };
+
+    for &horizon in DECISION_BASE_FORWARD_HORIZONS_SECS.iter() {
+        // Forward horizon measured from B (the actual base anchor), monotonic.
+        let due_monotonic = base_instant + Duration::from_secs(horizon);
+        let now = tokio::time::Instant::now();
+        if due_monotonic > now {
+            tokio::time::sleep(due_monotonic - now).await;
+        }
+        let due_at = b + chrono::Duration::seconds(horizon as i64);
+
+        measurement.count(|c| c.decision_base_sells_attempted += 1);
+        let sell_requested_at = Utc::now();
+        let sell_call = gated_quote_sell_raw(&rpc_gate, &oracle, &mint, base_amount_raw).await;
+        let (sell_quote, sell_quote_failure, sell_sampled_at, matched, quantity_match, net) =
+            match sell_call.result {
+                Ok(q) => {
+                    let rec = ExecutableQuoteRecord::from(&q);
+                    // For a SELL, base_amount_raw is the exact raw base IN; it must
+                    // equal the class base quantity we passed. Mismatch is a defect,
+                    // not attrition: record it, do not compute a return, do not fall
+                    // back to any other quantity.
+                    let qty_match = rec.quote_amount_raw > 0 && rec.base_amount_raw == base_amount_raw;
+                    let sampled = outcome_sampled_at(Some(rec.quoted_at), Utc::now());
+                    if rec.base_amount_raw != base_amount_raw {
+                        measurement.count(|c| c.decision_base_quantity_mismatches += 1);
+                        (Some(rec), None, sampled, false, false, None)
+                    } else {
+                        let net =
+                            protocol_net_ex_network_return_bps(ENTRY_QUOTE_LAMPORTS, rec.quote_amount_raw);
+                        (Some(rec), None, sampled, true, qty_match, net)
+                    }
+                }
+                Err(e) => {
+                    let c = classify_observation_error_full(&e);
+                    (None, Some(c.code), outcome_sampled_at(None, Utc::now()), false, false, None)
+                }
+            };
+
+        if matched {
+            measurement.count(|c| c.decision_base_sells_available += 1);
+        } else {
+            measurement.count(|c| c.decision_base_sells_missing += 1);
+        }
+        let (severe_loss_50, positive_tail_50) = decision_base_secondary_labels(net);
+        // Attrition = the market/liquidity is gone (sell quote failed). A quantity
+        // mismatch is a defect flagged by quantity_match, not attrition.
+        let market_attrition = sell_quote_failure.is_some();
+
+        measurement.append(MeasurementPayload::DecisionBaseOutcome(DecisionBaseOutcomeRecord {
+            candidate_id: candidate_id.clone(),
+            mint: mint_str.clone(),
+            decision_class: class,
+            decision_timestamp,
+            base_entry_anchor: b,
+            horizon_secs: horizon,
+            base_amount_raw,
+            due_at,
+            sell_requested_at,
+            sell_sampled_at,
+            sample_lag_ms: sample_lag_ms(due_at, sell_sampled_at),
+            matched_sell_available: matched,
+            quantity_match,
+            sell_quote,
+            sell_quote_failure,
+            gross_return_bps: net,
+            net_return_bps: net,
+            severe_loss_50,
+            positive_tail_50,
+            market_attrition,
+            rpc_gate_wait_ms: Some(sell_call.gate_wait_ms),
+            rpc_call_duration_ms: Some(sell_call.call_duration_ms),
+            decision_base_measurement_version: DECISION_BASE_MEASUREMENT_VERSION,
+        }));
+    }
+}
 
 struct MeasurementCtx {
     shared: Arc<MeasurementShared>,
@@ -2304,6 +2525,7 @@ async fn discover_candidate(
             // enrichment. Detached on purpose — canonical outcome-horizon scheduling
             // outranks enrichment and must never wait on it (enrichment is expendable).
             enrichment.spawn(t0_enrichment(
+                candidate_id.clone(),
                 mint,
                 candidate.creator.clone(),
                 oracle.clone(),
@@ -2782,6 +3004,12 @@ async fn track_candidate_inner(
     let mut delayed_entry_quote_recorded = false;
     let mut delayed_entry_quote_truth: Option<DelayedEntryQuoteTruth> = None;
 
+    // --- P3-DECISION-BASE-RETURN (tracking timeline): DB_T2 + DB_T6. Run-owned
+    // local JoinSet, joined after the canonical loop (never detached). Each base is
+    // fired right after its participation feature is emitted (base requested_at >=
+    // the emitted cutoff), then runs matched forward sells of its OWN quantity.
+    let mut db_tasks: JoinSet<()> = JoinSet::new();
+
     for &horizon in OUTCOME_HORIZONS_SECS {
         // Sleep until the monotonic due instant (never negative).
         let due_monotonic = entry_monotonic + Duration::from_secs(horizon);
@@ -2904,6 +3132,16 @@ async fn track_candidate_inner(
         if horizon == 2 {
             if let Some(cutoff) = h1_sample_2s {
                 measurement.emit_participation(&mint_str, SnapshotClass::T2, cutoff, Utc::now());
+                // DB_T2: base at/after the T2 feature cutoff (amendment §2-3).
+                db_tasks.spawn(run_decision_base(
+                    rpc_gate.clone(),
+                    oracle.clone(),
+                    measurement.clone(),
+                    candidate_id.clone(),
+                    mint,
+                    DecisionClass::T2,
+                    cutoff,
+                ));
             }
         }
         if horizon == 6 {
@@ -2912,6 +3150,16 @@ async fn track_candidate_inner(
                 // same frozen H1 decision-time function as the delayed-entry path.
                 let t6_cutoff = h1_decision_time_from_observations(s2, s4, s6);
                 measurement.emit_participation(&mint_str, SnapshotClass::T6, t6_cutoff, Utc::now());
+                // DB_T6: base at/after the T6 feature decision (amendment §2-3).
+                db_tasks.spawn(run_decision_base(
+                    rpc_gate.clone(),
+                    oracle.clone(),
+                    measurement.clone(),
+                    candidate_id.clone(),
+                    mint,
+                    DecisionClass::T6,
+                    t6_cutoff,
+                ));
             }
         }
 
@@ -3047,6 +3295,11 @@ async fn track_candidate_inner(
             }
         }
     }
+
+    // Drain the run-owned tracking-timeline decision-base tasks (DB_T2/T6 matched
+    // sells run to ~T6+120s, just past the 120s canonical loop). Awaited here so
+    // they stay owned by this task; an early Err return above drops (aborts) them.
+    while db_tasks.join_next().await.is_some() {}
 
     // --- Section 19/36: complete. Required task write. ---
     if recorder
@@ -3263,6 +3516,47 @@ mod tests {
         assert_eq!(HOLDER_DECISION_BUDGET_MS, 15_000);
         assert_eq!(MICROSTRUCTURE_FINALIZATION_BUDGET_MS, 500);
         assert_eq!(MICROSTRUCTURE_PROBE_DELAY_MS, 1_000);
+    }
+
+    #[test] // decision-base forward horizons frozen (amendment §6)
+    fn decision_base_forward_horizons_frozen() {
+        assert_eq!(DECISION_BASE_FORWARD_HORIZONS_SECS, [15, 30, 60, 120]);
+    }
+
+    #[test] // amendment §5: enrichment drain must cover DB_T15 + 120s owned work
+    fn enrichment_drain_covers_decision_base_lifetime() {
+        let max_decision_offset = 15u64;
+        let max_forward_horizon = 120u64;
+        let required = max_decision_offset + max_forward_horizon; // 135s min
+        assert!(
+            MEASUREMENT_ENRICHMENT_DRAIN_SECS >= required,
+            "enrichment drain {} must cover >= {}s of owned decision-base work",
+            MEASUREMENT_ENRICHMENT_DRAIN_SECS,
+            required
+        );
+        assert_eq!(MEASUREMENT_ENRICHMENT_DRAIN_SECS, 240);
+        // The run-level outcome drain (DB_T2/T6 live in track_candidate) also covers it.
+        assert!(OUTCOME_DRAIN_SECS >= required);
+    }
+
+    #[test] // amendment §8: the decision-base path never falls back to a T0 quantity
+    fn decision_base_no_t0_quantity_fallback() {
+        let src = include_str!("observe_record.rs");
+        // Isolate the run_decision_base fn body.
+        let start = src
+            .find("async fn run_decision_base(")
+            .expect("run_decision_base present");
+        let body = &src[start..start + 6000.min(src.len() - start)];
+        // Its sells quote exactly `base_amount_raw` (the class's own base), and it
+        // must not reference the T0 initial quantity variable.
+        assert!(body.contains("gated_quote_sell_raw(&rpc_gate, &oracle, &mint, base_amount_raw)"));
+        assert!(
+            !body.contains("initial_base_amount_raw"),
+            "decision-base path must not reference the T0 initial quantity"
+        );
+        // No fallback default on the base quantity (no unwrap_or / unwrap_or_default
+        // that could substitute a non-class quantity).
+        assert!(!body.contains("base_amount_raw.unwrap_or"));
     }
 
     #[test] // holder T15: completed within 15s of T0 -> available; over -> not

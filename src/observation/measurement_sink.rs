@@ -20,11 +20,14 @@ use super::measurement::{
     HolderSnapshot, MeasurementFailureRecord, MicrostructureProbe, ParticipationSnapshot, TradeObserved,
     TradeSide,
 };
+use super::schema::{DecisionBaseOutcomeRecord, DecisionBaseQuoteRecord};
 use super::measurement_runtime::MintSubscription;
 use crate::stream::pumpportal::TradeEvent;
 
 /// Measurement-sink schema version (independent of OBSERVATION_SCHEMA_VERSION).
-pub const MEASUREMENT_SINK_SCHEMA_VERSION: u32 = 1;
+/// v2 (additive): DecisionBaseQuote + DecisionBaseOutcome payloads + decision-base
+/// summary counters (P3-DECISION-BASE-RETURN-MEASUREMENT-WORKSTREAM-001).
+pub const MEASUREMENT_SINK_SCHEMA_VERSION: u32 = 2;
 
 /// A per-mint subscription-state snapshot persisted for coverage/backpressure audit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,6 +112,31 @@ pub struct MeasurementRunSummary {
     /// Timestamp-architecture semantics in force for this run (AMENDMENT-001).
     #[serde(default)]
     pub timestamp_semantics_version: u32,
+    // P3-DECISION-BASE-RETURN-MEASUREMENT-WORKSTREAM-001 (all additive).
+    #[serde(default)]
+    pub decision_base_measurement_version: u32,
+    #[serde(default)]
+    pub decision_base_attempts: u64,
+    #[serde(default)]
+    pub decision_base_available: u64,
+    #[serde(default)]
+    pub decision_base_late: u64,
+    #[serde(default)]
+    pub decision_base_rpc_failure: u64,
+    #[serde(default)]
+    pub decision_base_account_missing: u64,
+    #[serde(default)]
+    pub decision_base_sells_attempted: u64,
+    #[serde(default)]
+    pub decision_base_sells_available: u64,
+    #[serde(default)]
+    pub decision_base_sells_missing: u64,
+    /// MUST stay 0: a matched sell whose base_in != the class base quantity.
+    #[serde(default)]
+    pub decision_base_quantity_mismatches: u64,
+    /// MUST stay 0: any fallback to the T0 initial quantity for a decision base.
+    #[serde(default)]
+    pub decision_base_t0_fallbacks: u64,
 }
 
 /// The payload union persisted to the measurement sink.
@@ -122,6 +150,8 @@ pub enum MeasurementPayload {
     MeasurementFailure(MeasurementFailureRecord),
     SubscriptionState(SubscriptionStateRecord),
     RunSummary(MeasurementRunSummary),
+    DecisionBaseQuote(DecisionBaseQuoteRecord),
+    DecisionBaseOutcome(DecisionBaseOutcomeRecord),
 }
 
 impl MeasurementPayload {
@@ -134,6 +164,8 @@ impl MeasurementPayload {
             MeasurementPayload::MeasurementFailure(_) => "MeasurementFailure",
             MeasurementPayload::SubscriptionState(_) => "SubscriptionState",
             MeasurementPayload::RunSummary(_) => "RunSummary",
+            MeasurementPayload::DecisionBaseQuote(_) => "DecisionBaseQuote",
+            MeasurementPayload::DecisionBaseOutcome(_) => "DecisionBaseOutcome",
         }
     }
     /// Candidate/mint linkage (best-effort from the payload). Run-scoped rows have none.
@@ -146,6 +178,8 @@ impl MeasurementPayload {
             MeasurementPayload::MeasurementFailure(f) => f.mint.clone(),
             MeasurementPayload::SubscriptionState(s) => s.mint.clone(),
             MeasurementPayload::RunSummary(_) => String::new(),
+            MeasurementPayload::DecisionBaseQuote(q) => q.mint.clone(),
+            MeasurementPayload::DecisionBaseOutcome(o) => o.mint.clone(),
         }
     }
 }
@@ -383,7 +417,7 @@ mod tests {
 
     #[test]
     fn sink_schema_version_frozen() {
-        assert_eq!(MEASUREMENT_SINK_SCHEMA_VERSION, 1);
+        assert_eq!(MEASUREMENT_SINK_SCHEMA_VERSION, 2);
     }
 
     // --- 2D: sink close / late-write / summary ---
