@@ -266,6 +266,94 @@ pub fn should_attempt_subscription() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Shared per-mint participation state (2B): produced by the main intake loop,
+// consumed at T2/T6 by the per-candidate task. Pure + deterministic + sink-free
+// so it is fully unit-testable; the bin wraps it in a Mutex behind the sink.
+// ---------------------------------------------------------------------------
+
+/// Stable idempotence key: (mint, snapshot-class discriminant).
+fn snapshot_class_key(class: SnapshotClass) -> u8 {
+    match class {
+        SnapshotClass::T2 => 2,
+        SnapshotClass::T6 => 6,
+    }
+}
+
+/// Per-mint runtime state needed to derive T2/T6 ParticipationSnapshots:
+/// the accumulated TradeObserved buffer, the coverage truth at snapshot time,
+/// and a once-only emission guard. NO cross-mint / cross-run contamination:
+/// every entry is mint-keyed and dropped on candidate cleanup.
+#[derive(Debug, Default)]
+pub struct ParticipationState {
+    buffers: std::collections::BTreeMap<String, Vec<TradeObserved>>,
+    coverage: std::collections::BTreeMap<String, CoverageState>,
+    emitted: std::collections::BTreeSet<(String, u8)>,
+}
+
+impl ParticipationState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append an accepted (already ingestion-deduped) trade to its mint buffer.
+    /// The pure snapshot layer additionally applies order-independent earliest-wins
+    /// dedup at derivation, so a stray duplicate here cannot inflate features.
+    pub fn record_trade(&mut self, t: TradeObserved) {
+        self.buffers.entry(t.mint.clone()).or_default().push(t);
+    }
+
+    /// Set/refresh coverage truth for a mint (subscribe ack/failure/reconnect).
+    pub fn set_coverage(&mut self, mint: &str, cov: CoverageState) {
+        self.coverage.insert(mint.to_string(), cov);
+    }
+
+    /// Coverage for a mint; a mint with no recorded coverage is UNKNOWN (never Active).
+    pub fn coverage_of(&self, mint: &str) -> CoverageState {
+        self.coverage.get(mint).copied().unwrap_or(CoverageState::StreamCoverageUnknown)
+    }
+
+    pub fn buffer_of(&self, mint: &str) -> &[TradeObserved] {
+        self.buffers.get(mint).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Build the final T2/T6 snapshot for a mint ONCE. Returns `None` if a final
+    /// snapshot of this class was already emitted (duplicate scheduling / retry).
+    /// `decision_deadline == cutoff` (frozen: a computation completing after the
+    /// decision cutoff cannot back the corresponding decision timestamp), so
+    /// `available_in_time` reflects real-time computability, never a backdate.
+    pub fn build_snapshot(
+        &mut self,
+        run_id: &str,
+        mint: &str,
+        class: SnapshotClass,
+        cutoff: DateTime<Utc>,
+        computed_at: DateTime<Utc>,
+    ) -> Option<ParticipationSnapshot> {
+        let key = (mint.to_string(), snapshot_class_key(class));
+        if self.emitted.contains(&key) {
+            return None; // final snapshot of this class already emitted
+        }
+        self.emitted.insert(key);
+        let cov = self.coverage_of(mint);
+        let buf = self.buffers.get(mint).map(|v| v.as_slice()).unwrap_or(&[]);
+        Some(coverage_aware_snapshot(cov, run_id, mint, class, cutoff, computed_at, cutoff, buf))
+    }
+
+    /// True if a final snapshot of this class was already emitted for the mint.
+    pub fn already_emitted(&self, mint: &str, class: SnapshotClass) -> bool {
+        self.emitted.contains(&(mint.to_string(), snapshot_class_key(class)))
+    }
+
+    /// Terminal cleanup: drop ALL participation state for a mint (buffer, coverage,
+    /// emission guards). Leaves no stale candidate mapping.
+    pub fn cleanup(&mut self, mint: &str) {
+        self.buffers.remove(mint);
+        self.coverage.remove(mint);
+        self.emitted.retain(|(m, _)| m != mint);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -422,5 +510,170 @@ mod tests {
         reg.cleanup("M");
         assert!(!reg.is_active("M"));
         assert!(reg.accept_signature("M", "sig1")); // cleared after cleanup
+    }
+
+    // --- 2B: ParticipationState (shared per-mint buffer + T2/T6 emission) ---
+
+    #[test] // per-mint buffer isolates candidates; A's trades never enter B
+    fn ps_buffer_isolates_mints() {
+        let mut ps = ParticipationState::new();
+        ps.record_trade(trade("a", "A", 1));
+        ps.record_trade(trade("b", "A", 2));
+        ps.record_trade(trade("c", "B", 1));
+        assert_eq!(ps.buffer_of("A").len(), 2);
+        assert_eq!(ps.buffer_of("B").len(), 1);
+        assert!(ps.buffer_of("A").iter().all(|t| t.mint == "A"));
+        assert!(ps.buffer_of("B").iter().all(|t| t.mint == "B"));
+    }
+
+    #[test] // duplicate signature => earliest receipt retained at snapshot derivation
+    fn ps_duplicate_sig_earliest_retained() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        ps.record_trade(trade("dup", "M", 1)); // earliest
+        ps.record_trade(trade("dup", "M", 5)); // later duplicate
+        let snap = ps.build_snapshot("r", "M", SnapshotClass::T6, ts(9), ts(9)).unwrap();
+        assert_eq!(snap.source_event_count, 2);
+        assert_eq!(snap.deduped_event_count, 1); // earliest wins, one kept
+    }
+
+    #[test] // T2 uses the provided actual sampled_at cutoff; post-cutoff trade excluded
+    fn ps_t2_cutoff_excludes_post() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        ps.record_trade(trade("a", "M", 1)); // <= cutoff 2
+        ps.record_trade(trade("b", "M", 9)); // > cutoff 2 => excluded
+        let snap = ps.build_snapshot("r", "M", SnapshotClass::T2, ts(2), ts(2)).unwrap();
+        assert_eq!(snap.cutoff_timestamp, ts(2));
+        assert_eq!(snap.features.buy_count, 1); // only the pre-cutoff trade
+    }
+
+    #[test] // pre-cutoff received trade is included even if recorded/processed later in call order
+    fn ps_pre_cutoff_included_regardless_of_record_order() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        // record the post-cutoff trade FIRST, the pre-cutoff trade LATER: inclusion
+        // depends on event_received_at, not record/processing order.
+        ps.record_trade(trade("late", "M", 9));
+        ps.record_trade(trade("early", "M", 1));
+        let snap = ps.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(6)).unwrap();
+        assert_eq!(snap.features.buy_count, 1);
+    }
+
+    #[test] // active stream + zero trades => VALID zero-activity snapshot (not missing)
+    fn ps_active_zero_is_valid() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        let snap = ps.build_snapshot("r", "M", SnapshotClass::T2, ts(2), ts(2)).unwrap();
+        assert!(snap.failure.is_none());
+        assert_eq!(snap.features.buy_count, 0);
+        assert_eq!(snap.features.unique_buyers, 0);
+    }
+
+    #[test] // subscription failure => MISSING/FAILURE, never encoded as zero
+    fn ps_failed_is_missing() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::SubscriptionFailed);
+        let snap = ps.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(6)).unwrap();
+        assert!(snap.failure.is_some());
+    }
+
+    #[test] // no recorded coverage => UNKNOWN => MISSING/FAILURE (not silent-zero)
+    fn ps_unknown_coverage_is_missing() {
+        let mut ps = ParticipationState::new();
+        assert_eq!(ps.coverage_of("M"), CoverageState::StreamCoverageUnknown);
+        let snap = ps.build_snapshot("r", "M", SnapshotClass::T2, ts(2), ts(2)).unwrap();
+        assert_eq!(snap.failure, Some(MeasurementFailureCategory::StreamEventMissing));
+    }
+
+    #[test] // zero-activity (active) is distinguishable from acquisition failure
+    fn ps_zero_vs_failure_distinguishable() {
+        let mut a = ParticipationState::new();
+        a.set_coverage("M", CoverageState::Active);
+        let mut f = ParticipationState::new();
+        f.set_coverage("M", CoverageState::SubscriptionFailed);
+        let za = a.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(6)).unwrap();
+        let fa = f.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(6)).unwrap();
+        assert!(za.failure.is_none() && za.features.buy_count == 0);
+        assert!(fa.failure.is_some());
+        assert_ne!(za.failure.is_some(), fa.failure.is_some());
+    }
+
+    #[test] // final T2 emitted once; duplicate scheduling does not re-emit
+    fn ps_t2_emitted_once() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        assert!(ps.build_snapshot("r", "M", SnapshotClass::T2, ts(2), ts(2)).is_some());
+        assert!(ps.already_emitted("M", SnapshotClass::T2));
+        assert!(ps.build_snapshot("r", "M", SnapshotClass::T2, ts(2), ts(2)).is_none()); // idempotent
+    }
+
+    #[test] // final T6 emitted once; T2 and T6 are independent classes
+    fn ps_t6_emitted_once_independent_of_t2() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        assert!(ps.build_snapshot("r", "M", SnapshotClass::T2, ts(2), ts(2)).is_some());
+        assert!(ps.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(6)).is_some()); // distinct class
+        assert!(ps.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(6)).is_none()); // T6 idempotent
+    }
+
+    #[test] // runtime snapshot == pure-layer replay from same buffer + cutoff (T2 and T6)
+    fn ps_runtime_equals_pure_replay() {
+        let buf = vec![trade("a", "M", 1), trade("b", "M", 3), trade("c", "M", 9)];
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        for t in &buf {
+            ps.record_trade(t.clone());
+        }
+        // T2
+        let rt2 = ps.build_snapshot("r", "M", SnapshotClass::T2, ts(2), ts(5)).unwrap();
+        let pure2 =
+            coverage_aware_snapshot(CoverageState::Active, "r", "M", SnapshotClass::T2, ts(2), ts(5), ts(2), &buf);
+        assert_eq!(rt2.features.buy_count, pure2.features.buy_count);
+        assert_eq!(rt2.deduped_event_count, pure2.deduped_event_count);
+        assert_eq!(rt2.cutoff_timestamp, pure2.cutoff_timestamp);
+        assert_eq!(rt2.available_in_time, pure2.available_in_time);
+        // T6
+        let rt6 = ps.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(6)).unwrap();
+        let pure6 =
+            coverage_aware_snapshot(CoverageState::Active, "r", "M", SnapshotClass::T6, ts(6), ts(6), ts(6), &buf);
+        assert_eq!(rt6.features.buy_count, pure6.features.buy_count);
+        assert_eq!(rt6.features.net_quote_flow_sol, pure6.features.net_quote_flow_sol);
+        assert_eq!(rt6.available_in_time, pure6.available_in_time);
+    }
+
+    #[test] // available_in_time is truthful: computed after the decision cutoff => false
+    fn ps_available_in_time_truthful() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        // computed strictly after cutoff => not available in time (no backdating)
+        let late = ps.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(7)).unwrap();
+        assert!(!late.available_in_time);
+        let mut ps2 = ParticipationState::new();
+        ps2.set_coverage("M", CoverageState::Active);
+        let on_time = ps2.build_snapshot("r", "M", SnapshotClass::T6, ts(6), ts(6)).unwrap();
+        assert!(on_time.available_in_time);
+    }
+
+    #[test] // cleanup removes buffer, coverage, and emission guard for the candidate
+    fn ps_cleanup_removes_state() {
+        let mut ps = ParticipationState::new();
+        ps.set_coverage("M", CoverageState::Active);
+        ps.record_trade(trade("a", "M", 1));
+        assert!(ps.build_snapshot("r", "M", SnapshotClass::T2, ts(2), ts(2)).is_some());
+        ps.cleanup("M");
+        assert_eq!(ps.buffer_of("M").len(), 0);
+        assert_eq!(ps.coverage_of("M"), CoverageState::StreamCoverageUnknown);
+        assert!(!ps.already_emitted("M", SnapshotClass::T2)); // emission guard cleared
+    }
+
+    #[test] // cleanup of one candidate does not disturb another
+    fn ps_cleanup_isolated() {
+        let mut ps = ParticipationState::new();
+        ps.record_trade(trade("a", "A", 1));
+        ps.record_trade(trade("b", "B", 1));
+        ps.cleanup("A");
+        assert_eq!(ps.buffer_of("A").len(), 0);
+        assert_eq!(ps.buffer_of("B").len(), 1);
     }
 }

@@ -42,8 +42,12 @@ use pumpfun_sniper::observation::schema::{
     StreamStateRecord, TrackingFinishStatus, TrackingFinishedRecord, TrackingSkippedRecord,
     ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
 };
-use pumpfun_sniper::observation::measurement::{MeasurementFailureCategory, MeasurementFailureRecord};
-use pumpfun_sniper::observation::measurement_runtime::{BoundedTradeQueue, SubscriptionRegistry, MEASUREMENT_TRADE_QUEUE_CAPACITY};
+use pumpfun_sniper::observation::measurement::{
+    MeasurementFailureCategory, MeasurementFailureRecord, SnapshotClass, TradeObserved,
+};
+use pumpfun_sniper::observation::measurement_runtime::{
+    BoundedTradeQueue, ParticipationState, SubscriptionRegistry, MEASUREMENT_TRADE_QUEUE_CAPACITY,
+};
 use pumpfun_sniper::observation::measurement_sink::{
     normalize_trade_event, MeasurementPayload, MeasurementSink, SubscriptionStateRecord,
 };
@@ -733,10 +737,89 @@ struct CandidateTaskResult {
 /// issue token-trade subscribe/unsubscribe. Passed by &mut through the intake
 /// path so no wide signature churn is needed. Measurement failures NEVER touch
 /// canonical observation state.
+/// Shared per-mint participation state + measurement sink (2B). The main intake
+/// loop is the sole PRODUCER (records deduped trades, sets coverage on subscribe);
+/// each per-candidate task is a CONSUMER that reads the buffer at its actual T2/T6
+/// sampled_at cutoffs to emit exactly-once snapshots. Both write the append-only
+/// sink. Critical sections are lock-brief and NEVER held across `.await`.
+struct MeasurementShared {
+    state: std::sync::Mutex<ParticipationState>,
+    sink: std::sync::Mutex<MeasurementSink<std::fs::File>>,
+    run_id: String,
+}
+
+impl MeasurementShared {
+    /// Record a deduped, normalized trade into its mint buffer AND persist it to
+    /// the durable sink. Buffer inclusion is keyed by `event_received_at` (stamped
+    /// at main-loop processing time), so a trade is in the buffer iff it already
+    /// has an `event_received_at` — no snapshot can miss an event whose receipt
+    /// timestamp is <= cutoff merely because a consumer ran later.
+    fn record_and_persist(&self, t: TradeObserved) {
+        {
+            let mut st = self.state.lock().expect("participation state poisoned");
+            st.record_trade(t.clone());
+        }
+        let _ = self
+            .sink
+            .lock()
+            .expect("sink poisoned")
+            .append(MeasurementPayload::TradeObserved(t), Utc::now());
+    }
+
+    /// Persist an arbitrary measurement payload (subscription state, failure).
+    fn append(&self, payload: MeasurementPayload) {
+        let _ = self.sink.lock().expect("sink poisoned").append(payload, Utc::now());
+    }
+
+    fn set_coverage(&self, mint: &str, cov: pumpfun_sniper::observation::measurement_runtime::CoverageState) {
+        self.state.lock().expect("participation state poisoned").set_coverage(mint, cov);
+    }
+
+    /// Emit the final T2/T6 snapshot for a mint exactly once. `cutoff` is the actual
+    /// sampled_at (T2: 2s sample; T6: max(2/4/6) decision time); `computed_at` is the
+    /// real emit time. Duplicate scheduling is a no-op (returns without a second row).
+    fn emit_participation(
+        &self,
+        mint: &str,
+        class: SnapshotClass,
+        cutoff: DateTime<Utc>,
+        computed_at: DateTime<Utc>,
+    ) {
+        let snap = {
+            let mut st = self.state.lock().expect("participation state poisoned");
+            st.build_snapshot(&self.run_id, mint, class, cutoff, computed_at)
+        };
+        if let Some(s) = snap {
+            self.append(MeasurementPayload::ParticipationSnapshot(s));
+        }
+    }
+
+    /// Terminal cleanup of a candidate's in-memory participation state (buffer,
+    /// coverage, emission guards). Durable sink rows are untouched.
+    fn cleanup(&self, mint: &str) {
+        self.state.lock().expect("participation state poisoned").cleanup(mint);
+    }
+}
+
+/// RAII guard: clears a candidate's in-memory participation state when the
+/// per-candidate task ends by ANY path (normal return, early error, panic).
+/// Guarantees no stale buffer/coverage/emission mapping outlives the task.
+/// (Full unsubscribe/reconnect lifecycle certification remains 2D.)
+struct ParticipationCleanup {
+    shared: Arc<MeasurementShared>,
+    mint: String,
+}
+
+impl Drop for ParticipationCleanup {
+    fn drop(&mut self) {
+        self.shared.cleanup(&self.mint);
+    }
+}
+
 struct MeasurementCtx {
     sender: CommandSender,
     registry: SubscriptionRegistry,
-    sink: MeasurementSink<std::fs::File>,
+    shared: Arc<MeasurementShared>,
     queue: BoundedTradeQueue,
     run_id: String,
     source_revision: String,
@@ -758,16 +841,18 @@ impl MeasurementCtx {
             }
         }
         if let Some(s) = self.registry.get(mint) {
-            let _ = self
-                .sink
-                .append(MeasurementPayload::SubscriptionState(SubscriptionStateRecord::from_sub(s)), Utc::now());
+            // Publish coverage truth so the per-candidate task derives zero-activity
+            // vs missing/failure correctly, then persist the subscription-state row.
+            self.shared.set_coverage(mint, s.coverage_state());
+            self.shared
+                .append(MeasurementPayload::SubscriptionState(SubscriptionStateRecord::from_sub(s)));
         }
     }
 
     /// Route an incoming trade for an expected-active mint: dedup by signature
     /// (earliest receipt wins; never persisted twice), push through the bounded
     /// queue (explicit backpressure failure, never a silent drop), then persist
-    /// TradeObserved to the separate sink and update the candidate buffer.
+    /// TradeObserved to the shared sink + candidate buffer for T2/T6 snapshots.
     fn on_expected_trade(&mut self, ev: &TradeEvent) {
         if !self.registry.accept_signature(&ev.mint, &ev.signature) {
             return; // duplicate signature — not persisted twice
@@ -777,22 +862,21 @@ impl MeasurementCtx {
         match self.queue.push(t) {
             Ok(()) => {
                 for qt in self.queue.drain() {
-                    self.registry.route_trade(qt.clone());
-                    let _ = self.sink.append(MeasurementPayload::TradeObserved(qt), Utc::now());
+                    if let Some(s) = self.registry.get_mut(&qt.mint) {
+                        s.note_trade(qt.event_received_at);
+                    }
+                    self.shared.record_and_persist(qt);
                 }
             }
             Err(_bp) => {
-                let _ = self.sink.append(
-                    MeasurementPayload::MeasurementFailure(MeasurementFailureRecord {
-                        run_id: self.run_id.clone(),
-                        mint: ev.mint.clone(),
-                        domain: "trade_stream".to_string(),
-                        stage: "bounded_queue".to_string(),
-                        category: MeasurementFailureCategory::Other, // TradeStreamBackpressureFailure
-                        at: now,
-                    }),
-                    now,
-                );
+                self.shared.append(MeasurementPayload::MeasurementFailure(MeasurementFailureRecord {
+                    run_id: self.run_id.clone(),
+                    mint: ev.mint.clone(),
+                    domain: "trade_stream".to_string(),
+                    stage: "bounded_queue".to_string(),
+                    category: MeasurementFailureCategory::Other, // TradeStreamBackpressureFailure
+                    at: now,
+                }));
             }
         }
     }
@@ -905,10 +989,19 @@ async fn main() -> Result<()> {
         .join(format!("measurement_{measurement_run_id}.jsonl"));
     let measurement_file =
         std::fs::File::create(&measurement_path).context("failed to create measurement sink file")?;
+    let measurement_shared = Arc::new(MeasurementShared {
+        state: std::sync::Mutex::new(ParticipationState::new()),
+        sink: std::sync::Mutex::new(MeasurementSink::new(
+            measurement_file,
+            &measurement_run_id,
+            &source_revision,
+        )),
+        run_id: measurement_run_id.clone(),
+    });
     let mut meas = MeasurementCtx {
         sender: client.get_command_sender(),
         registry: SubscriptionRegistry::new(),
-        sink: MeasurementSink::new(measurement_file, &measurement_run_id, &source_revision),
+        shared: measurement_shared.clone(),
         queue: BoundedTradeQueue::new(MEASUREMENT_TRADE_QUEUE_CAPACITY),
         run_id: measurement_run_id.clone(),
         source_revision: source_revision.clone(),
@@ -1370,6 +1463,9 @@ async fn discover_candidate(
             let oracle = oracle.clone();
             let recorder = recorder.clone();
             let rpc_gate = rpc_gate.clone();
+            // P3 Domain-1 (unconditional): subscribe to this tracked mint's trades
+            // and publish coverage BEFORE the task can reach its T2 cutoff.
+            meas.on_candidate_admitted(&mint_str).await;
             tasks.spawn(track_candidate(
                 permit,
                 candidate_id,
@@ -1378,9 +1474,8 @@ async fn discover_candidate(
                 oracle,
                 rpc_gate,
                 recorder,
+                meas.shared.clone(),
             ));
-            // P3 Domain-1 (unconditional): subscribe to this tracked mint's trades.
-            meas.on_candidate_admitted(&mint_str).await;
         }
         Err(_) => {
             counters.tracking_skipped += 1;
@@ -1636,8 +1731,15 @@ async fn track_candidate(
     oracle: Arc<PumpMarketOracle>,
     rpc_gate: Arc<ObservationRpcGate>,
     recorder: ObservationRecorder,
+    measurement: Arc<MeasurementShared>,
 ) -> CandidateTaskOutcome {
     let mint_str = mint.to_string();
+    // Clears this candidate's participation buffer/coverage/emission guard on ANY
+    // task exit path (return, error, panic) — no stale per-mint state survives.
+    let _participation_cleanup = ParticipationCleanup {
+        shared: measurement.clone(),
+        mint: mint_str.clone(),
+    };
 
     // --- Section 16/36: bounded initial availability retry. ---
     let backoffs = [0u64, 250, 500, 1000];
@@ -1914,6 +2016,23 @@ async fn track_candidate(
             4 => h1_sample_4s = Some(sampled_at),
             6 => h1_sample_6s = Some(sampled_at),
             _ => {}
+        }
+
+        // --- P3 Domain-1 (2B): emit T2/T6 ParticipationSnapshots at the ACTUAL
+        // sampled_at cutoffs (never a nominal clock). Exactly-once per class;
+        // `computed_at` is the real emit time so `available_in_time` is truthful.
+        if horizon == 2 {
+            if let Some(cutoff) = h1_sample_2s {
+                measurement.emit_participation(&mint_str, SnapshotClass::T2, cutoff, Utc::now());
+            }
+        }
+        if horizon == 6 {
+            if let (Some(s2), Some(s4), Some(s6)) = (h1_sample_2s, h1_sample_4s, h1_sample_6s) {
+                // T6 decision cutoff = max(actual sampled_at 2/4/6), reusing the
+                // same frozen H1 decision-time function as the delayed-entry path.
+                let t6_cutoff = h1_decision_time_from_observations(s2, s4, s6);
+                measurement.emit_participation(&mint_str, SnapshotClass::T6, t6_cutoff, Utc::now());
+            }
         }
 
         if horizon == 6 && !delayed_entry_quote_recorded {
