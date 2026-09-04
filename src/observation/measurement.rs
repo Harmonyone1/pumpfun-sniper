@@ -96,6 +96,11 @@ pub enum MeasurementFailureCategory {
     /// Domain-2 (P3-HOLDER-DEFECT-002): holder token-account state was not present
     /// at `confirmed` commitment (e.g. a very fresh mint). MISSING, never zero.
     AccountStateUnavailableAtConfirmed,
+    /// Domain-2 (P3-HOLDER-AVAILABILITY-DEFECT-001): the mint is not yet visible as a
+    /// Token mint on the RPC (PumpPortal emits NewToken before the mint account lands;
+    /// getTokenLargestAccounts returns "-32602 not a Token mint"). RETRYABLE freshness
+    /// race; MISSING (never zero) if still unresolved after the bounded retry budget.
+    AccountNotYetVisible,
     /// Domain-2: a returned token account is owned by a token program this build
     /// does not decode (only classic SPL Token is a dependency).
     UnsupportedTokenProgram,

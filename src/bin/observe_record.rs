@@ -1174,7 +1174,11 @@ impl Drop for ParticipationCleanup {
 /// category. Never converts a failure into a zero measurement.
 fn classify_measurement_rpc_error(msg: &str) -> MeasurementFailureCategory {
     let m = msg.to_ascii_lowercase();
-    if m.contains("timed out") || m.contains("timeout") {
+    if m.contains("not a token mint") || m.contains("could not find mint") {
+        // PumpPortal emits NewToken before the mint account lands on the RPC; the
+        // node then reports the pubkey is "not a Token mint". Retryable freshness.
+        MeasurementFailureCategory::AccountNotYetVisible
+    } else if m.contains("timed out") || m.contains("timeout") {
         MeasurementFailureCategory::Timeout
     } else if m.contains("429") || m.contains("rate limit") || m.contains("too many requests") {
         MeasurementFailureCategory::RateLimited
@@ -1184,6 +1188,25 @@ fn classify_measurement_rpc_error(msg: &str) -> MeasurementFailureCategory {
         MeasurementFailureCategory::RpcUnavailable
     }
 }
+
+/// Whether a holder-acquisition failure is worth a bounded retry. Freshness (mint not
+/// yet visible) and transient transport errors are retryable; a decode/params error
+/// that is NOT a freshness race, or a hard unavailability, is not looped indefinitely.
+/// NEVER depends on any feature/holder/price/outcome value — only the error category.
+fn is_retryable_holder_failure(cat: MeasurementFailureCategory) -> bool {
+    matches!(
+        cat,
+        MeasurementFailureCategory::AccountNotYetVisible
+            | MeasurementFailureCategory::Timeout
+            | MeasurementFailureCategory::RateLimited
+            | MeasurementFailureCategory::RpcUnavailable
+    )
+}
+
+/// Frozen bounded holder-acquisition retry backoffs (ms from first attempt). Absorbs
+/// the observed PumpPortal->RPC mint-visibility lag; still bounded (~6s) and truthful:
+/// a late completion sets available_in_time=false rather than redefining T0.
+const HOLDER_FRESHNESS_BACKOFFS_MS: [u64; 4] = [0, 1000, 3000, 6000];
 
 /// Commitment for the T0 holder account-state fetch. `confirmed` (not the RPC default
 /// `finalized`): at T0 the target accounts are seconds old, so `finalized` can return
@@ -1265,14 +1288,26 @@ async fn acquire_holder_snapshot(
     let curve_pda = bonding_curve_pda(mint).0.to_string();
     let creator_deterministic = creator.is_some();
 
-    // Step 1: largest accounts (balances), bounded single retry on retryable transport.
+    // Step 1: largest accounts (balances) at CONFIRMED commitment, with a bounded
+    // freshness-aware retry (P3-HOLDER-AVAILABILITY-DEFECT-001). PumpPortal emits
+    // NewToken before the mint account is visible on the RPC, so the first attempt
+    // often returns "not a Token mint" -> AccountNotYetVisible; a bounded backoff
+    // absorbs that lag. Retry decision depends ONLY on the error category.
     let mut attempt_err: Option<MeasurementFailureCategory> = None;
     let mut balances: Option<Vec<(String, u64)>> = None;
-    for attempt in 0u8..2 {
+    let last = HOLDER_FRESHNESS_BACKOFFS_MS.len() - 1;
+    for (i, backoff_ms) in HOLDER_FRESHNESS_BACKOFFS_MS.iter().enumerate() {
+        if *backoff_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
+        }
         let (permit, _wait) = gate.acquire().await;
         let rpc = rpc.clone();
         let m = *mint;
-        let res = tokio::task::spawn_blocking(move || rpc.get_token_largest_accounts(&m)).await;
+        let res = tokio::task::spawn_blocking(move || {
+            rpc.get_token_largest_accounts_with_commitment(&m, holder_fetch_commitment())
+                .map(|r| r.value)
+        })
+        .await;
         drop(permit);
         match res {
             Ok(Ok(list)) => {
@@ -1291,13 +1326,7 @@ async fn acquire_holder_snapshot(
             Ok(Err(e)) => {
                 let cat = classify_measurement_rpc_error(&e.to_string());
                 attempt_err = Some(cat);
-                let retryable = matches!(
-                    cat,
-                    MeasurementFailureCategory::Timeout
-                        | MeasurementFailureCategory::RateLimited
-                        | MeasurementFailureCategory::RpcUnavailable
-                );
-                if !retryable || attempt == 1 {
+                if !is_retryable_holder_failure(cat) || i == last {
                     break;
                 }
             }
@@ -3177,6 +3206,41 @@ mod tests {
     fn holder_fetch_uses_confirmed_commitment() {
         assert_eq!(holder_fetch_commitment(), CommitmentConfig::confirmed());
         assert_ne!(holder_fetch_commitment(), CommitmentConfig::finalized());
+    }
+
+    // --- P3-HOLDER-AVAILABILITY-DEFECT-001: fresh-mint visibility ---
+
+    #[test] // "not a Token mint" (mint not yet visible) => retryable freshness category
+    fn freshness_error_classified_and_retryable() {
+        let cat = classify_measurement_rpc_error("RPC response error -32602: Invalid param: not a Token mint;");
+        assert_eq!(cat, MeasurementFailureCategory::AccountNotYetVisible);
+        assert!(is_retryable_holder_failure(cat));
+    }
+
+    #[test] // transient transport is retryable; hard/param failures are not looped
+    fn retry_policy_categories() {
+        assert!(is_retryable_holder_failure(MeasurementFailureCategory::Timeout));
+        assert!(is_retryable_holder_failure(MeasurementFailureCategory::RateLimited));
+        assert!(is_retryable_holder_failure(MeasurementFailureCategory::RpcUnavailable));
+        assert!(is_retryable_holder_failure(MeasurementFailureCategory::AccountNotYetVisible));
+        // NOT retried: unsupported program, decode failure, mint mismatch, account-missing
+        assert!(!is_retryable_holder_failure(MeasurementFailureCategory::UnsupportedTokenProgram));
+        assert!(!is_retryable_holder_failure(MeasurementFailureCategory::TokenAccountDecodeFailed));
+        assert!(!is_retryable_holder_failure(MeasurementFailureCategory::TokenMintMismatch));
+        assert!(!is_retryable_holder_failure(MeasurementFailureCategory::AccountMissing));
+    }
+
+    #[test] // bounded freshness backoff schedule is frozen + bounded (~6s)
+    fn freshness_backoffs_frozen() {
+        assert_eq!(HOLDER_FRESHNESS_BACKOFFS_MS, [0, 1000, 3000, 6000]);
+        assert!(HOLDER_FRESHNESS_BACKOFFS_MS.iter().sum::<u64>() <= 10_000);
+    }
+
+    #[test] // rate-limit / timeout still classify explicitly (unchanged)
+    fn other_rpc_categories_unchanged() {
+        assert_eq!(classify_measurement_rpc_error("HTTP 429 Too Many Requests"), MeasurementFailureCategory::RateLimited);
+        assert_eq!(classify_measurement_rpc_error("operation timed out"), MeasurementFailureCategory::Timeout);
+        assert_eq!(classify_measurement_rpc_error("could not find account"), MeasurementFailureCategory::AccountMissing);
     }
 
     #[test] // classic SPL token account decodes to its authoritative owner
