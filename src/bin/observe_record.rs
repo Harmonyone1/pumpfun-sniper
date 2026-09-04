@@ -1209,12 +1209,17 @@ fn is_retryable_holder_failure(cat: MeasurementFailureCategory) -> bool {
 /// (evaluated against the T10 decision timestamp), never redefining T0.
 const HOLDER_FRESHNESS_BACKOFFS_MS: [u64; 4] = [0, 1000, 3000, 6000];
 
-/// Timestamp-architecture AMENDMENT-001 budgets (ms). Decision timestamp = anchor + budget.
-/// Holder anchor = requested_at (T0 measurement start) -> T10; probe anchor = requested_at
-/// (T0 probe start) -> T0_AVAILABLE. available_in_time is recomputable at replay from the
-/// record's stored anchor + completed_at + these frozen constants.
-const HOLDER_DECISION_BUDGET_MS: i64 = 10_000;
-const MICROSTRUCTURE_T0_BUDGET_MS: i64 = 250;
+/// Timestamp-architecture budgets (ms). Decision timestamp = anchor + budget; available_in_time
+/// is recomputable at replay from the record's stored anchor (requested_at) + completed_at.
+/// AMENDMENT-002 (timestamp_semantics_version=2): holder promoted T10->T15 (acquisition p50
+/// ~10.5s); microstructure promoted T0->T1 (fire probes at T0+1s — cold-T0 curves are not yet
+/// quoteable, a SOURCE-availability limit a bigger compute budget cannot fix) with a 500ms
+/// finalization budget. Holder anchor = requested_at (T0); probe anchor = requested_at (T1 fire).
+const HOLDER_DECISION_BUDGET_MS: i64 = 15_000;
+const MICROSTRUCTURE_FINALIZATION_BUDGET_MS: i64 = 500;
+/// Microstructure probes fire at T0 + this delay (the frozen T1 class from the cold-start
+/// diagnostic: earliest offset with >=90% all-3 quote coverage and >=95% within 500ms).
+const MICROSTRUCTURE_PROBE_DELAY_MS: u64 = 1_000;
 
 /// available_in_time: the finalized measurement completed within `budget_ms` of its anchor
 /// (the registered decision timestamp = anchor + budget). Pure; runtime & replay agree.
@@ -1495,8 +1500,8 @@ async fn acquire_microstructure_probe(
         mint: mint.to_string(),
         requested_at,
         completed_at,
-        // Domain-3 T0_AVAILABLE: decision timestamp = requested_at (T0 probe start) + 250ms.
-        available_in_time: within_budget(requested_at, completed_at, MICROSTRUCTURE_T0_BUDGET_MS),
+        // Domain-3 T1: decision timestamp = requested_at (T1 probe fire, ~T0+1s) + 500ms.
+        available_in_time: within_budget(requested_at, completed_at, MICROSTRUCTURE_FINALIZATION_BUDGET_MS),
         input_lamports: lamports,
         expected_base_raw,
         base_decimals,
@@ -1544,13 +1549,18 @@ async fn t0_enrichment(
     // AMENDMENT-001: holder and microstructure run CONCURRENTLY — the holder's ~10s
     // freshness retry must NOT delay probe initiation (D3 decoupling). Both share the
     // bounded RPC gate; both stay owned by this enrichment task (drained at shutdown).
+    // Holder fires at T0 (requested_at = T0, anchor for the T15 decision class).
     let holder_fut = acquire_holder_snapshot(
         &rpc_gate, &rpc, &mint, creator_wallet.as_deref(), &run_id, &source_revision, t0,
     );
+    // Microstructure fires at the T1 class (T0 + MICROSTRUCTURE_PROBE_DELAY_MS): cold-T0
+    // curves aren't quoteable yet. requested_at is the actual fire time (~T0+1s), the anchor
+    // for the 500ms finalization budget. Independent of the holder (concurrent via join!).
     let probes_fut = async {
+        tokio::time::sleep(Duration::from_millis(MICROSTRUCTURE_PROBE_DELAY_MS)).await;
         let mut probes = Vec::with_capacity(MICROSTRUCTURE_PROBE_LAMPORTS.len());
         for lamports in MICROSTRUCTURE_PROBE_LAMPORTS {
-            probes.push(acquire_microstructure_probe(&rpc_gate, &oracle, &mint, lamports, &run_id, t0).await);
+            probes.push(acquire_microstructure_probe(&rpc_gate, &oracle, &mint, lamports, &run_id, Utc::now()).await);
         }
         probes
     };
@@ -3248,28 +3258,34 @@ mod tests {
 
     // --- AMENDMENT-001: decision-timestamp availability budgets (D2 T10 / D3 T0) ---
 
-    #[test] // frozen budgets
+    #[test] // frozen budgets (AMENDMENT-002 v2): holder T15, microstructure T1 + 500ms
     fn ts_arch_budgets_frozen() {
-        assert_eq!(HOLDER_DECISION_BUDGET_MS, 10_000);
-        assert_eq!(MICROSTRUCTURE_T0_BUDGET_MS, 250);
+        assert_eq!(HOLDER_DECISION_BUDGET_MS, 15_000);
+        assert_eq!(MICROSTRUCTURE_FINALIZATION_BUDGET_MS, 500);
+        assert_eq!(MICROSTRUCTURE_PROBE_DELAY_MS, 1_000);
     }
 
-    #[test] // holder T10: completed within 10s of T0 -> available; over -> not
-    fn holder_t10_boundary() {
-        let t0 = chrono::Utc.timestamp_opt(1_000_000, 0).unwrap();
+    #[test] // holder T15: completed within 15s of T0 -> available; over -> not
+    fn holder_t15_boundary() {
         use chrono::TimeZone;
-        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(9_999), HOLDER_DECISION_BUDGET_MS));
-        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(10_000), HOLDER_DECISION_BUDGET_MS)); // boundary inclusive
-        assert!(!within_budget(t0, t0 + chrono::Duration::milliseconds(10_001), HOLDER_DECISION_BUDGET_MS));
+        let t0 = chrono::Utc.timestamp_opt(1_000_000, 0).unwrap();
+        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(14_999), HOLDER_DECISION_BUDGET_MS));
+        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(15_000), HOLDER_DECISION_BUDGET_MS)); // inclusive
+        assert!(!within_budget(t0, t0 + chrono::Duration::milliseconds(15_001), HOLDER_DECISION_BUDGET_MS));
     }
 
-    #[test] // microstructure T0_AVAILABLE: within 250ms -> available; over -> not
-    fn probe_t0_boundary() {
+    #[test] // microstructure T1: completed within 500ms of the T1 fire anchor -> available
+    fn probe_t1_boundary() {
         use chrono::TimeZone;
-        let t0 = chrono::Utc.timestamp_opt(1_000_000, 0).unwrap();
-        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(249), MICROSTRUCTURE_T0_BUDGET_MS));
-        assert!(within_budget(t0, t0 + chrono::Duration::milliseconds(250), MICROSTRUCTURE_T0_BUDGET_MS));
-        assert!(!within_budget(t0, t0 + chrono::Duration::milliseconds(251), MICROSTRUCTURE_T0_BUDGET_MS));
+        let fire = chrono::Utc.timestamp_opt(1_000_000, 0).unwrap(); // ~T0+1s fire time (the anchor)
+        assert!(within_budget(fire, fire + chrono::Duration::milliseconds(499), MICROSTRUCTURE_FINALIZATION_BUDGET_MS));
+        assert!(within_budget(fire, fire + chrono::Duration::milliseconds(500), MICROSTRUCTURE_FINALIZATION_BUDGET_MS));
+        assert!(!within_budget(fire, fire + chrono::Duration::milliseconds(501), MICROSTRUCTURE_FINALIZATION_BUDGET_MS));
+    }
+
+    #[test] // microstructure T1 class = probes fire at T0 + 1s (source availability, not compute)
+    fn micro_t1_fire_delay_frozen() {
+        assert_eq!(MICROSTRUCTURE_PROBE_DELAY_MS, 1_000);
     }
 
     #[tokio::test] // D3 DECOUPLING: a slow holder does NOT delay probe start under join!

@@ -27,7 +27,7 @@ pub const MEASUREMENT_TRADE_QUEUE_CAPACITY: usize = 4096;
 /// SOURCE CUTOFF and DECISION TIMESTAMP are separate: a feature's `available_in_time`
 /// is evaluated against its registered decision timestamp (anchor + budget), never the
 /// raw source cutoff. Feature formulas / trade inclusion are UNCHANGED.
-pub const TIMESTAMP_SEMANTICS_VERSION: u32 = 1;
+pub const TIMESTAMP_SEMANTICS_VERSION: u32 = 2;
 /// Domain-1 participation: T{2,6}_AVAILABLE = source cutoff + this budget (ms).
 pub const PARTICIPATION_FINALIZATION_BUDGET_MS: i64 = 5;
 
@@ -936,7 +936,7 @@ mod tests {
     #[test] // budget constant + semantics version frozen
     fn ts_arch_constants_frozen() {
         assert_eq!(PARTICIPATION_FINALIZATION_BUDGET_MS, 5);
-        assert_eq!(TIMESTAMP_SEMANTICS_VERSION, 1);
+        assert_eq!(TIMESTAMP_SEMANTICS_VERSION, 2);
     }
 
     fn ps_active(cutoff: DateTime<Utc>, computed_at: DateTime<Utc>, class: SnapshotClass) -> ParticipationSnapshot {
