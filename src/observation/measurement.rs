@@ -88,6 +88,11 @@ pub enum MeasurementFailureCategory {
     ComputationTooLate,
     DuplicateEvent,
     UnknownTradeType,
+    /// Domain-2: the curve/program-controlled reserve token account could not be
+    /// resolved authoritatively (by owner). Holder concentration features that
+    /// require curve exclusion are MISSING — never computed as if all accounts
+    /// were ordinary (P3-HOLDER-DEFECT-001 remediation).
+    CurveTokenAccountUnresolved,
     Other,
 }
 

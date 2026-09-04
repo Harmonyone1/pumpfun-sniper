@@ -48,8 +48,8 @@ use pumpfun_sniper::observation::measurement::{
     TOTAL_MINT_SUPPLY_TOKENS,
 };
 use pumpfun_sniper::observation::measurement_runtime::{
-    classify_holder_accounts, BoundedTradeQueue, ParticipationState, SubscriptionRegistry,
-    MEASUREMENT_TRADE_QUEUE_CAPACITY,
+    classify_holder_accounts_by_owner, BoundedTradeQueue, ParticipationState, RawHolderAccount,
+    SubscriptionRegistry, MEASUREMENT_TRADE_QUEUE_CAPACITY,
 };
 use pumpfun_sniper::observation::measurement_sink::{
     normalize_trade_event, MeasurementPayload, MeasurementRunSummary, MeasurementSink,
@@ -58,7 +58,7 @@ use pumpfun_sniper::observation::measurement_sink::{
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::market::pump_state::bonding_curve_pda;
 use pumpfun_sniper::runtime::RuntimeLease;
-use spl_associated_token_account::get_associated_token_address;
+use solana_sdk::program_pack::Pack;
 use pumpfun_sniper::stream::pumpportal::{
     CommandSender, PumpPortalDecodeError, PumpPortalDecodeKind, SubscriptionCommand, TradeEvent,
 };
@@ -1129,25 +1129,47 @@ fn classify_measurement_rpc_error(msg: &str) -> MeasurementFailureCategory {
     }
 }
 
+/// All-`None`/zero holder features — used when the snapshot is MISSING/FAILURE so a
+/// failed acquisition or an UNRESOLVED curve is never encoded as a valid zero-curve
+/// concentration (P3-HOLDER-DEFECT-001).
+fn blocked_holder_features() -> pumpfun_sniper::observation::measurement::HolderFeatures {
+    pumpfun_sniper::observation::measurement::HolderFeatures {
+        top1_noncurve_holder_share: None,
+        top5_noncurve_holder_share: None,
+        top10_noncurve_holder_share: None,
+        holder_hhi: None,
+        ordinary_holder_count: 0,
+        ordinary_holder_count_top20_floor: true,
+        creator_held_share: None,
+        curve_held_share: None,
+        noncurve_supply_share: None,
+    }
+}
+
 /// Domain 2 — one bounded T0 holder snapshot for `mint`. Reuses the observation RPC
-/// gate; `getTokenLargestAccounts` (top-20 truncated by the RPC = the frozen floor),
-/// converts base balances to UI tokens (÷10^decimals) for the fixed 1e9 denominator,
-/// and classifies curve/creator by deterministic ATA. A failure carries explicit
-/// provenance and is NEVER encoded as zero concentration. At most one bounded retry
-/// for a retryable transport failure; retry NEVER depends on any feature value.
+/// gate: `getTokenLargestAccounts` (top-20 truncated by the RPC = the frozen floor) for
+/// balances, then `getMultipleAccounts` on those addresses to read each token account's
+/// AUTHORITATIVE owner. Curve/creator are classified BY OWNER — the curve reserve is
+/// whichever account is owned by `bonding_curve_pda` (wherever it actually lives), not a
+/// derived ATA (P3-HOLDER-DEFECT-001). If the curve reserve is not found among the
+/// returned accounts, the snapshot is MISSING (`CurveTokenAccountUnresolved`) — never a
+/// zero-curve concentration. Balances convert base→UI tokens (÷10^decimals) for the fixed
+/// 1e9 denominator. `creator` is the creator WALLET pubkey (owner-matched). At most one
+/// bounded retry for a retryable transport failure; retry NEVER depends on a feature value.
 async fn acquire_holder_snapshot(
     gate: &Arc<ObservationRpcGate>,
     rpc: &Arc<RpcClient>,
     mint: &Pubkey,
-    creator_ata: Option<&str>,
+    creator: Option<&str>,
     run_id: &str,
     source_revision: &str,
     requested_at: DateTime<Utc>,
     t0_deadline: DateTime<Utc>,
 ) -> HolderSnapshot {
-    let curve_ata = get_associated_token_address(&bonding_curve_pda(mint).0, mint).to_string();
-    let creator_deterministic = creator_ata.is_some();
+    let curve_pda = bonding_curve_pda(mint).0.to_string();
+    let creator_deterministic = creator.is_some();
 
+    // Step 1: largest accounts (balances), bounded single retry on retryable transport.
     let mut attempt_err: Option<MeasurementFailureCategory> = None;
     let mut balances: Option<Vec<(String, u64)>> = None;
     for attempt in 0u8..2 {
@@ -1173,7 +1195,6 @@ async fn acquire_holder_snapshot(
             Ok(Err(e)) => {
                 let cat = classify_measurement_rpc_error(&e.to_string());
                 attempt_err = Some(cat);
-                // Only retry a retryable transport failure, and only once.
                 let retryable = matches!(
                     cat,
                     MeasurementFailureCategory::Timeout
@@ -1190,13 +1211,72 @@ async fn acquire_holder_snapshot(
             }
         }
     }
+
+    let balances = match balances {
+        Some(b) => b,
+        None => {
+            return HolderSnapshot {
+                run_id: run_id.to_string(),
+                mint: mint.to_string(),
+                requested_at,
+                completed_at: Utc::now(),
+                rpc_slot: None,
+                available_in_time: false,
+                raw_accounts: Vec::new(),
+                total_mint_supply_tokens: TOTAL_MINT_SUPPLY_TOKENS,
+                failure: Some(attempt_err.unwrap_or(MeasurementFailureCategory::Other)),
+                source: "rpc".to_string(),
+                source_revision: source_revision.to_string(),
+                feature_version: MEASUREMENT_FEATURE_VERSION,
+                features: blocked_holder_features(),
+            };
+        }
+    };
+
+    // Step 2: resolve each account's AUTHORITATIVE owner via getMultipleAccounts.
+    let pubkeys: Vec<Pubkey> = balances.iter().filter_map(|(a, _)| Pubkey::from_str(a).ok()).collect();
+    let owners: std::collections::HashMap<String, String> = {
+        let (permit, _wait) = gate.acquire().await;
+        let rpc = rpc.clone();
+        let keys = pubkeys.clone();
+        let res = tokio::task::spawn_blocking(move || rpc.get_multiple_accounts(&keys)).await;
+        drop(permit);
+        let mut m = std::collections::HashMap::new();
+        if let Ok(Ok(accts)) = res {
+            for (pk, acc) in pubkeys.iter().zip(accts.into_iter()) {
+                if let Some(acc) = acc {
+                    // Decode the SPL token account; owner is authoritative. Verify the
+                    // mint matches so we never attribute an unrelated account.
+                    if let Ok(tok) = spl_token::state::Account::unpack(&acc.data) {
+                        if tok.mint == *mint {
+                            m.insert(pk.to_string(), tok.owner.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        m
+    };
+
+    let raw: Vec<RawHolderAccount> = balances
+        .iter()
+        .map(|(addr, bal)| RawHolderAccount {
+            address: addr.clone(),
+            ui_balance: *bal,
+            owner: owners.get(addr).cloned(),
+        })
+        .collect();
+
+    let (raw_accounts, curve_resolved) = classify_holder_accounts_by_owner(&raw, &curve_pda, creator);
     let completed_at = Utc::now();
 
-    let (raw_accounts, failure) = match balances {
-        Some(b) => (classify_holder_accounts(&b, &curve_ata, creator_ata), None),
-        None => (Vec::new(), Some(attempt_err.unwrap_or(MeasurementFailureCategory::Other))),
+    // Curve reserve not authoritatively found => MISSING, never zero-curve concentration.
+    let (features, failure) = if curve_resolved {
+        (holder_features(&raw_accounts, creator_deterministic), None)
+    } else {
+        (blocked_holder_features(), Some(MeasurementFailureCategory::CurveTokenAccountUnresolved))
     };
-    let features = holder_features(&raw_accounts, creator_deterministic);
+
     HolderSnapshot {
         run_id: run_id.to_string(),
         mint: mint.to_string(),
@@ -1294,17 +1374,16 @@ async fn t0_enrichment(
     source_revision: String,
     t0_deadline: DateTime<Utc>,
 ) {
-    // Deterministic creator ATA only if the creator pubkey parses; else BLOCKED.
-    let creator_ata = Pubkey::from_str(&creator)
-        .ok()
-        .map(|c| get_associated_token_address(&c, &mint).to_string());
+    // Creator classification is by OWNER: the creator's account is owned by the
+    // creator WALLET. Deterministic only if the provider creator pubkey parses.
+    let creator_wallet = Pubkey::from_str(&creator).ok().map(|c| c.to_string());
 
     // Domain 2 — holder snapshot.
     let holder = acquire_holder_snapshot(
         &rpc_gate,
         &rpc,
         &mint,
-        creator_ata.as_deref(),
+        creator_wallet.as_deref(),
         &run_id,
         &source_revision,
         Utc::now(),

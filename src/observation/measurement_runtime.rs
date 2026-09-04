@@ -313,30 +313,48 @@ pub fn should_attempt_subscription() -> bool {
 // Domain 2/3 (2C): deterministic classification + redundancy glue (pure).
 // ---------------------------------------------------------------------------
 
-/// Deterministically classify token-account holders from a `getTokenLargestAccounts`
-/// result already converted to UI-token balances (base / 10^decimals). curve/program
-/// and creator are matched ONLY by their deterministic associated-token-account
-/// addresses — never by a balance heuristic. `creator_ata == None` means creator
-/// attribution is BLOCKED (ambiguous), so no account is labeled Creator. Everything
-/// unmatched is Ordinary; Unknown is never fabricated here.
-pub fn classify_holder_accounts(
-    largest: &[(String, u64)],
-    curve_ata: &str,
-    creator_ata: Option<&str>,
-) -> Vec<HolderAccount> {
-    largest
+/// A largest-account row enriched with its on-chain SPL token-account OWNER, already
+/// converted to UI-token balance (base / 10^decimals). `owner` is `None` when the
+/// account could not be decoded (classified Unknown, never fabricated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawHolderAccount {
+    pub address: String,
+    pub ui_balance: u64,
+    pub owner: Option<String>,
+}
+
+/// Deterministically classify holders by AUTHORITATIVE token-account OWNER — NOT by
+/// any derived-address / ATA assumption and NOT by balance size (P3-HOLDER-DEFECT-001):
+/// - owner == the bonding-curve PDA  => CurveProgram (the reserve, wherever it lives)
+/// - owner == the creator wallet     => Creator (only if `creator` is known)
+/// - owner known but neither         => Ordinary
+/// - owner undecodable               => Unknown (never fabricated as ordinary/curve)
+///
+/// Returns the classified accounts plus `curve_resolved` = whether the curve reserve
+/// was authoritatively found among them. If it was not, the caller MUST treat
+/// curve-exclusion features as MISSING (never zero-fill the curve share).
+pub fn classify_holder_accounts_by_owner(
+    accounts: &[RawHolderAccount],
+    curve_pda: &str,
+    creator: Option<&str>,
+) -> (Vec<HolderAccount>, bool) {
+    let mut curve_resolved = false;
+    let classified = accounts
         .iter()
-        .map(|(addr, bal)| {
-            let class = if addr == curve_ata {
-                HolderAccountClass::CurveProgram
-            } else if creator_ata == Some(addr.as_str()) {
-                HolderAccountClass::Creator
-            } else {
-                HolderAccountClass::Ordinary
+        .map(|a| {
+            let class = match a.owner.as_deref() {
+                Some(o) if o == curve_pda => {
+                    curve_resolved = true;
+                    HolderAccountClass::CurveProgram
+                }
+                Some(o) if creator == Some(o) => HolderAccountClass::Creator,
+                Some(_) => HolderAccountClass::Ordinary,
+                None => HolderAccountClass::Unknown,
             };
-            HolderAccount { address: addr.clone(), raw_balance_tokens: *bal, class }
+            HolderAccount { address: a.address.clone(), raw_balance_tokens: a.ui_balance, class }
         })
-        .collect()
+        .collect();
+    (classified, curve_resolved)
 }
 
 /// Redundancy audit for one microstructure probe: compare the probe's total expected
@@ -455,7 +473,7 @@ impl ParticipationState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::measurement::TradeSide;
+    use super::super::measurement::{holder_features, TradeSide};
     use chrono::TimeZone;
 
     fn ts(s: i64) -> DateTime<Utc> {
@@ -774,26 +792,86 @@ mod tests {
 
     // --- 2C: holder classification + microstructure redundancy (pure) ---
 
-    #[test] // curve/creator matched by deterministic ATA, everything else Ordinary
-    fn classify_curve_creator_ordinary() {
-        let largest = vec![
-            ("CURVE".to_string(), 800_000_000u64),
-            ("CREATOR".to_string(), 100_000_000u64),
-            ("WALLET1".to_string(), 60_000_000u64),
-        ];
-        let out = classify_holder_accounts(&largest, "CURVE", Some("CREATOR"));
-        assert_eq!(out[0].class, HolderAccountClass::CurveProgram);
-        assert_eq!(out[1].class, HolderAccountClass::Creator);
-        assert_eq!(out[2].class, HolderAccountClass::Ordinary);
-        assert_eq!(out[0].raw_balance_tokens, 800_000_000);
+    fn raw(addr: &str, bal: u64, owner: Option<&str>) -> RawHolderAccount {
+        RawHolderAccount { address: addr.into(), ui_balance: bal, owner: owner.map(|s| s.to_string()) }
     }
 
-    #[test] // creator BLOCKED (None) => no account labeled Creator
-    fn classify_creator_blocked() {
-        let largest = vec![("CURVE".to_string(), 1u64), ("X".to_string(), 2u64)];
-        let out = classify_holder_accounts(&largest, "CURVE", None);
+    #[test] // classify by OWNER: curve reserve (owned by curve PDA), creator, ordinary
+    fn classify_by_owner_curve_creator_ordinary() {
+        // Reproduces the 2E live shape: the curve reserve's ADDRESS is unrelated to
+        // any ATA derivation — only its OWNER (the curve PDA) identifies it.
+        let accts = vec![
+            raw("RESERVE_ADDR_NOT_AN_ATA", 793_100_000, Some("CURVE_PDA")),
+            raw("CREATOR_ATA", 6_000_000, Some("CREATOR_WALLET")),
+            raw("WHALE_ATA", 900_000, Some("SOME_WALLET")),
+        ];
+        let (out, curve_resolved) = classify_holder_accounts_by_owner(&accts, "CURVE_PDA", Some("CREATOR_WALLET"));
+        assert!(curve_resolved);
+        assert_eq!(out[0].class, HolderAccountClass::CurveProgram); // matched by owner, not address
+        assert_eq!(out[1].class, HolderAccountClass::Creator);
+        assert_eq!(out[2].class, HolderAccountClass::Ordinary);
+    }
+
+    #[test] // creator unknown => no Creator label; undecodable owner => Unknown
+    fn classify_by_owner_creator_blocked_and_unknown() {
+        let accts = vec![
+            raw("R", 1, Some("CURVE_PDA")),
+            raw("C", 2, Some("CREATOR_WALLET")),
+            raw("U", 3, None),
+        ];
+        let (out, curve_resolved) = classify_holder_accounts_by_owner(&accts, "CURVE_PDA", None);
+        assert!(curve_resolved);
         assert!(out.iter().all(|a| a.class != HolderAccountClass::Creator));
-        assert_eq!(out[1].class, HolderAccountClass::Ordinary);
+        assert_eq!(out[2].class, HolderAccountClass::Unknown);
+    }
+
+    // --- P3-HOLDER-DEFECT-001 remediation regression (from the 2E live shape) ---
+
+    #[test] // 1/3/8/9/10: authoritative owner match classifies the curve reserve as
+    // curve/program, and the ~99.65% reserve is EXCLUDED from non-curve top-k shares
+    fn remediation_curve_reserve_excluded_from_noncurve() {
+        // 2E live shape (curve reserve ~99.65% supply + creator) plus one small
+        // ordinary holder so the non-curve population is non-empty.
+        let accts = vec![
+            raw("RESERVE", 996_479_081, Some("CURVE_PDA")), // the top1 that WAS mislabeled ordinary
+            raw("CREATOR_ATA", 3_000_000, Some("CREATOR_WALLET")),
+            raw("WHALE_ATA", 2_000_000, Some("WALLET_X")),
+        ];
+        let (classified, curve_resolved) = classify_holder_accounts_by_owner(&accts, "CURVE_PDA", Some("CREATOR_WALLET"));
+        assert!(curve_resolved);
+        // The old ATA assumption would have left RESERVE as Ordinary -> top1 ~0.9965.
+        assert_eq!(classified[0].class, HolderAccountClass::CurveProgram);
+        let feats = holder_features(&classified, true);
+        // Curve reserve EXCLUDED from non-curve top-k: top1 is the whale (~0.002), not 0.9965.
+        assert!(feats.top1_noncurve_holder_share.unwrap() < 0.01, "curve reserve must be excluded from non-curve top1");
+        assert!(feats.top5_noncurve_holder_share.unwrap() < 0.01);
+        assert!(feats.top10_noncurve_holder_share.unwrap() < 0.01);
+        // curve_held_share reflects the RESOLVED reserve, not zero.
+        assert!(feats.curve_held_share.unwrap() > 0.99);
+    }
+
+    #[test] // 6/7: unresolved curve => caller must treat as MISSING, never zero curve share
+    fn remediation_unresolved_curve_flag() {
+        // No account is owned by the curve PDA (e.g. reserve not among returned rows).
+        let accts = vec![
+            raw("A", 500_000_000, Some("WALLET_A")),
+            raw("B", 400_000_000, Some("WALLET_B")),
+        ];
+        let (_classified, curve_resolved) = classify_holder_accounts_by_owner(&accts, "CURVE_PDA", None);
+        assert!(!curve_resolved, "curve must be reported UNRESOLVED so caller emits MISSING/FAILURE, not zero curve share");
+    }
+
+    #[test] // 15: no balance-size heuristic — the biggest balance is NOT auto-curve
+    fn remediation_no_balance_heuristic() {
+        // Biggest balance is an ordinary wallet; the small one is the real curve.
+        let accts = vec![
+            raw("BIG_WALLET", 900_000_000, Some("WALLET_X")),
+            raw("SMALL_RESERVE", 10_000_000, Some("CURVE_PDA")),
+        ];
+        let (out, curve_resolved) = classify_holder_accounts_by_owner(&accts, "CURVE_PDA", None);
+        assert!(curve_resolved);
+        assert_eq!(out[0].class, HolderAccountClass::Ordinary); // biggest is NOT curve
+        assert_eq!(out[1].class, HolderAccountClass::CurveProgram); // owner decides, not size
     }
 
     #[test] // redundancy: probe matching curve-implied within tolerance => Redundant
