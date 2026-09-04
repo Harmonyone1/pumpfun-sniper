@@ -25,6 +25,7 @@ solana-client = "=2.0.25"
 solana-account-decoder = "=2.0.25"
 solana-transaction-status = "=2.0.25"
 spl-token = "=6.0.0"
+spl-token-2022 = "=4.0.0"
 spl-associated-token-account = "=4.0.0"
 
 # Jito - NOTE: SDK still maturing, expect breaking changes

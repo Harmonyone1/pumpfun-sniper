@@ -1138,25 +1138,36 @@ fn holder_fetch_commitment() -> CommitmentConfig {
     CommitmentConfig::confirmed()
 }
 
-/// Decode a fetched token account's AUTHORITATIVE owner, keyed off its OWNING PROGRAM.
-/// Only classic SPL Token is a build dependency, so any other program id is an explicit
-/// `UnsupportedTokenProgram` (Token-2022 is not currently in the pump path / deps). The
-/// decoded mint MUST equal the candidate mint or it is `TokenMintMismatch`. Never
-/// attributes ownership without a mint match. Pure + unit-testable.
+/// Decode a fetched token account's AUTHORITATIVE (mint, owner), keyed off its OWNING
+/// PROGRAM. Supports classic SPL Token and Token-2022 (P3-HOLDER-DEFECT-003: pump.fun
+/// tokens are Token-2022, including >165-byte extension-bearing accounts). Token-2022
+/// uses `StateWithExtensions`, which validates the base layout + extension envelope, so
+/// this is NOT a blind byte-slice. Any other owning program is an explicit
+/// `UnsupportedTokenProgram`; undecodable data is `TokenAccountDecodeFailed`; a decoded
+/// mint that isn't the candidate mint is `TokenMintMismatch`. Never attributes ownership
+/// without a mint match. Pure + unit-testable.
 fn decode_token_account_owner(
     owner_program: &Pubkey,
     data: &[u8],
     expected_mint: &Pubkey,
 ) -> std::result::Result<String, MeasurementFailureCategory> {
-    if *owner_program != spl_token::id() {
+    let (mint_bytes, owner) = if *owner_program == spl_token::id() {
+        let tok = spl_token::state::Account::unpack(data)
+            .map_err(|_| MeasurementFailureCategory::TokenAccountDecodeFailed)?;
+        (tok.mint.to_bytes(), tok.owner.to_string())
+    } else if *owner_program == spl_token_2022::id() {
+        use spl_token_2022::extension::StateWithExtensions;
+        use spl_token_2022::state::Account as Token2022Account;
+        let st = StateWithExtensions::<Token2022Account>::unpack(data)
+            .map_err(|_| MeasurementFailureCategory::TokenAccountDecodeFailed)?;
+        (st.base.mint.to_bytes(), st.base.owner.to_string())
+    } else {
         return Err(MeasurementFailureCategory::UnsupportedTokenProgram);
-    }
-    let tok = spl_token::state::Account::unpack(data)
-        .map_err(|_| MeasurementFailureCategory::TokenAccountDecodeFailed)?;
-    if tok.mint != *expected_mint {
+    };
+    if mint_bytes != expected_mint.to_bytes() {
         return Err(MeasurementFailureCategory::TokenMintMismatch);
     }
-    Ok(tok.owner.to_string())
+    Ok(owner)
 }
 
 /// All-`None`/zero holder features — used when the snapshot is MISSING/FAILURE so a
@@ -3147,6 +3158,109 @@ mod tests {
             decode_token_account_owner(&spl_token::id(), &junk, &mint),
             Err(MeasurementFailureCategory::TokenAccountDecodeFailed)
         );
+    }
+
+    // --- P3-HOLDER-DEFECT-003: Token-2022 decode ---
+
+    fn t22_base_account(mint: &Pubkey, owner: &Pubkey) -> Vec<u8> {
+        use spl_token_2022::solana_program::program_option::COption;
+        use spl_token_2022::state::{Account, AccountState};
+        let acct = Account {
+            mint: *mint,
+            owner: *owner,
+            amount: 1_000,
+            delegate: COption::None,
+            state: AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+        let mut data = vec![0u8; Account::LEN];
+        Account::pack(acct, &mut data).unwrap();
+        data
+    }
+
+    fn t22_immutable_owner_account(mint: &Pubkey, owner: &Pubkey) -> Vec<u8> {
+        use spl_token_2022::extension::immutable_owner::ImmutableOwner;
+        use spl_token_2022::extension::{BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut};
+        use spl_token_2022::solana_program::program_option::COption;
+        use spl_token_2022::state::{Account, AccountState};
+        let len = ExtensionType::try_calculate_account_len::<Account>(&[ExtensionType::ImmutableOwner]).unwrap();
+        let mut data = vec![0u8; len];
+        let mut state = StateWithExtensionsMut::<Account>::unpack_uninitialized(&mut data).unwrap();
+        state.base = Account {
+            mint: *mint,
+            owner: *owner,
+            amount: 1_000,
+            delegate: COption::None,
+            state: AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+        state.init_extension::<ImmutableOwner>(true).unwrap();
+        data
+    }
+
+    #[test] // Token-2022 base (165-byte) account decodes to its authoritative owner
+    fn decode_token2022_base() {
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let data = t22_base_account(&mint, &owner);
+        let got = decode_token_account_owner(&spl_token_2022::id(), &data, &mint).unwrap();
+        assert_eq!(got, owner.to_string());
+    }
+
+    #[test] // Token-2022 EXTENSION-bearing (170-byte) account decodes (the live shape)
+    fn decode_token2022_extension_170() {
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let data = t22_immutable_owner_account(&mint, &owner);
+        assert_eq!(data.len(), 170, "ImmutableOwner extension account is 170 bytes");
+        let got = decode_token_account_owner(&spl_token_2022::id(), &data, &mint).unwrap();
+        assert_eq!(got, owner.to_string());
+    }
+
+    #[test] // Token-2022 mint mismatch is explicit (owner not attributed)
+    fn decode_token2022_mint_mismatch() {
+        let acct_mint = Pubkey::new_unique();
+        let candidate_mint = Pubkey::new_unique();
+        let data = t22_immutable_owner_account(&acct_mint, &Pubkey::new_unique());
+        assert_eq!(
+            decode_token_account_owner(&spl_token_2022::id(), &data, &candidate_mint),
+            Err(MeasurementFailureCategory::TokenMintMismatch)
+        );
+    }
+
+    #[test] // Token-2022 program + too-short/garbage data => explicit decode failure
+    fn decode_token2022_garbage() {
+        let mint = Pubkey::new_unique();
+        assert_eq!(
+            decode_token_account_owner(&spl_token_2022::id(), &[0u8; 10], &mint),
+            Err(MeasurementFailureCategory::TokenAccountDecodeFailed)
+        );
+    }
+
+    #[test] // classification uses decoded owner regardless of token program (curve excluded)
+    fn token2022_curve_excluded_via_owner() {
+        // A Token-2022 curve reserve (owned by the curve PDA) must classify as curve
+        // and be excluded from non-curve concentration — same math as classic.
+        use pumpfun_sniper::observation::measurement::{holder_features, HolderAccountClass};
+        use pumpfun_sniper::observation::measurement_runtime::{classify_holder_accounts_by_owner, RawHolderAccount};
+        let curve_pda = Pubkey::new_unique();
+        let owner_a = Pubkey::new_unique();
+        let raw = vec![
+            RawHolderAccount { address: "RESERVE".into(), ui_balance: 990_000_000, owner: Some(curve_pda.to_string()) },
+            RawHolderAccount { address: "WHALE".into(), ui_balance: 5_000_000, owner: Some(owner_a.to_string()) },
+        ];
+        let (classified, resolved) = classify_holder_accounts_by_owner(&raw, &curve_pda.to_string(), None);
+        assert!(resolved);
+        assert_eq!(classified[0].class, HolderAccountClass::CurveProgram);
+        let feats = holder_features(&classified, false);
+        assert!(feats.top1_noncurve_holder_share.unwrap() < 0.01);
+        assert!(feats.curve_held_share.unwrap() > 0.98);
     }
 
     /// Section 45 static execution-absence guard. Forbidden needles are assembled
