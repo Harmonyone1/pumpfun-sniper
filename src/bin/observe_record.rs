@@ -1575,6 +1575,27 @@ async fn t0_enrichment(
     // (holder T10 = T0+10s; probe T0_AVAILABLE = T0+250ms) and is replay-self-contained.
     let t0 = t0_deadline;
 
+    // --- P3-DECISION-BASE-RETURN (admission timeline): DB_T1 + DB_T15. ---
+    // Spawned HERE, before the holder/probe join, each sleeping to its OWN anchor
+    // (T1 = t0+1s, T15 = t0+15s) so firing is anchor-driven — NOT blocked behind
+    // the holder's ~10s freshness retry (which otherwise pushed DB_T1's request_lag
+    // to ~9.4s, run_01). Run-owned local JoinSet, joined at the end of this task
+    // (never detached). Each runs its own buy + matched forward sells of its OWN
+    // base quantity, anchored on the actual base sampled_at B (amendment §1,§5,§6).
+    let mut db_tasks: JoinSet<()> = JoinSet::new();
+    for (class, offset_secs) in [(DecisionClass::T1, 1u64), (DecisionClass::T15, 15u64)] {
+        let (g, o, s, cid) = (rpc_gate.clone(), oracle.clone(), shared.clone(), candidate_id.clone());
+        let d = t0 + chrono::Duration::seconds(offset_secs as i64);
+        let due = t0_instant + Duration::from_secs(offset_secs);
+        db_tasks.spawn(async move {
+            let now = tokio::time::Instant::now();
+            if due > now {
+                tokio::time::sleep(due - now).await;
+            }
+            run_decision_base(g, o, s, cid, mint, class, d).await;
+        });
+    }
+
     // AMENDMENT-001: holder and microstructure run CONCURRENTLY — the holder's ~10s
     // freshness retry must NOT delay probe initiation (D3 decoupling). Both share the
     // bounded RPC gate; both stay owned by this enrichment task (drained at shutdown).
@@ -1617,34 +1638,9 @@ async fn t0_enrichment(
         shared.append(MeasurementPayload::MicrostructureProbe(probe));
     }
 
-    // --- P3-DECISION-BASE-RETURN (admission timeline): DB_T1 + DB_T15. ---
-    // Run-owned local JoinSet, joined before this enrichment task returns (never
-    // detached). DB_T1's feature (probe) already fired at ~T0+1s above, so its base
-    // is requested now (>= T0+1s). DB_T15 fires at T0+15s. Each runs its own buy +
-    // matched forward sells of its OWN base quantity (amendment §1,§5).
-    let mut db_tasks: JoinSet<()> = JoinSet::new();
-    let d_t1 = t0 + chrono::Duration::seconds(1);
-    db_tasks.spawn(run_decision_base(
-        rpc_gate.clone(),
-        oracle.clone(),
-        shared.clone(),
-        candidate_id.clone(),
-        mint,
-        DecisionClass::T1,
-        d_t1,
-    ));
-    {
-        let (g, o, s, cid) = (rpc_gate.clone(), oracle.clone(), shared.clone(), candidate_id.clone());
-        let d_t15 = t0 + chrono::Duration::seconds(15);
-        let t15_due = t0_instant + Duration::from_secs(15);
-        db_tasks.spawn(async move {
-            let now = tokio::time::Instant::now();
-            if t15_due > now {
-                tokio::time::sleep(t15_due - now).await;
-            }
-            run_decision_base(g, o, s, cid, mint, DecisionClass::T15, d_t15).await;
-        });
-    }
+    // Drain the run-owned admission-timeline decision-base tasks (spawned BEFORE
+    // the holder/probe join so their firing is anchor-driven, not blocked by the
+    // holder's ~10s freshness retry). Joined before this enrichment task returns.
     while db_tasks.join_next().await.is_some() {}
 }
 
