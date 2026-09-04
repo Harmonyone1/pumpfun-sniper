@@ -93,6 +93,16 @@ pub enum MeasurementFailureCategory {
     /// require curve exclusion are MISSING — never computed as if all accounts
     /// were ordinary (P3-HOLDER-DEFECT-001 remediation).
     CurveTokenAccountUnresolved,
+    /// Domain-2 (P3-HOLDER-DEFECT-002): holder token-account state was not present
+    /// at `confirmed` commitment (e.g. a very fresh mint). MISSING, never zero.
+    AccountStateUnavailableAtConfirmed,
+    /// Domain-2: a returned token account is owned by a token program this build
+    /// does not decode (only classic SPL Token is a dependency).
+    UnsupportedTokenProgram,
+    /// Domain-2: a token account owned by the SPL Token program failed to decode.
+    TokenAccountDecodeFailed,
+    /// Domain-2: a decoded token account's mint does not match the candidate mint.
+    TokenMintMismatch,
     Other,
 }
 

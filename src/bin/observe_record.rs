@@ -58,6 +58,7 @@ use pumpfun_sniper::observation::measurement_sink::{
 use pumpfun_sniper::observation::ObservationRecorder;
 use pumpfun_sniper::market::pump_state::bonding_curve_pda;
 use pumpfun_sniper::runtime::RuntimeLease;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::program_pack::Pack;
 use pumpfun_sniper::stream::pumpportal::{
     CommandSender, PumpPortalDecodeError, PumpPortalDecodeKind, SubscriptionCommand, TradeEvent,
@@ -1129,6 +1130,35 @@ fn classify_measurement_rpc_error(msg: &str) -> MeasurementFailureCategory {
     }
 }
 
+/// Commitment for the T0 holder account-state fetch. `confirmed` (not the RPC default
+/// `finalized`): at T0 the target accounts are seconds old, so `finalized` can return
+/// nothing while `confirmed` already has the truth — matching the oracle's commitment
+/// (P3-HOLDER-DEFECT-002). Kept as a fn so a guard test fails if this regresses.
+fn holder_fetch_commitment() -> CommitmentConfig {
+    CommitmentConfig::confirmed()
+}
+
+/// Decode a fetched token account's AUTHORITATIVE owner, keyed off its OWNING PROGRAM.
+/// Only classic SPL Token is a build dependency, so any other program id is an explicit
+/// `UnsupportedTokenProgram` (Token-2022 is not currently in the pump path / deps). The
+/// decoded mint MUST equal the candidate mint or it is `TokenMintMismatch`. Never
+/// attributes ownership without a mint match. Pure + unit-testable.
+fn decode_token_account_owner(
+    owner_program: &Pubkey,
+    data: &[u8],
+    expected_mint: &Pubkey,
+) -> std::result::Result<String, MeasurementFailureCategory> {
+    if *owner_program != spl_token::id() {
+        return Err(MeasurementFailureCategory::UnsupportedTokenProgram);
+    }
+    let tok = spl_token::state::Account::unpack(data)
+        .map_err(|_| MeasurementFailureCategory::TokenAccountDecodeFailed)?;
+    if tok.mint != *expected_mint {
+        return Err(MeasurementFailureCategory::TokenMintMismatch);
+    }
+    Ok(tok.owner.to_string())
+}
+
 /// All-`None`/zero holder features — used when the snapshot is MISSING/FAILURE so a
 /// failed acquisition or an UNRESOLVED curve is never encoded as a valid zero-curve
 /// concentration (P3-HOLDER-DEFECT-001).
@@ -1233,29 +1263,42 @@ async fn acquire_holder_snapshot(
         }
     };
 
-    // Step 2: resolve each account's AUTHORITATIVE owner via getMultipleAccounts.
+    // Step 2: resolve each account's AUTHORITATIVE owner via getMultipleAccounts at
+    // CONFIRMED commitment (P3-HOLDER-DEFECT-002) — fresh mints aren't finalized yet.
     let pubkeys: Vec<Pubkey> = balances.iter().filter_map(|(a, _)| Pubkey::from_str(a).ok()).collect();
-    let owners: std::collections::HashMap<String, String> = {
+    let (owners, rpc_slot, present_count, decode_err): (
+        std::collections::HashMap<String, String>,
+        Option<u64>,
+        usize,
+        Option<MeasurementFailureCategory>,
+    ) = {
         let (permit, _wait) = gate.acquire().await;
         let rpc = rpc.clone();
         let keys = pubkeys.clone();
-        let res = tokio::task::spawn_blocking(move || rpc.get_multiple_accounts(&keys)).await;
+        let res = tokio::task::spawn_blocking(move || {
+            rpc.get_multiple_accounts_with_commitment(&keys, holder_fetch_commitment())
+        })
+        .await;
         drop(permit);
         let mut m = std::collections::HashMap::new();
-        if let Ok(Ok(accts)) = res {
-            for (pk, acc) in pubkeys.iter().zip(accts.into_iter()) {
+        let mut slot = None;
+        let mut present = 0usize;
+        let mut last_err = None;
+        if let Ok(Ok(resp)) = res {
+            slot = Some(resp.context.slot);
+            for (pk, acc) in pubkeys.iter().zip(resp.value.into_iter()) {
                 if let Some(acc) = acc {
-                    // Decode the SPL token account; owner is authoritative. Verify the
-                    // mint matches so we never attribute an unrelated account.
-                    if let Ok(tok) = spl_token::state::Account::unpack(&acc.data) {
-                        if tok.mint == *mint {
-                            m.insert(pk.to_string(), tok.owner.to_string());
+                    present += 1;
+                    match decode_token_account_owner(&acc.owner, &acc.data, mint) {
+                        Ok(owner) => {
+                            m.insert(pk.to_string(), owner);
                         }
+                        Err(cat) => last_err = Some(cat),
                     }
                 }
             }
         }
-        m
+        (m, slot, present, last_err)
     };
 
     let raw: Vec<RawHolderAccount> = balances
@@ -1271,10 +1314,17 @@ async fn acquire_holder_snapshot(
     let completed_at = Utc::now();
 
     // Curve reserve not authoritatively found => MISSING, never zero-curve concentration.
+    // Provenance precedence: no account state at confirmed > specific decode failure >
+    // generic curve-unresolved.
     let (features, failure) = if curve_resolved {
         (holder_features(&raw_accounts, creator_deterministic), None)
     } else {
-        (blocked_holder_features(), Some(MeasurementFailureCategory::CurveTokenAccountUnresolved))
+        let cat = if present_count == 0 {
+            MeasurementFailureCategory::AccountStateUnavailableAtConfirmed
+        } else {
+            decode_err.unwrap_or(MeasurementFailureCategory::CurveTokenAccountUnresolved)
+        };
+        (blocked_holder_features(), Some(cat))
     };
 
     HolderSnapshot {
@@ -1282,7 +1332,7 @@ async fn acquire_holder_snapshot(
         mint: mint.to_string(),
         requested_at,
         completed_at,
-        rpc_slot: None,
+        rpc_slot,
         available_in_time: completed_at <= t0_deadline,
         raw_accounts,
         total_mint_supply_tokens: TOTAL_MINT_SUPPLY_TOKENS,
@@ -3031,6 +3081,72 @@ mod tests {
     #[test] // 2C: frozen microstructure probe sizes, in order
     fn microstructure_probe_sizes_frozen() {
         assert_eq!(MICROSTRUCTURE_PROBE_LAMPORTS, [500_000, 1_000_000, 2_000_000]);
+    }
+
+    // --- P3-HOLDER-DEFECT-002 remediation: commitment + decode robustness ---
+
+    fn packed_token_account(mint: &Pubkey, owner: &Pubkey) -> Vec<u8> {
+        use spl_token::solana_program::program_option::COption;
+        let acct = spl_token::state::Account {
+            mint: *mint,
+            owner: *owner,
+            amount: 1_000,
+            delegate: COption::None,
+            state: spl_token::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+        let mut data = vec![0u8; spl_token::state::Account::LEN];
+        spl_token::state::Account::pack(acct, &mut data).unwrap();
+        data
+    }
+
+    #[test] // GUARD: holder account fetch must use CONFIRMED (not finalized/default)
+    fn holder_fetch_uses_confirmed_commitment() {
+        assert_eq!(holder_fetch_commitment(), CommitmentConfig::confirmed());
+        assert_ne!(holder_fetch_commitment(), CommitmentConfig::finalized());
+    }
+
+    #[test] // classic SPL token account decodes to its authoritative owner
+    fn decode_classic_token_account_owner() {
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let data = packed_token_account(&mint, &owner);
+        let got = decode_token_account_owner(&spl_token::id(), &data, &mint).unwrap();
+        assert_eq!(got, owner.to_string());
+    }
+
+    #[test] // non-SPL-Token owning program => explicit UnsupportedTokenProgram
+    fn decode_unsupported_program() {
+        let mint = Pubkey::new_unique();
+        let data = packed_token_account(&mint, &Pubkey::new_unique());
+        let other_program = Pubkey::new_unique(); // e.g. Token-2022 (not a dependency)
+        assert_eq!(
+            decode_token_account_owner(&other_program, &data, &mint),
+            Err(MeasurementFailureCategory::UnsupportedTokenProgram)
+        );
+    }
+
+    #[test] // decoded mint != candidate mint => explicit TokenMintMismatch
+    fn decode_mint_mismatch() {
+        let acct_mint = Pubkey::new_unique();
+        let candidate_mint = Pubkey::new_unique();
+        let data = packed_token_account(&acct_mint, &Pubkey::new_unique());
+        assert_eq!(
+            decode_token_account_owner(&spl_token::id(), &data, &candidate_mint),
+            Err(MeasurementFailureCategory::TokenMintMismatch)
+        );
+    }
+
+    #[test] // undecodable data owned by SPL Token => explicit TokenAccountDecodeFailed
+    fn decode_garbage_data() {
+        let mint = Pubkey::new_unique();
+        let junk = vec![0u8; 10];
+        assert_eq!(
+            decode_token_account_owner(&spl_token::id(), &junk, &mint),
+            Err(MeasurementFailureCategory::TokenAccountDecodeFailed)
+        );
     }
 
     /// Section 45 static execution-absence guard. Forbidden needles are assembled
