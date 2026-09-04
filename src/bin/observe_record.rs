@@ -43,16 +43,21 @@ use pumpfun_sniper::observation::schema::{
     ENTRY_QUOTE_LAMPORTS, OUTCOME_HORIZONS_SECS, SNAPSHOT_HORIZONS_SECS,
 };
 use pumpfun_sniper::observation::measurement::{
-    MeasurementFailureCategory, MeasurementFailureRecord, SnapshotClass, TradeObserved,
+    holder_features, HolderSnapshot, MeasurementFailureCategory, MeasurementFailureRecord,
+    MicrostructureProbe, SnapshotClass, TradeObserved, MEASUREMENT_FEATURE_VERSION,
+    TOTAL_MINT_SUPPLY_TOKENS,
 };
 use pumpfun_sniper::observation::measurement_runtime::{
-    BoundedTradeQueue, ParticipationState, SubscriptionRegistry, MEASUREMENT_TRADE_QUEUE_CAPACITY,
+    classify_holder_accounts, BoundedTradeQueue, ParticipationState, SubscriptionRegistry,
+    MEASUREMENT_TRADE_QUEUE_CAPACITY,
 };
 use pumpfun_sniper::observation::measurement_sink::{
     normalize_trade_event, MeasurementPayload, MeasurementSink, SubscriptionStateRecord,
 };
 use pumpfun_sniper::observation::ObservationRecorder;
+use pumpfun_sniper::market::pump_state::bonding_curve_pda;
 use pumpfun_sniper::runtime::RuntimeLease;
+use spl_associated_token_account::get_associated_token_address;
 use pumpfun_sniper::stream::pumpportal::{
     CommandSender, PumpPortalDecodeError, PumpPortalDecodeKind, SubscriptionCommand, TradeEvent,
 };
@@ -816,11 +821,227 @@ impl Drop for ParticipationCleanup {
     }
 }
 
+/// Coarse read-only RPC/quote failure classification into a frozen provenance
+/// category. Never converts a failure into a zero measurement.
+fn classify_measurement_rpc_error(msg: &str) -> MeasurementFailureCategory {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("timed out") || m.contains("timeout") {
+        MeasurementFailureCategory::Timeout
+    } else if m.contains("429") || m.contains("rate limit") || m.contains("too many requests") {
+        MeasurementFailureCategory::RateLimited
+    } else if m.contains("could not find account") || m.contains("account not found") || m.contains("missing") {
+        MeasurementFailureCategory::AccountMissing
+    } else {
+        MeasurementFailureCategory::RpcUnavailable
+    }
+}
+
+/// Domain 2 — one bounded T0 holder snapshot for `mint`. Reuses the observation RPC
+/// gate; `getTokenLargestAccounts` (top-20 truncated by the RPC = the frozen floor),
+/// converts base balances to UI tokens (÷10^decimals) for the fixed 1e9 denominator,
+/// and classifies curve/creator by deterministic ATA. A failure carries explicit
+/// provenance and is NEVER encoded as zero concentration. At most one bounded retry
+/// for a retryable transport failure; retry NEVER depends on any feature value.
+async fn acquire_holder_snapshot(
+    gate: &Arc<ObservationRpcGate>,
+    rpc: &Arc<RpcClient>,
+    mint: &Pubkey,
+    creator_ata: Option<&str>,
+    run_id: &str,
+    source_revision: &str,
+    requested_at: DateTime<Utc>,
+    t0_deadline: DateTime<Utc>,
+) -> HolderSnapshot {
+    let curve_ata = get_associated_token_address(&bonding_curve_pda(mint).0, mint).to_string();
+    let creator_deterministic = creator_ata.is_some();
+
+    let mut attempt_err: Option<MeasurementFailureCategory> = None;
+    let mut balances: Option<Vec<(String, u64)>> = None;
+    for attempt in 0u8..2 {
+        let (permit, _wait) = gate.acquire().await;
+        let rpc = rpc.clone();
+        let m = *mint;
+        let res = tokio::task::spawn_blocking(move || rpc.get_token_largest_accounts(&m)).await;
+        drop(permit);
+        match res {
+            Ok(Ok(list)) => {
+                balances = Some(
+                    list.into_iter()
+                        .map(|b| {
+                            let raw: u128 = b.amount.amount.parse().unwrap_or(0);
+                            let ui = (raw / 10u128.pow(b.amount.decimals as u32)) as u64;
+                            (b.address, ui)
+                        })
+                        .collect(),
+                );
+                attempt_err = None;
+                break;
+            }
+            Ok(Err(e)) => {
+                let cat = classify_measurement_rpc_error(&e.to_string());
+                attempt_err = Some(cat);
+                // Only retry a retryable transport failure, and only once.
+                let retryable = matches!(
+                    cat,
+                    MeasurementFailureCategory::Timeout
+                        | MeasurementFailureCategory::RateLimited
+                        | MeasurementFailureCategory::RpcUnavailable
+                );
+                if !retryable || attempt == 1 {
+                    break;
+                }
+            }
+            Err(_join) => {
+                attempt_err = Some(MeasurementFailureCategory::Other);
+                break;
+            }
+        }
+    }
+    let completed_at = Utc::now();
+
+    let (raw_accounts, failure) = match balances {
+        Some(b) => (classify_holder_accounts(&b, &curve_ata, creator_ata), None),
+        None => (Vec::new(), Some(attempt_err.unwrap_or(MeasurementFailureCategory::Other))),
+    };
+    let features = holder_features(&raw_accounts, creator_deterministic);
+    HolderSnapshot {
+        run_id: run_id.to_string(),
+        mint: mint.to_string(),
+        requested_at,
+        completed_at,
+        rpc_slot: None,
+        available_in_time: completed_at <= t0_deadline,
+        raw_accounts,
+        total_mint_supply_tokens: TOTAL_MINT_SUPPLY_TOKENS,
+        failure,
+        source: "rpc".to_string(),
+        source_revision: source_revision.to_string(),
+        feature_version: MEASUREMENT_FEATURE_VERSION,
+        features,
+    }
+}
+
+/// Domain 3 — one read-only exact-input buy-quote probe at `lamports`. Uses ONLY the
+/// existing canonical read-only quote path (no wallet, no signing, no tx send). Persists
+/// raw expected-out + fee semantics so the marginal/impact/convexity/redundancy
+/// derivations are reproducible from the row alone. Failure carries provenance and is
+/// never a numeric zero.
+async fn acquire_microstructure_probe(
+    gate: &Arc<ObservationRpcGate>,
+    oracle: &PumpMarketOracle,
+    mint: &Pubkey,
+    lamports: u64,
+    run_id: &str,
+    requested_at: DateTime<Utc>,
+    t0_deadline: DateTime<Utc>,
+) -> MicrostructureProbe {
+    let call = gated_quote_buy_sol(gate, oracle, mint, lamports).await;
+    let completed_at = Utc::now();
+    let (expected_base_raw, base_decimals, success, source, pf, cf, lf, failure) = match call.result {
+        Ok(q) => (
+            Some(q.base_amount_raw),
+            q.base_decimals,
+            true,
+            format!("{:?}", q.venue),
+            Some(q.protocol_fee_bps),
+            Some(q.creator_fee_bps),
+            Some(q.lp_fee_bps),
+            None,
+        ),
+        Err(e) => (
+            None,
+            0,
+            false,
+            "unavailable".to_string(),
+            None,
+            None,
+            None,
+            Some(classify_measurement_rpc_error(&e.to_string())),
+        ),
+    };
+    MicrostructureProbe {
+        run_id: run_id.to_string(),
+        mint: mint.to_string(),
+        requested_at,
+        completed_at,
+        available_in_time: completed_at <= t0_deadline,
+        input_lamports: lamports,
+        expected_base_raw,
+        base_decimals,
+        success,
+        quote_source: source,
+        protocol_fee_bps: pf,
+        creator_fee_bps: cf,
+        lp_fee_bps: lf,
+        latency_ms: call.call_duration_ms,
+        failure,
+        feature_version: MEASUREMENT_FEATURE_VERSION,
+    }
+}
+
+/// Frozen T0 microstructure probe sizes (lamports).
+const MICROSTRUCTURE_PROBE_LAMPORTS: [u64; 3] = [500_000, 1_000_000, 2_000_000];
+
+/// Domain 2 + 3 T0 enrichment, run as a DETACHED task so canonical outcome-horizon
+/// scheduling is never blocked (enrichment is expendable; the observation core is
+/// not). Unconditional per candidate — no dependence on hypothesis/price/future
+/// state. Persists a HolderSnapshot + one MicrostructureProbe per frozen size to the
+/// separate measurement sink. `t0_deadline` is the T0 point (candidate admission);
+/// `available_in_time` is truthful, never backdated.
+#[allow(clippy::too_many_arguments)]
+async fn t0_enrichment(
+    mint: Pubkey,
+    creator: String,
+    oracle: Arc<PumpMarketOracle>,
+    rpc_gate: Arc<ObservationRpcGate>,
+    rpc: Arc<RpcClient>,
+    shared: Arc<MeasurementShared>,
+    run_id: String,
+    source_revision: String,
+    t0_deadline: DateTime<Utc>,
+) {
+    // Deterministic creator ATA only if the creator pubkey parses; else BLOCKED.
+    let creator_ata = Pubkey::from_str(&creator)
+        .ok()
+        .map(|c| get_associated_token_address(&c, &mint).to_string());
+
+    // Domain 2 — holder snapshot.
+    let holder = acquire_holder_snapshot(
+        &rpc_gate,
+        &rpc,
+        &mint,
+        creator_ata.as_deref(),
+        &run_id,
+        &source_revision,
+        Utc::now(),
+        t0_deadline,
+    )
+    .await;
+    shared.append(MeasurementPayload::HolderSnapshot(holder));
+
+    // Domain 3 — read-only microstructure probes at each frozen size (unconditional).
+    for lamports in MICROSTRUCTURE_PROBE_LAMPORTS {
+        let probe = acquire_microstructure_probe(
+            &rpc_gate,
+            &oracle,
+            &mint,
+            lamports,
+            &run_id,
+            Utc::now(),
+            t0_deadline,
+        )
+        .await;
+        shared.append(MeasurementPayload::MicrostructureProbe(probe));
+    }
+}
+
 struct MeasurementCtx {
     sender: CommandSender,
     registry: SubscriptionRegistry,
     shared: Arc<MeasurementShared>,
     queue: BoundedTradeQueue,
+    /// Shared read-only RPC handle for Domain-2/3 T0 enrichment (never signs/sends).
+    rpc: Arc<RpcClient>,
     run_id: String,
     source_revision: String,
 }
@@ -1003,6 +1224,7 @@ async fn main() -> Result<()> {
         registry: SubscriptionRegistry::new(),
         shared: measurement_shared.clone(),
         queue: BoundedTradeQueue::new(MEASUREMENT_TRADE_QUEUE_CAPACITY),
+        rpc: rpc.clone(),
         run_id: measurement_run_id.clone(),
         source_revision: source_revision.clone(),
     };
@@ -1466,6 +1688,20 @@ async fn discover_candidate(
             // P3 Domain-1 (unconditional): subscribe to this tracked mint's trades
             // and publish coverage BEFORE the task can reach its T2 cutoff.
             meas.on_candidate_admitted(&mint_str).await;
+            // P3 Domain-2/3 (unconditional): detached T0 holder + microstructure
+            // enrichment. Detached on purpose — canonical outcome-horizon scheduling
+            // outranks enrichment and must never wait on it (enrichment is expendable).
+            tokio::spawn(t0_enrichment(
+                mint,
+                candidate.creator.clone(),
+                oracle.clone(),
+                rpc_gate.clone(),
+                meas.rpc.clone(),
+                meas.shared.clone(),
+                meas.run_id.clone(),
+                meas.source_revision.clone(),
+                candidate_received_at,
+            ));
             tasks.spawn(track_candidate(
                 permit,
                 candidate_id,
@@ -2297,6 +2533,31 @@ fn tracking_finished(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test] // 2C: read-only RPC/quote failure maps to explicit provenance (never zero)
+    fn measurement_rpc_error_provenance() {
+        assert_eq!(
+            classify_measurement_rpc_error("operation timed out"),
+            MeasurementFailureCategory::Timeout
+        );
+        assert_eq!(
+            classify_measurement_rpc_error("HTTP 429 Too Many Requests"),
+            MeasurementFailureCategory::RateLimited
+        );
+        assert_eq!(
+            classify_measurement_rpc_error("could not find account"),
+            MeasurementFailureCategory::AccountMissing
+        );
+        assert_eq!(
+            classify_measurement_rpc_error("connection refused"),
+            MeasurementFailureCategory::RpcUnavailable
+        );
+    }
+
+    #[test] // 2C: frozen microstructure probe sizes, in order
+    fn microstructure_probe_sizes_frozen() {
+        assert_eq!(MICROSTRUCTURE_PROBE_LAMPORTS, [500_000, 1_000_000, 2_000_000]);
+    }
 
     /// Section 45 static execution-absence guard. Forbidden needles are assembled
     /// from split fragments via `concat!()` so this test's own source never

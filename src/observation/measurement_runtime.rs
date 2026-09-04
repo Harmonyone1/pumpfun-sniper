@@ -14,8 +14,9 @@
 use chrono::{DateTime, Utc};
 
 use super::measurement::{
-    compute_participation_snapshot, MeasurementFailureCategory, ParticipationSnapshot, SnapshotClass,
-    TradeObserved,
+    compute_participation_snapshot, curve_implied_tokens_out, redundancy_compare,
+    HolderAccount, HolderAccountClass, MeasurementFailureCategory, ParticipationSnapshot,
+    RedundancyAudit, SnapshotClass, TradeObserved,
 };
 
 /// Frozen bounded capacity for the per-run Domain-1 trade-event queue. Chosen to
@@ -263,6 +264,57 @@ pub fn coverage_aware_snapshot(
 /// Frozen: subscribe attempt is UNCONDITIONAL (takes nothing; depends on nothing).
 pub fn should_attempt_subscription() -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// Domain 2/3 (2C): deterministic classification + redundancy glue (pure).
+// ---------------------------------------------------------------------------
+
+/// Deterministically classify token-account holders from a `getTokenLargestAccounts`
+/// result already converted to UI-token balances (base / 10^decimals). curve/program
+/// and creator are matched ONLY by their deterministic associated-token-account
+/// addresses — never by a balance heuristic. `creator_ata == None` means creator
+/// attribution is BLOCKED (ambiguous), so no account is labeled Creator. Everything
+/// unmatched is Ordinary; Unknown is never fabricated here.
+pub fn classify_holder_accounts(
+    largest: &[(String, u64)],
+    curve_ata: &str,
+    creator_ata: Option<&str>,
+) -> Vec<HolderAccount> {
+    largest
+        .iter()
+        .map(|(addr, bal)| {
+            let class = if addr == curve_ata {
+                HolderAccountClass::CurveProgram
+            } else if creator_ata == Some(addr.as_str()) {
+                HolderAccountClass::Creator
+            } else {
+                HolderAccountClass::Ordinary
+            };
+            HolderAccount { address: addr.clone(), raw_balance_tokens: *bal, class }
+        })
+        .collect()
+}
+
+/// Redundancy audit for one microstructure probe: compare the probe's total expected
+/// UI tokens out to the bonding-curve-implied UI tokens out for the same SOL input
+/// (ex-fee reference from `curve_implied_tokens_out`). Returns `None` when inputs are
+/// unusable. This is the audited derivation path (executability check, NOT an
+/// expectancy/outcome signal), reproducible from the persisted raw probe + reserves.
+pub fn microstructure_redundancy(
+    expected_base_raw: u64,
+    input_lamports: u64,
+    base_decimals: u8,
+    v_sol: f64,
+    v_tokens: f64,
+) -> Option<RedundancyAudit> {
+    if input_lamports == 0 {
+        return None;
+    }
+    let probe_ui = expected_base_raw as f64 / 10f64.powi(base_decimals as i32);
+    let sol_in = input_lamports as f64 / 1_000_000_000.0;
+    let curve_ui = curve_implied_tokens_out(v_sol, v_tokens, sol_in)?;
+    Some(redundancy_compare(probe_ui, curve_ui))
 }
 
 // ---------------------------------------------------------------------------
@@ -675,5 +727,51 @@ mod tests {
         ps.cleanup("A");
         assert_eq!(ps.buffer_of("A").len(), 0);
         assert_eq!(ps.buffer_of("B").len(), 1);
+    }
+
+    // --- 2C: holder classification + microstructure redundancy (pure) ---
+
+    #[test] // curve/creator matched by deterministic ATA, everything else Ordinary
+    fn classify_curve_creator_ordinary() {
+        let largest = vec![
+            ("CURVE".to_string(), 800_000_000u64),
+            ("CREATOR".to_string(), 100_000_000u64),
+            ("WALLET1".to_string(), 60_000_000u64),
+        ];
+        let out = classify_holder_accounts(&largest, "CURVE", Some("CREATOR"));
+        assert_eq!(out[0].class, HolderAccountClass::CurveProgram);
+        assert_eq!(out[1].class, HolderAccountClass::Creator);
+        assert_eq!(out[2].class, HolderAccountClass::Ordinary);
+        assert_eq!(out[0].raw_balance_tokens, 800_000_000);
+    }
+
+    #[test] // creator BLOCKED (None) => no account labeled Creator
+    fn classify_creator_blocked() {
+        let largest = vec![("CURVE".to_string(), 1u64), ("X".to_string(), 2u64)];
+        let out = classify_holder_accounts(&largest, "CURVE", None);
+        assert!(out.iter().all(|a| a.class != HolderAccountClass::Creator));
+        assert_eq!(out[1].class, HolderAccountClass::Ordinary);
+    }
+
+    #[test] // redundancy: probe matching curve-implied within tolerance => Redundant
+    fn redundancy_matches_curve() {
+        // curve_implied_tokens_out(v_sol=30, v_tokens=1_073_000_000, sol_in=0.5)
+        let sol_in = 0.5;
+        let curve_ui = curve_implied_tokens_out(30.0, 1_073_000_000.0, sol_in).unwrap();
+        // build a probe whose expected UI tokens ~= curve_ui (6 decimals)
+        let expected_base_raw = (curve_ui * 1e6) as u64;
+        let audit =
+            microstructure_redundancy(expected_base_raw, 500_000_000, 6, 30.0, 1_073_000_000.0).unwrap();
+        assert!(audit.within_tolerance);
+        assert_eq!(audit.class, super::super::measurement::RedundancyClass::Redundant);
+    }
+
+    #[test] // redundancy: large divergence => NonRedundant; zero input => None
+    fn redundancy_divergent_and_guarded() {
+        let audit =
+            microstructure_redundancy(1, 500_000_000, 6, 30.0, 1_073_000_000.0).unwrap();
+        assert!(!audit.within_tolerance);
+        assert_eq!(audit.class, super::super::measurement::RedundancyClass::NonRedundant);
+        assert!(microstructure_redundancy(1000, 0, 6, 30.0, 1e9).is_none());
     }
 }
